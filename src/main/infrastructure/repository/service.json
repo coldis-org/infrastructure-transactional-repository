@@ -1,23 +1,28 @@
 {
-	"id": "transactional-repository",
+	"id": "infrastructure-transactional-repository",
 	"container": {
 		"portMappings": [
 			{
 				"containerPort": 5432,
 				"hostPort": 25000,
 				"labels": {
-					"VIP_0": "/transactional-repository:5432"
+					"VIP_0": "/infrastructure-transactional-repository:5432"
 				}
 			}
 		],
-		"type": "DOCKER",
+		"type": "MESOS",
 		"volumes": [
 			{
 				"containerPath": "/var/lib/postgresql/data",
+				"hostPath": "postgres_data",
+				"mode": "RW"
+			},
+			{
+				"containerPath": "postgres_data",
 				"mode": "RW",
 				"external": {
 					"size": 12,
-					"name": "transactional-repository-data",
+					"name": "infrastructure-transactional-repository-data",
 					"provider": "dvdi",
 					"options": {
 						"dvdi/driver": "rexray"
@@ -26,7 +31,7 @@
 			}
 		],
 		"docker": {
-			"image": "coldis/transactional-repository",
+			"image": "coldis/infrastructure-transactional-repository",
 			"forcePullImage": true,
 			"parameters": []
 		}

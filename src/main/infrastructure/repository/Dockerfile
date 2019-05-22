@@ -1,6 +1,13 @@
 # From Postgres.
 FROM postgres:11.2
 
+# Installs Postgres contrib.
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends \
+		postgresql-contrib-${PG_MAJOR} && \
+	apt-get clean -y && \
+	rm -rf /var/lib/apt/lists/*
+
 # Sets locale and UTF-8 charset.
 ENV TZ=America/Sao_Paulo \
 	LANG_NAME=pt_BR \
@@ -11,8 +18,11 @@ RUN localedef -i ${LANG_NAME} -c -f UTF-8 -A /usr/share/locale/locale.alias ${LA
 	cp /usr/share/zoneinfo/${TZ} /etc/localtime
 
 # Copies the server configuration.
-COPY conf/*.conf /tmp/
+COPY conf /tmp
+RUN chown -R postgres:postgres /tmp
 
 # Copies init script.
 COPY script/init.sh /docker-entrypoint-initdb.d/
+RUN chown -R postgres:postgres /docker-entrypoint-initdb.d/
+
 

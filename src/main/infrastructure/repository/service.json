@@ -4,24 +4,17 @@
 		"portMappings": [
 			{
 				"containerPort": 5432,
-				"hostPort": 25000,
 				"labels": {
 					"VIP_0": "/infrastructure-transactional-repository:5432"
 				}
 			}
 		],
-		"type": "MESOS",
+		"type": "DOCKER",
 		"volumes": [
 			{
 				"containerPath": "/var/lib/postgresql/data",
-				"hostPath": "postgres_data",
-				"mode": "RW"
-			},
-			{
-				"containerPath": "postgres_data",
 				"mode": "RW",
 				"external": {
-					"size": 12,
 					"name": "infrastructure-transactional-repository-data",
 					"provider": "dvdi",
 					"options": {

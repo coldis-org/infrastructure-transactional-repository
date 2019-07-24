@@ -16,7 +16,7 @@ REPLICATION_LOCK_FILE="${PGDATA}/replication_configured.lock"
 trap - INT TERM
 
 # Updates the conf file.
-${DEBUG} && echo  "Updating config"
+${DEBUG} && echo "Updating config"
 rm -Rf ${PGDATA}/postgresql.conf
 cp /tmp/postgresql.conf ${PGDATA}/postgresql.conf
 rm -Rf ${PGDATA}/pg_hba.conf
@@ -26,7 +26,7 @@ cp /tmp/pg_hba.conf ${PGDATA}/pg_hba.conf
 if [ ! -f ${USER_LOCK_FILE} ] && [ "${USER_NAME}" != "" ] 
 then
 
-	${DEBUG} && echo  "Configuring default database"
+	${DEBUG} && echo "Configuring default database"
 	
 	# Creates the default user.
 	psql -c "CREATE USER ${USER_NAME} WITH PASSWORD '${USER_PASSWORD}';" -U postgres
@@ -43,7 +43,7 @@ fi
 if [ ! -f ${JSON_CAST_LOCK_FILE} ] && [ "${ENABLE_JSON_CAST}" == "true" ] 
 then
 
-	${DEBUG} && echo  "Configuring JSON cast"
+	${DEBUG} && echo "Configuring JSON cast"
 
 	# Creates the JSON casts.
 	psql -c "CREATE CAST (varchar as json) WITHOUT FUNCTION AS IMPLICIT;" -U postgres ${DATABASE_NAME} ${USER_NAME}
@@ -66,7 +66,7 @@ fi
 if [ ! -f ${UNACCENT_LOCK_FILE} ] && [ "${ENABLE_UNACCENT}" == "true" ] 
 then
 
-	${DEBUG} && echo  "Configuring unaccent extension"
+	${DEBUG} && echo "Configuring unaccent extension"
 
 	# Creates unaccent extension.
 	psql -c "CREATE EXTENSION IF NOT EXISTS unaccent;" -U postgres ${DATABASE_NAME} ${USER_NAME}
@@ -81,7 +81,7 @@ fi
 if [ ! -f ${REPLICATION_LOCK_FILE} ] && [ "${REPLICATOR_USER_NAME}" != "" ]
 then
 	
-	${DEBUG} && echo  "Configuring replication"
+	${DEBUG} && echo "Configuring replication"
 
 	# Also creates the replication user.
 	psql -c "CREATE USER ${REPLICATOR_USER_NAME} REPLICATION LOGIN ENCRYPTED PASSWORD '${REPLICATOR_USER_PASSWORD}';" -U postgres
@@ -95,7 +95,7 @@ fi
 if [ -f ${SQL_CONFIGURATION} ]
 then
 	
-	${DEBUG} && echo  "Configuring database"
+	${DEBUG} && echo "Configuring database"
 
 	# Also creates the replication user.
 	psql -a -f ${SQL_CONFIGURATION} -U ${USER_NAME} ${DATABASE_NAME} 

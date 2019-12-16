@@ -1,5 +1,5 @@
 # From Postgres.
-FROM postgres:11.2
+FROM postgres:12.1
 
 # Installs Postgres contrib.
 RUN apt-get update && \
@@ -23,6 +23,7 @@ RUN chown -R postgres:postgres /tmp
 
 # Copies init script.
 COPY script/init.sh /docker-entrypoint-initdb.d/
-RUN chown -R postgres:postgres /docker-entrypoint-initdb.d/
+RUN chown -R postgres:postgres /docker-entrypoint-initdb.d/ && \
+	chmod -R +x /docker-entrypoint-initdb.d/
 
 

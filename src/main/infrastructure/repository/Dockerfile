@@ -1,5 +1,5 @@
 # From Postgres.
-FROM postgres:12.1
+FROM postgres:11.6
 
 # Installs Postgres contrib.
 RUN apt-get update && \

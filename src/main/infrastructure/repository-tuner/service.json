@@ -1,0 +1,22 @@
+{
+	"id": "infrastructure-transactional-repository-tuner",
+	"container": {
+		"portMappings": [
+		],
+		"type": "DOCKER",
+		"volumes": [
+		],
+		"docker": {
+			"image": "coldis/infrastructure-transactional-repository-tuner",
+			"forcePullImage": true,
+			"parameters": []
+		}
+	},
+	"env": {},
+	"healthChecks": [],
+	"args": [],
+	"cpus": 1,
+	"disk": 1024,
+	"instances": 1,
+	"mem": 256
+}

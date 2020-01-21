@@ -94,3 +94,10 @@ then
 	psql -a -f ${SQL_CONFIGURATION} -U ${USER_NAME} ${DATABASE_NAME} 
 
 fi
+
+${DEBUG} && echo "Updating configuration"
+rm -Rf ${PGDATA}/postgresql.conf
+cp /tmp/postgresql.conf ${PGDATA}/postgresql.conf
+rm -Rf ${PGDATA}/pg_hba.conf
+cp /tmp/pg_hba.conf ${PGDATA}/pg_hba.conf
+

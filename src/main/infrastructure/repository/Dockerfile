@@ -22,8 +22,11 @@ COPY conf /tmp
 RUN chown -R postgres:postgres /tmp
 
 # Copies init script.
-COPY script/init.sh /docker-entrypoint-initdb.d/
-RUN chown -R postgres:postgres /docker-entrypoint-initdb.d/ && \
-	chmod -R +x /docker-entrypoint-initdb.d/
+COPY script/init.sh /
+COPY script/configure.sh /docker-entrypoint-initdb.d/
+RUN chown -R postgres:postgres /docker-entrypoint-initdb.d/ /init.sh && \
+	chmod -R +x /docker-entrypoint-initdb.d/ /init.sh
 
-
+# Command.
+ENTRYPOINT [ "/init.sh" ]
+CMD [ "/docker-entrypoint.sh", "postgres" ]

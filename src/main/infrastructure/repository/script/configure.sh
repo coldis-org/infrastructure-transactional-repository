@@ -16,6 +16,7 @@ REPLICATION_LOCK_FILE="${PGDATA}/replication_configured.lock"
 trap - INT TERM
 
 # If the user has not been (and should) configured yet.
+${DEBUG} && echo "USER_NAME=${USER_NAME}"
 if [ ! -f ${USER_LOCK_FILE} ] && [ "${USER_NAME}" != "" ] 
 then
 
@@ -30,10 +31,16 @@ then
 	# Creates the lock.
 	touch ${USER_LOCK_FILE}
 	
+# If the user has been (or should not) configured yet.
+else
+
+	${DEBUG} && echo "Skipping default database"
+	
 fi
 
 # If the JSON has not been (and should) configured yet.
-if [ ! -f ${JSON_CAST_LOCK_FILE} ] && [ "${ENABLE_JSON_CAST}" == "true" ] 
+${DEBUG} && echo "ENABLE_JSON_CAST=${ENABLE_JSON_CAST}"
+if [ ! -f ${JSON_CAST_LOCK_FILE} ] && [ "${ENABLE_JSON_CAST}" = "true" ] 
 then
 
 	${DEBUG} && echo "Configuring JSON cast"
@@ -52,11 +59,17 @@ then
 
 	# Creates the lock.
 	touch ${JSON_CAST_LOCK_FILE}
+	
+# If the JSON has been (or should not) configured yet.
+else
+
+	${DEBUG} && echo "Skipping JSON cast"
 
 fi
 
 # If unaccent extension should be confgured.
-if [ ! -f ${UNACCENT_LOCK_FILE} ] && [ "${ENABLE_UNACCENT}" == "true" ] 
+${DEBUG} && echo "ENABLE_UNACCENT=${ENABLE_UNACCENT}"
+if [ ! -f ${UNACCENT_LOCK_FILE} ] && [ "${ENABLE_UNACCENT}" = "true" ] 
 then
 
 	${DEBUG} && echo "Configuring unaccent extension"
@@ -67,10 +80,16 @@ then
 
 	# Creates the lock.
 	touch ${UNACCENT_LOCK_FILE}
+	
+# If unaccent extension should not be confgured.
+else 
+
+	${DEBUG} && echo "Skipping unaccent extension"
 
 fi
 
 # If the JSON has not been (and should) configured yet.
+${DEBUG} && echo "REPLICATOR_USER_NAME=${REPLICATOR_USER_NAME}"
 if [ ! -f ${REPLICATION_LOCK_FILE} ] && [ "${REPLICATOR_USER_NAME}" != "" ]
 then
 	
@@ -81,6 +100,11 @@ then
 
 	# Creates the lock.
 	touch ${REPLICATION_LOCK_FILE}
+	
+# If the JSON has been (or should not) configured yet.
+else 
+
+	${DEBUG} && echo "Skipping replication"
 
 fi
 
@@ -92,6 +116,11 @@ then
 
 	# Also creates the replication user.
 	psql -a -f ${SQL_CONFIGURATION} -U ${USER_NAME} ${DATABASE_NAME} 
+
+# If there is no configuration file.
+else 
+
+	${DEBUG} && echo "Skipping database configuration"
 
 fi
 

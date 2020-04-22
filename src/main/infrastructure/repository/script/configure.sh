@@ -78,6 +78,9 @@ then
 	psql -c "CREATE EXTENSION IF NOT EXISTS unaccent;" -U postgres ${DATABASE_NAME} ${USER_NAME}
 	psql -c "CREATE FUNCTION immutable_unaccent(text) RETURNS text LANGUAGE SQL IMMUTABLE AS 'SELECT unaccent(\$1)';" -U postgres ${DATABASE_NAME} ${USER_NAME}
 
+	# Creates pg_trgm extension.
+	psql -c "CREATE EXTENSION pg_trgm;" -U postgres ${DATABASE_NAME} ${USER_NAME}
+
 	# Creates the lock.
 	touch ${UNACCENT_LOCK_FILE}
 	

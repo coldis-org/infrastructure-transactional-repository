@@ -1,10 +1,10 @@
 # From Postgres.
-FROM postgres:11.7
+FROM postgres:12.3
 
-# Installs Postgres contrib.
+# Installs Postgres contrib and LDAP tools.
 RUN apt-get update && \
 	apt-get install -y --no-install-recommends \
-		postgresql-contrib-${PG_MAJOR} && \
+		postgresql-contrib-${PG_MAJOR} ldap-utils && \
 	apt-get clean -y && \
 	rm -rf /var/lib/apt/lists/*
 
@@ -22,11 +22,12 @@ COPY conf /tmp
 RUN chown -R postgres:postgres /tmp
 
 # Copies init script.
-COPY script/init.sh /
-COPY script/configure.sh /docker-entrypoint-initdb.d/
-RUN chown -R postgres:postgres /docker-entrypoint-initdb.d/ /init.sh && \
-	chmod -R +x /docker-entrypoint-initdb.d/ /init.sh
+RUN mkdir -p /opt/psql-script	
+COPY script/psql /opt/psql-script
+WORKDIR /opt/psql-script
+RUN chown -R postgres:postgres /opt/psql-script && \
+	chmod -R +x /opt/psql-script
 
 # Command.
-ENTRYPOINT [ "/init.sh" ]
+ENTRYPOINT [ "./psql_init.sh" ]
 CMD [ "/docker-entrypoint.sh", "postgres" ]

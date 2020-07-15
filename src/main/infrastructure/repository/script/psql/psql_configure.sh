@@ -11,6 +11,7 @@ USER_LOCK_FILE="${PGDATA}/user_configured.lock"
 JSON_CAST_LOCK_FILE="${PGDATA}/json_cast_configured.lock"
 UNACCENT_LOCK_FILE="${PGDATA}/unaccent_configured.lock"
 REPLICATION_LOCK_FILE="${PGDATA}/replication_configured.lock"
+STATS_LOCK_FILE="${PGDATA}/stats_configured.lock"
 
 # Enables interruption signal handling.
 trap - INT TERM
@@ -52,6 +53,28 @@ else
 	${DEBUG} && echo "Skipping default database"
 	
 fi
+
+
+# If stats extension should be confgured.
+${DEBUG} && echo "ENABLE_STATS=${ENABLE_STATS}"
+if [ ! -f ${STATS_LOCK_FILE} ] && [ "${ENABLE_STATS}" != "false" ] 
+then
+
+	${DEBUG} && echo "Configuring stats extension"
+
+	# Creates pg_trgm extension.
+	PGPASSWORD=${POSTGRES_PASSWORD} psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" -U ${POSTGRES_USER} ${DATABASE_NAME}
+	
+	# Creates the lock.
+	touch ${STATS_LOCK_FILE}
+	
+# If stats extension should not be confgured.
+else 
+
+	${DEBUG} && echo "Skipping stats extension"
+
+fi
+
 
 # If the JSON has not been (and should) configured yet.
 ${DEBUG} && echo "ENABLE_JSON_CAST=${ENABLE_JSON_CAST}"

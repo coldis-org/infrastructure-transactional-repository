@@ -1,0 +1,39 @@
+{
+	"id": "infrastructure-transactional-repository",
+	"container": {
+		"portMappings": [
+			{
+				"containerPort": 5432,
+				"labels": {
+					"VIP_0": "/infrastructure-transactional-repository:5432"
+				}
+			}
+		],
+		"type": "DOCKER",
+		"volumes": [
+			{
+				"containerPath": "/var/lib/postgresql/data",
+				"mode": "RW",
+				"external": {
+					"name": "infrastructure-transactional-repository-data",
+					"provider": "dvdi",
+					"options": {
+						"dvdi/driver": "rexray"
+					}
+				}
+			}
+		],
+		"docker": {
+			"image": "coldis/infrastructure-transactional-repository",
+			"forcePullImage": true,
+			"parameters": []
+		}
+	},
+	"env": {},
+	"healthChecks": [],
+	"args": [],
+	"cpus": 1,
+	"disk": 1024,
+	"instances": 1,
+	"mem": 256
+}

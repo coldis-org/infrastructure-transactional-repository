@@ -10,6 +10,7 @@ SQL_CONFIGURATION=/tmp/config.sql
 USER_LOCK_FILE="${PGDATA}/user_configured.lock"
 JSON_CAST_LOCK_FILE="${PGDATA}/json_cast_configured.lock"
 UNACCENT_LOCK_FILE="${PGDATA}/unaccent_configured.lock"
+TABLEFUNC_LOCK_FILE="${PGDATA}/tablefunc_configured.lock"
 REPLICATION_LOCK_FILE="${PGDATA}/replication_configured.lock"
 STATS_LOCK_FILE="${PGDATA}/stats_configured.lock"
 
@@ -133,6 +134,30 @@ else
 	${DEBUG} && echo "Skipping unaccent extension"
 
 fi
+
+# If tablefunc extension should be confgured.
+${DEBUG} && echo "ENABLE_TABLEFUNC=${ENABLE_TABLEFUNC}"
+if [ ! -f "${TABLEFUNC_LOCK_FILE}" ] && [ "${ENABLE_TABLEFUNC}" = "true" ] 
+then
+
+	${DEBUG} && echo "Configuring tablefunc extension"
+
+	# Creates tablefunc extension.
+	PGPASSWORD=${POSTGRES_PASSWORD} psql -c "CREATE EXTENSION IF NOT EXISTS tablefunc;" -U ${POSTGRES_USER} ${DATABASE_NAME}
+	
+	# Creates the lock.
+	touch ${TABLEFUNC_LOCK_FILE}
+	
+# If unaccent extension should not be confgured.
+else 
+
+	${DEBUG} && echo "Skipping unaccent extension"
+
+fi
+
+
+
+CREATE extension tablefunc;
 
 # If the JSON has not been (and should) configured yet.
 ${DEBUG} && echo "REPLICATOR_USER_NAME=${REPLICATOR_USER_NAME}"

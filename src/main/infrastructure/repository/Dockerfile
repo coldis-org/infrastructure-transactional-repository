@@ -1,5 +1,5 @@
 # From Postgres.
-FROM postgres:12.3
+FROM postgres:12.4
 
 # Installs Postgres contrib and LDAP tools.
 RUN apt-get update && \

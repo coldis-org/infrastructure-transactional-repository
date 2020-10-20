@@ -24,14 +24,6 @@ do
 	sleep 10
 done
 
-# Makes sure configuration is updated
-${DEBUG} && echo "Updating configuration"
-rm -Rf ${PGDATA}/postgresql.conf
-cp /tmp/postgresql.conf ${PGDATA}/postgresql.conf
-rm -Rf ${PGDATA}/pg_hba.conf
-cp /tmp/pg_hba.conf ${PGDATA}/pg_hba.conf
-PGPASSWORD=${POSTGRES_PASSWORD} psql -c "SELECT pg_reload_conf();" -U ${POSTGRES_USER}
-
 # If the user has not been (and should) configured yet.
 ${DEBUG} && echo "USER_NAME=${USER_NAME}"
 if [ ! -f "${USER_LOCK_FILE}" ] && [ "${USER_NAME}" != "" ] 

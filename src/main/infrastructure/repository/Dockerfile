@@ -1,12 +1,5 @@
 # From Postgres.
-FROM postgres:12.4
-
-# Installs Postgres contrib and LDAP tools.
-RUN apt-get update && \
-	apt-get install -y --no-install-recommends \
-		postgresql-contrib-${PG_MAJOR} ldap-utils && \
-	apt-get clean -y && \
-	rm -rf /var/lib/apt/lists/*
+FROM postgres:12.5
 
 # Sets locale and UTF-8 charset.
 ENV TZ=America/Sao_Paulo \
@@ -16,6 +9,13 @@ ENV TZ=America/Sao_Paulo \
 	LANGUAGE=pt_BR:pt
 RUN localedef -i ${LANG_NAME} -c -f UTF-8 -A /usr/share/locale/locale.alias ${LANG_FILE} && \
 	cp /usr/share/zoneinfo/${TZ} /etc/localtime
+
+# Installs Postgres contrib and LDAP tools.
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends \
+		postgresql-contrib-${PG_MAJOR} ldap-utils gettext && \
+	apt-get clean -y && \
+	rm -rf /var/lib/apt/lists/*
 
 # Copies the server configuration.
 COPY conf /tmp

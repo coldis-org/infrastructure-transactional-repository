@@ -18,6 +18,7 @@ then
 	cp /tmp/postgresql.conf ${PGDATA}/postgresql.conf
 	rm -Rf ${PGDATA}/pg_hba.conf
 	cp /tmp/pg_hba.conf ${PGDATA}/pg_hba.conf
+	ensubst < ${PGDATA}/pg_hba.conf > ${PGDATA}/pg_hba.conf
 fi
 # Configures database
 ./psql_configure.sh &

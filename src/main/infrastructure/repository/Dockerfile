@@ -1,5 +1,5 @@
 # From Postgres.
-FROM postgres:12.6
+FROM postgres:12.7
 
 # Sets locale and UTF-8 charset.
 ENV TZ=America/Sao_Paulo \
@@ -30,4 +30,4 @@ RUN chown -R postgres:postgres /opt/psql-script && \
 
 # Command.
 ENTRYPOINT [ "./psql_init.sh" ]
-CMD [ "/docker-entrypoint.sh", "postgres" ]
+CMD [ "docker-entrypoint.sh", "postgres" ]

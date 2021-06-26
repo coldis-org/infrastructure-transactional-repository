@@ -17,12 +17,14 @@ if [ ! -f ${REPLICATION_LOCK_FILE} ]; then
 	# Cleans data.
 	rm -rf ${PGDATA}/*
 	# Starts replication streaming.
-	echo ${REPLICATOR_USER_PASSWORD} | pg_basebackup -h ${MASTER_ENDPOINT} -p ${MASTER_PORT} -D ${PGDATA} -PRv -U ${REPLICATOR_USER_NAME} -X stream
-	chown postgres ${PGDATA} -R
+	echo ${REPLICATOR_USER_PASSWORD} | pg_basebackup -h ${MASTER_ENDPOINT} -p ${MASTER_PORT} -D ${PGDATA} -PRv -U ${REPLICATOR_USER_NAME} -X stream --checkpoint=fast
 	# Stes that replication has been configured.
 	touch ${REPLICATION_LOCK_FILE}
 
 fi
+
+# Makes sure the permissions are set.
+chown postgres ${PGDATA} -R
 
 # Starts the databse.
 exec gosu postgres postgres

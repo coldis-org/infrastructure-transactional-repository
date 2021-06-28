@@ -17,7 +17,7 @@ if [ ! -f ${REPLICATION_LOCK_FILE} ]; then
 	# Cleans data.
 	rm -rf ${PGDATA}/*
 	# Starts replication streaming.
-	echo ${REPLICATOR_USER_PASSWORD} | pg_basebackup -h ${MASTER_ENDPOINT} -p ${MASTER_PORT} -D ${PGDATA} -PRv -U ${REPLICATOR_USER_NAME} -X stream --checkpoint=fast
+	echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup -h ${MASTER_ENDPOINT} -p ${MASTER_PORT} -D ${PGDATA} -PRv -U ${POSTGRES_REPLICATOR_USER} -X stream --checkpoint=fast
 	# Stes that replication has been configured.
 	touch ${REPLICATION_LOCK_FILE}
 

@@ -24,6 +24,8 @@ if [ ! -f ${REPLICATION_LOCK_FILE} ]; then
 fi
 
 # Makes sure the permissions are set.
+echo "Changing folder permissions"
+chmod 750 ${PGDATA} -R
 chown postgres ${PGDATA} -R
 
 # Starts the databse.

@@ -1,5 +1,5 @@
 # From Postgres.
-FROM coldis/infrastructure-transactional-repository:2.1
+FROM coldis/infrastructure-transactional-repository:2.2
 
 # Copies init script.
 COPY script/init.sh /

@@ -23,4 +23,5 @@ fi
 ./psql_configure.sh &
 
 # Executes the init command.
-exec $@
+exec env POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} $@
+

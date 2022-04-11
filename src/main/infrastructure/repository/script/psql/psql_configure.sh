@@ -44,8 +44,11 @@ else
 fi
 
 # configure default user.
+${DEBUG} && echo "Creating default user."
 PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "CREATE USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} || true
+${DEBUG} && echo "Setting default user password."
 PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} || true
+${DEBUG} && echo "Setting default user timeout."
 PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER ROLE ${POSTGRES_DEFAULT_USER} SET statement_timeout='${TIMEOUT:-3min}';" -U ${POSTGRES_DEFAULT_USER} || true
 
 # Configures users.

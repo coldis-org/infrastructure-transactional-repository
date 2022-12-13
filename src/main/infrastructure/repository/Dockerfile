@@ -28,6 +28,17 @@ WORKDIR /opt/psql-script
 RUN chown -R postgres:postgres /opt/psql-script && \
 	chmod -R +x /opt/psql-script
 
+RUN apt-get update && apt-get install vim -y
+
+RUN apt-get update -y \
+	&& apt-get install -y cron dnsutils wget \
+	&& apt-get clean -y \
+	&& rm -rf /var/lib/apt/lists/*
+
+COPY cron /etc/cron.d
+RUN chmod -R 0644 /etc/cron.d/ \
+	&& crontab /etc/cron.d/cron_job
+
 # Command.
 ENTRYPOINT [ "./psql_init.sh" ]
 CMD [ "docker-entrypoint.sh", "postgres" ]

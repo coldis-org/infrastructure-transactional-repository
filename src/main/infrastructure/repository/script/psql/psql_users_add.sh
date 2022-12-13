@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # Default parameters.
-DEBUG=true
+DEBUG=${DEBUG:=true}
 DEBUG_OPT=
 
 # For each permission.
@@ -47,7 +47,6 @@ do
 			-h "${LDAP_HOST}" -b "${LDAP_GROUPS}" "(cn=${USER_GROUP})" \
 			 | grep memberUid | sed "s/memberUid: //g")
 		fi
-	
 		# For each user to configure access.
 		for CURRENT_USER in ${USERS}
 		do

@@ -19,6 +19,12 @@ then
 	rm -Rf ${PGDATA}/pg_hba.conf
 	envsubst < /tmp/pg_hba.conf > ${PGDATA}/pg_hba.conf
 fi
+
+# To use cron
+env > /etc/env_vars
+chmod +x /etc/env_vars
+service cron start
+
 # Configures database
 ./psql_configure.sh &
 

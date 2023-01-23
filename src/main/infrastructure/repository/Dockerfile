@@ -1,5 +1,5 @@
 # From Postgres.
-FROM postgres:15.0-bullseye
+FROM postgres:14.6-bullseye
 
 # Sets locale and UTF-8 charset.
 ENV TZ=America/Sao_Paulo \

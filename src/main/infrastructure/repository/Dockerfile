@@ -10,12 +10,16 @@ ENV TZ=America/Sao_Paulo \
 RUN localedef -i ${LANG_NAME} -c -f UTF-8 -A /usr/share/locale/locale.alias ${LANG_FILE} && \
 	cp /usr/share/zoneinfo/${TZ} /etc/localtime
 
-# Installs Postgres contrib and LDAP tools.
+# Installs Postgres contrib, LDAP tools and cron.
 RUN apt-get update && \
 	apt-get install -y --no-install-recommends \
-		postgresql-contrib-${PG_MAJOR} ldap-utils gettext && \
+		postgresql-contrib-${PG_MAJOR} ldap-utils gettext cron && \
 	apt-get clean -y && \
 	rm -rf /var/lib/apt/lists/*
+
+COPY cron /etc/cron.d
+RUN chmod -R 0644 /etc/cron.d/ \
+	&& crontab /etc/cron.d/cron_job
 
 # Copies the server configuration.
 COPY conf /tmp

@@ -8,7 +8,7 @@ USER_READ_GROUP_VARS=$(env | grep "PSQL_READ_SCHEMA_" | sed -e "s/PSQL_READ_SCHE
 USER_GROUP_VARS=$(echo "${USER_READ_GROUP_VARS}")
 EXISTENT_USERS=$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -t -A -q -X -c "SELECT usename FROM pg_catalog.pg_user;" -U ${POSTGRES_ADMIN_USER} | tr " " \n || true)
 
-REVOKE_USER() {
+REMOVE_USER() {
 	CURRENT_USER=$1
 	if [ "${CURRENT_USER}" != "${POSTGRES_ADMIN_USER}" ] && [ "${CURRENT_USER}" != "${POSTGRES_DEFAULT_USER}" ] && [ "${CURRENT_USER}" != "${POSTGRES_REPLICATOR_USER}" ] 
 	then
@@ -49,7 +49,7 @@ do
 	do
 		if ! (echo $USERS  | grep -wq $USER_DB)
 		then
-			REVOKE_USER $USER_DB
+			REMOVE_USER $USER_DB
 		fi
 	done
 done

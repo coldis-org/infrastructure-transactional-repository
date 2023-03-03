@@ -12,7 +12,7 @@ REMOVE_USER() {
 	CURRENT_USER=$1
 	if [ "${CURRENT_USER}" != "${POSTGRES_ADMIN_USER}" ] && [ "${CURRENT_USER}" != "${POSTGRES_DEFAULT_USER}" ] && [ "${CURRENT_USER}" != "${POSTGRES_REPLICATOR_USER}" ] 
 	then
-		for SCHEMA in $(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -t -c "SELECT schema_name FROM information_schema.schemata;" -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DEFAULT_DATABASE} --quiet)
+		for SCHEMA in $(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -t -c "SELECT schema_name FROM information_schema.schemata where schema_name NOT IN ('pg_catalog', 'information_schema') and schema_name not like 'pg_%';" -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DEFAULT_DATABASE} --quiet)
 		do
 			${DEBUG} && echo "Removing user ${CURRENT_USER} permissions"
 			PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -c "REVOKE ALL ON DATABASE \"${POSTGRES_DEFAULT_DATABASE}\" FROM \"${CURRENT_USER}\";" -U ${POSTGRES_ADMIN_USER} || true

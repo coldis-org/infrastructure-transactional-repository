@@ -2,11 +2,11 @@
 FROM coldis/infrastructure-transactional-repository:4.1.1
 
 # Copies init script.
-COPY script/init.sh /
-RUN chown -R postgres:postgres /init.sh && \
-	chmod -R +x /init.sh
+COPY script/psql_replica_init.sh /
+RUN chown -R postgres:postgres /psql_replica_init.sh && \
+	chmod -R +x /psql_replica_init.sh
 	
-ENTRYPOINT ["/init.sh"]
+ENTRYPOINT ["/psql_replica_init.sh"]
 CMD [ "docker-entrypoint.sh", "postgres" ]
 
 

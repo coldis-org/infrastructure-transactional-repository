@@ -29,4 +29,4 @@ chmod 750 ${PGDATA} -R
 chown postgres ${PGDATA} -R
 
 # Starts the databse.
-exec gosu postgres $@
+exec $@

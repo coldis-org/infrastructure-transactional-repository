@@ -7,6 +7,6 @@ RUN chown -R postgres:postgres /init.sh && \
 	chmod -R +x /init.sh
 	
 ENTRYPOINT ["/init.sh"]
-CMD []
+CMD [ "docker-entrypoint.sh", "postgres" ]
 
 

@@ -32,7 +32,7 @@ then
 	fi
 
 	BACKUP_PARAMS="""--host=${MASTER_ENDPOINT} --port=${MASTER_PORT} --pgdata=${PGDATA} --username=${POSTGRES_REPLICATOR_USER}\
-			--format=tar --wal-method=stream --checkpoint=fast --progress --verbose --write-recovery-conf ${SLOT_PARAM}"""
+					 --wal-method=stream --checkpoint=fast --progress --verbose --write-recovery-conf ${SLOT_PARAM}"""
 	# Starts replication streaming.
 	(echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS} --create-slot) || \
 	(echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS})
@@ -47,4 +47,4 @@ chmod 750 ${PGDATA} -R
 chown postgres ${PGDATA} -R
 
 # Starts the databse.
-exec $@
+exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} $@

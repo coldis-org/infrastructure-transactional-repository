@@ -29,5 +29,5 @@ service cron start
 ./psql_configure.sh &
 
 # Executes the init command.
-exec env POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} $@
+exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} $@
 

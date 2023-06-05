@@ -32,7 +32,7 @@ then
 	fi
 
 	BACKUP_PARAMS="""--host=${MASTER_ENDPOINT} --port=${MASTER_PORT} --pgdata=${PGDATA} --username=${POSTGRES_REPLICATOR_USER}\
-					 --wal-method=stream --checkpoint=fast --progress --verbose --write-recovery-conf ${SLOT_PARAM}"""
+					 --wal-method=stream  --write-recovery-conf --checkpoint=fast --progress --verbose ${SLOT_PARAM}"""
 	# Starts replication streaming.
 	(echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS} --create-slot) || \
 	(echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS})

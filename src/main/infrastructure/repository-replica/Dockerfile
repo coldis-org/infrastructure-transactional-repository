@@ -7,6 +7,6 @@ RUN chown -R postgres:postgres /psql_replica_init.sh && \
 	chmod -R +x /psql_replica_init.sh
 	
 ENTRYPOINT [ "/psql_replica_init.sh" ]
-CMD [ "docker-entrypoint.sh", "postgres" ]
+CMD [ "gosu", "postgres" , "postgres" ]
 
 

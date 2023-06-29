@@ -45,7 +45,7 @@ then
 		USER_GROUPS=$( echo "${USER_GROUPS}" | sed -e "s/,/\n/g" )
 		for USER_GROUP in ${USER_GROUPS} 
 		do
-			USERS="$(ldapsearch -LLL -w "${LDAP_PASSWORD}" -D "${LDAP_USER}" -h "${LDAP_HOST}" \
+			USERS="$(ldapsearch -LLL -w "${LDAP_PASSWORD}" -D "${LDAP_USER}" -H "${LDAP_HOST}" \
 			-b "${LDAP_GROUPS}" "(cn=${USER_GROUP})" 	| grep memberUid | sed "s/memberUid: //g")\n$USERS"
 		done
 		USERS=$(echo $USERS | sort | uniq)

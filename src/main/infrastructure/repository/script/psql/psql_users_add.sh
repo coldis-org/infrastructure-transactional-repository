@@ -49,7 +49,7 @@ do
 		then
 			${DEBUG} && echo "Getting users from ldap: ${USER_GROUP}"
 			USERS=$(ldapsearch -LLL -w "${LDAP_PASSWORD}" -D "${LDAP_USER}" \
-			-h "${LDAP_HOST}" -b "${LDAP_GROUPS}" "(cn=${USER_GROUP})" \
+			-H "${LDAP_HOST}" -b "${LDAP_GROUPS}" "(cn=${USER_GROUP})" \
 			 | grep memberUid | sed "s/memberUid: //g")
 		fi
 

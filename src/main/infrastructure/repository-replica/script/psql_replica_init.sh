@@ -35,7 +35,10 @@ then
 					 --wal-method=stream  --write-recovery-conf --checkpoint=fast --progress --verbose ${SLOT_PARAM}"""
 	# Starts replication streaming.
 	(echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS} --create-slot) || \
-	(echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS})
+	( \
+		(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -h "${MASTER_ENDPOINT}" -c "SELECT pg_drop_replication_slot('${REPLICATION_SLOT_NAME}');" -U ${POSTGRES_ADMIN_USER}) \
+		&& (echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS} --create-slot) \
+	)
 	# Sets that replication has been configured.
 	touch ${REPLICATION_LOCK_FILE}
 

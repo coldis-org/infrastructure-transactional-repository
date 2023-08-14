@@ -1,5 +1,5 @@
 # From Postgres.
-FROM postgres:16beta1-bookworm
+FROM postgres:15.4-bookworm
 
 # Sets locale and UTF-8 charset.
 ENV TZ=America/Sao_Paulo \

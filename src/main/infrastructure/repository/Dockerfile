@@ -31,7 +31,7 @@ COPY script/psql /opt/psql-script
 WORKDIR /opt/psql-script
 RUN chown -R postgres:postgres /opt/psql-script && \
 	chmod -R +x /opt/psql-script
-
+	
 # Command.
 ENTRYPOINT [ "./psql_init.sh" ]
 CMD [ "docker-entrypoint.sh", "postgres" ]

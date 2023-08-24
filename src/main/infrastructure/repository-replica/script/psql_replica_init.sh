@@ -31,7 +31,18 @@ then
 		SLOT_PARAM="--slot=${REPLICATION_SLOT_NAME}"
 	fi
 
-	BACKUP_PARAMS="""--host=${MASTER_ENDPOINT} --port=${MASTER_PORT} --pgdata=${PGDATA} --username=${POSTGRES_REPLICATOR_USER}\
+	# Uses one if other is not available.	
+	if [ -z "${COPY_ENDPOINT}" ]
+	then
+		COPY_ENDPOINT="${MASTER_ENDPOINT}"
+	else
+		if [ -z "${MASTER_ENDPOINT}" ]
+		then
+			MASTER_ENDPOINT="${COPY_ENDPOINT}"
+		fi
+	fi
+
+	BACKUP_PARAMS="""--host=${COPY_ENDPOINT} --port=${COPY_PORT} --pgdata=${PGDATA} --username=${POSTGRES_REPLICATOR_USER}\
 					 --wal-method=stream  --write-recovery-conf --checkpoint=fast --progress --verbose ${SLOT_PARAM}"""
 	# Starts replication streaming.
 	(echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS} --create-slot) || \

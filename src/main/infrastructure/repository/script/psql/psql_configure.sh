@@ -20,6 +20,12 @@ do
 	sleep 10
 done
 
+# Configures timeout for admin user.
+${DEBUG} && echo "Setting admin user timeout."
+PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -c "ALTER ROLE ${POSTGRES_DEFAULT_USER} SET statement_timeout='${ADMIN_TIMEOUT=0}';" -U ${POSTGRES_ADMIN_USER} || true
+PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -c "ALTER ROLE ${POSTGRES_DEFAULT_USER} SET lock_timeout='${ADMIN_TIMEOUT=0}';" -U ${POSTGRES_ADMIN_USER} || true
+
+
 # If the user has not been (and should) configured yet.
 ${DEBUG} && echo "POSTGRES_DEFAULT_USER=${POSTGRES_DEFAULT_USER}"
 if [ ! -f "${USER_LOCK_FILE}" ] && [ "${POSTGRES_DEFAULT_USER}" != "" ] 
@@ -43,21 +49,11 @@ else
 	
 fi
 
-# configure default user.
+# Configures default user.
 ${DEBUG} && echo "Creating default user."
 PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "CREATE USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} || true
 ${DEBUG} && echo "Setting default user password."
 PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} || true
-
-# Configures timeout for user.
-if [ -z "${TIMEOUT}" ] 
-then
-	${DEBUG} && echo "Unsetting default user timeout."
-	PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER ROLE ${POSTGRES_DEFAULT_USER} RESET statement_timeout;" -U ${POSTGRES_DEFAULT_USER} || true
-else
-	${DEBUG} && echo "Setting default user timeout."
-	PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER ROLE ${POSTGRES_DEFAULT_USER} SET statement_timeout='${TIMEOUT}';" -U ${POSTGRES_DEFAULT_USER} || true
-fi
 
 # Configures users.
 ./psql_users_remove.sh  || true

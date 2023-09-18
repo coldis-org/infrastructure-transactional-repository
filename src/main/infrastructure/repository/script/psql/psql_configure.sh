@@ -59,6 +59,7 @@ PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER USER ${POSTGRES_DEFAULT_U
 ./psql_users_remove.sh  || true
 ./psql_users_add.sh  || true
 ./psql_users_alter_group.sh || true
+./psql_alter_table_owner.sh || true
 
 # If stats extension should be confgured.
 ${DEBUG} && echo "ENABLE_STATS=${ENABLE_STATS}"

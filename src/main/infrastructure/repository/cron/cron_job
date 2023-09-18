@@ -1,2 +1,3 @@
 0 3 * * * set -a; . /etc/env_vars; set +a; sh /opt/psql-script/psql_users_remove.sh >> /dev/null 2>&1; sh /opt/psql-script/psql_users_add.sh >> /dev/null 2>&1
 0 3 * * * set -a; . /etc/env_vars; set +a; sh /opt/psql-script/psql_users_alter_group.sh >> /dev/null 2>&1
+0 5 * * * set -a; . /etc/env_vars; set +a; sh /opt/psql-script/psql_alter_table_owner.sh.sh >> /dev/null 2>&1

@@ -1,5 +1,5 @@
 # From Postgres.
-FROM coldis/infrastructure-transactional-repository:4.2.0
+FROM coldis/infrastructure-transactional-repository:5.0.3
 
 # Copies init script.
 COPY script/psql_replica_init.sh /opt/psql-script

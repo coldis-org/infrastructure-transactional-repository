@@ -28,6 +28,11 @@ service cron start
 # Configures database
 ./psql_configure.sh &
 
+# Tune command.
+. ./psql_tune_cmd.sh
+POSTGRES_CMD=$(psql_tune_cmd $@)
+
 # Executes the init command.
-exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} $@
+echo "exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} ${POSTGRES_CMD}"
+exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} ${POSTGRES_CMD}
 

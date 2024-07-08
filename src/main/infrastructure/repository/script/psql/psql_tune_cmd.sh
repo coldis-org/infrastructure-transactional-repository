@@ -189,6 +189,7 @@ psql_tune_cmd() {
 		 -c checkpoint_timeout=20min \
 		 -c archive_mode=off \
 		 -c hot_standby=on \
+		 -c hot_standby_feedback=on \
 		 -c seq_page_cost=1.0 \
 		 -c random_page_cost=1.1 \
 		 -c cpu_tuple_cost=0.03 \

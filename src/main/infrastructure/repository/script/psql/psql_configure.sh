@@ -188,6 +188,8 @@ else
 
 fi
 
+echo "Database started and configured"
+
 
 
 

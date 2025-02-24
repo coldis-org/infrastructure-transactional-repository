@@ -50,13 +50,13 @@ CHECK_MASTER_CONN () {
 
 CHECK_LDAP_CONN () {
   PG_HBA=$(cat ${PGDATA}/pg_hba.conf)
-  LDAP_HOST_FILE=$(echo "$PG_HBA" | grep -o 'ldapserver=[^ ]*' | head -n 1 | cut -d'=' -f2)
-  LDAP_PORT_FILE=$(echo "$PG_HBA" | grep -o 'ldapport=[^ ]*' | head -n 1 | cut -d'=' -f2)
+  LDAP_HOST_FILE=$(echo "$PG_HBA" | grep -o 'ldapserver=[^ ]*' | head -n 1 | cut -d'=' -f2 | tr -d '"')
+  LDAP_PORT_FILE=$(echo "$PG_HBA" | grep -o 'ldapport=[^ ]*' | head -n 1 | cut -d'=' -f2 | tr -d '"')
 
   if [ "$LDAP_HOST_FILE" != "$LDAP_DB_URI" -o "$LDAP_PORT_FILE" != "$LDAP_DB_PORT" ]; then
 
-    sed -i "s/ldapserver=$LDAP_HOST_FILE/ldapserver=\"$LDAP_DB_URI\"/g;
-      s/ldapport=$LDAP_PORT_FILE/ldapport=\"$LDAP_DB_PORT\"/g" ${PGDATA}/pg_hba.conf
+    sed -i "s/ldapserver=\"$LDAP_HOST_FILE\"/ldapserver=\"$LDAP_DB_URI\"/g;
+      s/ldapport=\"$LDAP_PORT_FILE\"/ldapport=\"$LDAP_DB_PORT\"/g" ${PGDATA}/pg_hba.conf
 	echo "UPDATING LDAP_CONN=${LDAP_DB_URI} - LDAP_PORT=${LDAP_DB_PORT}"
   fi
 }
@@ -70,7 +70,7 @@ if [ -f ${REPLICATION_LOCK_FILE} ]; then
 	CHECK_MASTER_CONN
 	CHECK_LDAP_CONN
   
-  if [ ! $SKIP_RELOAD ];  then
+  if [ $SKIP_RELOAD != "true" ];  then
     RELOAD_PG_CONF
   else
     echo "Skiping reload configuration"

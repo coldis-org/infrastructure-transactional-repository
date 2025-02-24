@@ -12,18 +12,6 @@ REPLICATION_LOCK_FILE=${PGDATA}/replication_configured.lock
 trap - INT TERM
 
 
-CHECK_MASTER_CONN () {
-  MASTER_CONN=$(cat ${PGDATA}/postgresql.auto.conf)
-  MASTER_HOST_CONN=$(echo "$MASTER_CONN" | grep -o 'host=[^ ]*' | cut -d'=' -f2)
-  MASTER_PORT_CONN=$(echo "$MASTER_CONN" | grep -o 'port=[^ ]*' | cut -d'=' -f2)
-
-  if [ "$MASTER_HOST_CONN" != "$MASTER_ENDPOINT" -o "$MASTER_PORT_CONN" != "$COPY_PORT" ]; then
-    sed -i "s/host=$MASTER_HOST_CONN/host=$MASTER_ENDPOINT/g;
-    	s/port=$MASTER_PORT_CONN/port=$COPY_PORT/g" ${PGDATA}/postgresql.auto.conf
-	echo "UPDATING MASTER_CONN=${MASTER_ENDPOINT} - MASTER_PORT=${COPY_PORT}"
-  fi
-}
-
 # If the replication has not been configured yet.
 if [ "${FORCE_BACKUP}" = "true" ]
 then
@@ -77,11 +65,9 @@ chown postgres ${PGDATA} -R
 . ./psql_tune_cmd.sh
 POSTGRES_CMD=$(psql_tune_cmd $@)
 
-# Check if master address has changed
-if [ -f ${REPLICATION_LOCK_FILE} ]; 
-then
-	CHECK_MASTER_CONN
-fi
+# Check if master address and LDAP has changed
+. ./psql_update_conn.sh --skip-reload
+
 
 # Executes the init command.
 echo "exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} ${POSTGRES_CMD}"

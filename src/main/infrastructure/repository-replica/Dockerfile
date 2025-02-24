@@ -1,8 +1,8 @@
 # From Postgres.
-FROM coldis/infrastructure-transactional-repository:6.0.0
+FROM coldis/infrastructure-transactional-repository:5.0.8
 
 # Copies init script.
-COPY script/psql_replica_init.sh /opt/psql-script
+COPY script/*.sh /opt/psql-script
 RUN chown -R postgres:postgres /opt/psql-script && \
 	chmod -R +x /opt/psql-script
 	

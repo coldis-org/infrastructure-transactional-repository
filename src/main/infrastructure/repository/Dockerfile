@@ -1,5 +1,8 @@
+# From Debian.
+FROM coldis/infrastructure-os:1.0.0 as debian
+
 # From Postgres.
-FROM postgres:16.6-bookworm
+FROM postgres:16.8-bookworm
 
 # Sets locale and UTF-8 charset.
 ENV TZ=America/Sao_Paulo \
@@ -26,13 +29,17 @@ COPY conf /tmp
 RUN chown -R postgres:postgres /tmp
 
 # Copies init script.
+COPY --from=debian /opt/os-script /opt/os-script
+COPY --from=debian /usr/bin/os* /usr/bin
 RUN mkdir -p /opt/psql-script	
 COPY script/psql /opt/psql-script
 WORKDIR /opt/psql-script
 RUN chown -R postgres:postgres /opt/psql-script && \
 	chmod -R +x /opt/psql-script
 	
-ENV MAX_CONNECTIONS=300\
+ENV POSTGRES_ADMIN_USER=postgres\
+    POSTGRES_ADMIN_PASSWORD=postgres\
+	MAX_CONNECTIONS=300\
 	MAX_WAL_SENDERS_CONN_PERC=5\
 	CPU_WORK_PERC=300\
 	MAX_WORKER_PROCESSES=\

@@ -6,7 +6,8 @@ set -o errexit
 # Default parameters.
 DEBUG=true
 DEBUG_OPT=
-REPLICATION_LOCK_FILE=${PGDATA}/replication_configured.lock
+REPLICATION_LOCK_FILE=${PGDATA}/standby.signal
+CONNECTION_FILE=${PGDATA}/pg_hba.conf
 SKIP_RELOAD=false
 
 # For each argument.
@@ -67,12 +68,17 @@ CHECK_LDAP_CONN () {
   }
 
 if [ -f ${REPLICATION_LOCK_FILE} ]; then
+  echo "Update Master connection"
 	CHECK_MASTER_CONN
+fi
+
+if [ -f ${CONNECTION_FILE} ]; then
+  echo "Update LDAP connection"
 	CHECK_LDAP_CONN
-  
-  if [ $SKIP_RELOAD != "true" ];  then
-    RELOAD_PG_CONF
-  else
-    echo "Skiping reload configuration"
-  fi
+fi
+
+if [ $SKIP_RELOAD != "true" ];  then
+  RELOAD_PG_CONF
+else
+  echo "Skiping reload configuration"
 fi

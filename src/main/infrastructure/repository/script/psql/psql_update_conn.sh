@@ -9,6 +9,7 @@ DEBUG_OPT=
 REPLICATION_LOCK_FILE=${PGDATA}/standby.signal
 CONNECTION_FILE=${PGDATA}/pg_hba.conf
 SKIP_RELOAD=false
+ENV_FILE="/local/application.env"
 
 # For each argument.
 while :; do
@@ -75,6 +76,9 @@ if [ -f ${REPLICATION_LOCK_FILE} ]; then
     CHECK_MASTER_CONN
   fi
 fi
+
+# Update environment variables
+. $ENV_FILE
 
 if [ -f ${CONNECTION_FILE} ]; then
   if [ -z "$LDAP_DB_URI" ] || [ -z "$LDAP_DB_PORT" ]; then

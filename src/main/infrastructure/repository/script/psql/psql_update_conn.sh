@@ -78,7 +78,7 @@ if [ -f ${REPLICATION_LOCK_FILE} ]; then
 fi
 
 # Update environment variables
-source $ENV_FILE
+. $ENV_FILE
 
 if [ -f ${CONNECTION_FILE} ]; then
   if [ -z "$LDAP_DB_URI" ] || [ -z "$LDAP_DB_PORT" ]; then

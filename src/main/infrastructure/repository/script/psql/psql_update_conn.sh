@@ -39,8 +39,8 @@ trap - INT TERM
 
 CHECK_MASTER_CONN () {
   MASTER_CONN=$(cat ${PGDATA}/postgresql.auto.conf)
-  MASTER_HOST_CONN=$(echo "$MASTER_CONN" | grep -o 'host=[^ ]*' | cut -d'=' -f2)
-  MASTER_PORT_CONN=$(echo "$MASTER_CONN" | grep -o 'port=[^ ]*' | cut -d'=' -f2)
+  MASTER_HOST_CONN=$(echo "$MASTER_CONN" | grep -o 'host=[^ ]*' | tail -n 1 | cut -d'=' -f2)
+  MASTER_PORT_CONN=$(echo "$MASTER_CONN" | grep -o 'port=[^ ]*' | tail -n 1 | cut -d'=' -f2)
 
   if [ "$MASTER_HOST_CONN" != "$MASTER_ENDPOINT" -o "$MASTER_PORT_CONN" != "$COPY_PORT" ]; then
     sed -i "s/host=$MASTER_HOST_CONN/host=$MASTER_ENDPOINT/g;
@@ -68,13 +68,21 @@ CHECK_LDAP_CONN () {
   }
 
 if [ -f ${REPLICATION_LOCK_FILE} ]; then
-  echo "Update Master connection"
-	CHECK_MASTER_CONN
+  if [ -z "$MASTER_ENDPOINT" ] || [ -z "$COPY_PORT" ]; then
+    echo "Not found MASTER environment values"
+  else
+    echo "Update Master connection"
+    CHECK_MASTER_CONN
+  fi
 fi
 
 if [ -f ${CONNECTION_FILE} ]; then
-  echo "Update LDAP connection"
-	CHECK_LDAP_CONN
+  if [ -z "$LDAP_DB_URI" ] || [ -z "$LDAP_DB_PORT" ]; then
+    echo "Not found LDAP environment values"
+  else
+    echo "Update LDAP connection"
+    CHECK_LDAP_CONN
+  fi
 fi
 
 if [ $SKIP_RELOAD != "true" ];  then

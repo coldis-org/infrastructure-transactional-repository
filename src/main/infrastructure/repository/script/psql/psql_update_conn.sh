@@ -38,6 +38,11 @@ done
 # Enables interruption signal handling.
 trap - INT TERM
 
+# Update environment variables
+if [ -f "$ENV_FILE" ]; then
+  . "$ENV_FILE"
+fi
+
 CHECK_MASTER_CONN () {
   MASTER_CONN=$(cat ${PGDATA}/postgresql.auto.conf)
   MASTER_HOST_CONN=$(echo "$MASTER_CONN" | grep -o 'host=[^ ]*' | tail -n 1 | cut -d'=' -f2)
@@ -76,9 +81,6 @@ if [ -f ${REPLICATION_LOCK_FILE} ]; then
     CHECK_MASTER_CONN
   fi
 fi
-
-# Update environment variables
-. $ENV_FILE
 
 if [ -f ${CONNECTION_FILE} ]; then
   if [ -z "$LDAP_DB_URI" ] || [ -z "$LDAP_DB_PORT" ]; then

@@ -63,12 +63,12 @@ chown postgres ${PGDATA} -R
 
 # Tune command.
 . ./psql_tune_cmd.sh
-POSTGRES_CMD=$(psql_tune_cmd $@)
+psql_tune_cmd "$@"
 
 # Check if master address and LDAP has changed
 . ./psql_update_conn.sh --skip-reload
 
 
 # Executes the init command.
-echo "exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} ${POSTGRES_CMD}"
-exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} ${POSTGRES_CMD}
+echo "exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} ${POSTGRES_TUNED_CMD}"
+exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} ${POSTGRES_TUNED_CMD}

@@ -4,6 +4,12 @@
 DEBUG=${DEBUG:=true}
 SKIP_ALTER_GROUP=${SKIP_ALTER_GROUP:=true}
 
+# If not exist
+if [ -z "$LDAP_HOST" ]; then
+	${DEBUG} && echo MOUNTING LDAP_HOST VAR - ${LDAP_URI}:${LDAP_PORT}
+	LDAP_HOST=${LDAP_URI}:${LDAP_PORT}
+fi
+
 # For each group to alter users.
 USER_ALTER_GROUP_VARS=$(env | grep "PSQL_ALTER_GROUP_" | sed -e "s/PSQL_ALTER_GROUP_//")
 

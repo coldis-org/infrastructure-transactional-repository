@@ -4,6 +4,12 @@
 DEBUG=${DEBUG:=true}
 SKIP_DELETE=${SKIP_DELETE:=false}
 
+# If not exist
+if [ -z "$LDAP_HOST" ]; then
+	${DEBUG} && echo MOUNTING LDAP_HOST VAR - ${LDAP_URI}:${LDAP_PORT}
+	LDAP_HOST=${LDAP_URI}:${LDAP_PORT}
+fi
+
 # Initializing user/group variables
 USER_READ_GROUP_VARS=$(env | grep "PSQL_READ_SCHEMA_" | sed -e "s/PSQL_READ_SCHEMA_//")
 USER_GROUP_VARS=$(echo "${USER_READ_GROUP_VARS}")

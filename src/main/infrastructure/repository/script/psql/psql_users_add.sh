@@ -4,6 +4,12 @@
 DEBUG=${DEBUG:=true}
 DEBUG_OPT=
 
+# If not exist
+if [ -z "$LDAP_HOST" ]; then
+	${DEBUG} && echo MOUNTING LDAP_HOST VAR - ${LDAP_URI}:${LDAP_PORT}
+	LDAP_HOST=${LDAP_URI}:${LDAP_PORT}
+fi
+
 # For each permission.
 USER_READ_GROUP_VARS=$(env | grep "PSQL_READ_SCHEMA_" | sed -e "s/PSQL_READ_SCHEMA_/read|/" -e "s/_TABLE_/|/")
 USER_WRITE_GROUP_VARS=$(env | grep "PSQL_WRITE_SCHEMA_" | sed -e "s/PSQL_WRITE_SCHEMA_/write|/" -e "s/_TABLE_/|/")

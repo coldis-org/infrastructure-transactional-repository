@@ -45,8 +45,8 @@ fi
 
 CHECK_MASTER_CONN () {
   MASTER_CONN=$(cat ${PGDATA}/postgresql.auto.conf)
-  MASTER_HOST_CONN=$(echo "$MASTER_CONN" | grep -o 'host=[^ ]*' | tail -n 1 | cut -d'=' -f2)
-  MASTER_PORT_CONN=$(echo "$MASTER_CONN" | grep -o 'port=[^ ]*' | tail -n 1 | cut -d'=' -f2)
+  MASTER_HOST_CONN=$(echo "$MASTER_CONN" | grep -o 'host=[^ ]*' | tail -n 1 | cut -d'=' -f2 | tr -d "'")
+  MASTER_PORT_CONN=$(echo "$MASTER_CONN" | grep -o 'port=[^ ]*' | tail -n 1 | cut -d'=' -f2 | tr -d "'")
 
   if [ "$MASTER_HOST_CONN" != "$MASTER_ENDPOINT" -o "$MASTER_PORT_CONN" != "$COPY_PORT" ]; then
     sed -i "s/host=$MASTER_HOST_CONN/host=$MASTER_ENDPOINT/g;

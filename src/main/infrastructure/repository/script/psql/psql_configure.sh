@@ -19,41 +19,36 @@ while !(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c 'SELECT 1;' -v O
 do
 	sleep 1
 done
-
-# Configures timeout for admin user.
-${DEBUG} && echo "Setting admin user timeout."
-PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "ALTER ROLE CURRENT_ROLE SET statement_timeout = ${ADMIN_STATEMENT_TIMEOUT:=0};" -U ${POSTGRES_ADMIN_USER:=postgres} || true
-PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "ALTER ROLE CURRENT_ROLE SET lock_timeout = ${ADMIN_LOCK_TIMEOUT:=3600000};" -U ${POSTGRES_ADMIN_USER:=postgres} || true
+sleep 2
+echo "Waiting database initialization..."
+while !(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres})
+do
+	sleep 1
+done
 
 
 # If the user has not been (and should) configured yet.
 ${DEBUG} && echo "POSTGRES_DEFAULT_USER=${POSTGRES_DEFAULT_USER}"
-if [ ! -f "${USER_LOCK_FILE}" ] && [ "${POSTGRES_DEFAULT_USER}" != "" ] 
+if [ "${POSTGRES_DEFAULT_USER}" != "" ]  && [ "${POSTGRES_DEFAULT_PASSWORD}" != "" ] 
 then
 
 	${DEBUG} && echo "Configuring default database"
 	
-	# Creates the default user.
-	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_ADMIN_USER:=postgres}
-	
-	# Creates the default database.
-	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE DATABASE ${POSTGRES_DEFAULT_DATABASE} OWNER ${POSTGRES_DEFAULT_USER};" -U ${POSTGRES_ADMIN_USER:=postgres}
+	# Creates the default user and database.
+	while !(PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_DEFAULT_USER})
+	do
+		sleep 1
+		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_ADMIN_USER:=postgres} || true
+		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE DATABASE ${POSTGRES_DEFAULT_DATABASE} OWNER ${POSTGRES_DEFAULT_USER};" -U ${POSTGRES_ADMIN_USER:=postgres} || true
+	done
+	PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} || true
 
-	# Creates the lock.
-	touch ${USER_LOCK_FILE}
-	
 # If the user has been (or should not) configured yet.
 else
 
-	${DEBUG} && echo "Skipping default database"
+	${DEBUG} && echo "Skipping configuring default user/database"
 	
 fi
-
-# Configures default user.
-${DEBUG} && echo "Creating default user."
-PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "CREATE USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} || true
-${DEBUG} && echo "Setting default user password."
-PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} || true
 
 # Configures users.
 ./psql_users_remove.sh  || true

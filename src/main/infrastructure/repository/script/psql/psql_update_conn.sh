@@ -68,10 +68,10 @@ CHECK_LDAP_CONN () {
   fi
 }
 
-  RELOAD_PG_CONF (){
-    echo "Reloading configuration"
+RELOAD_PG_CONF (){
+	echo "Reloading configuration"
     PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -c "SELECT pg_reload_conf();" -U ${POSTGRES_ADMIN_USER} || true
-  }
+}
 
 if [ -f ${REPLICATION_LOCK_FILE} ]; then
   if [ -z "$MASTER_ENDPOINT" ] || [ -z "$COPY_PORT" ]; then

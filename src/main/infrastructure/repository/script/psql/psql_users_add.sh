@@ -11,6 +11,7 @@ if [ -z "$LDAP_HOST" ]; then
 fi
 
 # For each permission.
+#USER_ROLE_GROUP_VARS=$(env | grep "PSQL_ROLE_" | sed -e "s/PSQL_ROLE_/role|/")
 USER_READ_GROUP_VARS=$(env | grep "PSQL_READ_SCHEMA_" | sed -e "s/PSQL_READ_SCHEMA_/read|/" -e "s/_TABLE_/|/")
 USER_WRITE_GROUP_VARS=$(env | grep "PSQL_WRITE_SCHEMA_" | sed -e "s/PSQL_WRITE_SCHEMA_/write|/" -e "s/_TABLE_/|/")
 USER_GROUP_VARS=$(echo "${USER_READ_GROUP_VARS}\n${USER_WRITE_GROUP_VARS}")
@@ -38,14 +39,14 @@ do
 	${DEBUG} && echo "USER_GROUP_PERMISSION_GRANT=${USER_GROUP_PERMISSION_GRANT}"
 	${DEBUG} && echo "USER_GROUPS=${USER_GROUPS}"
 	USER_GROUPS=$( echo "${USER_GROUPS}" | sed -e "s/,/\n/g" )
-	
+	GRANT_TYPE="USAGE"
+	if [ "$USER_GROUP_PERMISSION" = "write" ]; then GRANT_TYPE="CREATE"; fi 
+
 	# For each group.
 	for USER_GROUP in ${USER_GROUPS}
 	do
-		# Get users from schema
+		# Get users from schema.
 		SCHEMA_USERS=
-		GRANT_TYPE="USAGE"
-		if [ "$USER_GROUP_PERMISSION" = "write" ]; then GRANT_TYPE="CREATE"; fi 
 		SCHEMA_USERS=$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -t -A -q -X -c  "select rolname from pg_namespace pn, pg_catalog.pg_roles r where array_to_string(nspacl,',') like '%'||r.rolname||'%' and pg_catalog.has_schema_privilege(r.rolname, nspname, '$GRANT_TYPE') and nspname = '$USER_GROUP_SCHEMA'" -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DEFAULT_DATABASE})
 		
 		${DEBUG} && echo SCHEMA_USERS=${SCHEMA_USERS}
@@ -62,7 +63,7 @@ do
 		# For each user to configure access.
 		for CURRENT_USER in ${USERS}
 		do
-			# Create only if not exist on schema
+			# Create only if not exist on schema.
 			if ! (echo $SCHEMA_USERS | grep -wq $CURRENT_USER)
 			then
 				# Configures the user permissions.

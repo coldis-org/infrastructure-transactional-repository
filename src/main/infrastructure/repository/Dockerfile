@@ -2,7 +2,7 @@
 FROM coldis/infrastructure-os:1.0.0 as debian
 
 # From Postgres.
-FROM postgres:16.9-bookworm
+FROM postgres:17.5-bookworm
 
 # Sets locale and UTF-8 charset.
 ENV TZ=America/Sao_Paulo \

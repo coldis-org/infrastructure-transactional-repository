@@ -20,6 +20,13 @@ then
 	envsubst < /tmp/pg_hba.conf > ${PGDATA}/pg_hba.conf
 fi
 
+# Only if DB exist and postgresql.conf is missing
+if [ -f /tmp/postgresql.conf ] && [ ! -f ${PGDATA}/postgresql.conf ] && [ ! -z "$(find ${PGDATA} -mindepth 1 -quit)" ]
+then
+	echo "Updating missing configuration"
+	cp /tmp/postgresql.conf ${PGDATA}/postgresql.conf
+fi
+
 # To use cron
 env > /etc/env_vars
 chmod +x /etc/env_vars

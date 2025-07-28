@@ -10,6 +10,13 @@ DEBUG_OPT=
 # Enables interruption signal handling.
 trap - INT TERM
 
+# If it's first run
+if [ -z "$(find ${PGDATA} -mindepth 1 -quit)" ]
+then
+	echo "Removing lost+found folder to initialize"
+	rm -rf ${PGDATA}/lost+found || true
+fi
+
 # Makes sure configuration is updated
 if [ -f ${PGDATA}/postgresql.conf ]
 then

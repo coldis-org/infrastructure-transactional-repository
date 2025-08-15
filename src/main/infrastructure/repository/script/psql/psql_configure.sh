@@ -26,6 +26,10 @@ do
 	sleep 1
 done
 
+# Configures timeout for admin user.
+${DEBUG} && echo "Setting admin user timeout."
+PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "ALTER ROLE CURRENT_ROLE SET statement_timeout = ${ADMIN_STATEMENT_TIMEOUT:=0};" -U ${POSTGRES_ADMIN_USER:=postgres} || true
+PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "ALTER ROLE CURRENT_ROLE SET lock_timeout = ${ADMIN_LOCK_TIMEOUT:=0};" -U ${POSTGRES_ADMIN_USER:=postgres} || true
 
 # If the user has not been (and should) configured yet.
 ${DEBUG} && echo "POSTGRES_DEFAULT_USER=${POSTGRES_DEFAULT_USER}"

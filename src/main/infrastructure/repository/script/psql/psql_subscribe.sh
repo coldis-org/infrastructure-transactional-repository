@@ -26,6 +26,8 @@ if [ $UPGRADE_SERVICE = "true" ]; then
 		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -h "${MASTER_ENDPOINT}" -p "${MASTER_PORT}" -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DEFAULT_DATABASE}  -c "CREATE PUBLICATION upgrade_publication FOR ALL TABLES;" || true
 		echo "waiting 15s"
 		sleep 15
+		# Check again
+		EXIST_PUB=$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -At -h "${MASTER_ENDPOINT}" -p "${MASTER_PORT}" -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DEFAULT_DATABASE} -c "SELECT 1 FROM pg_publication WHERE pubname='${PUB_NAME}'" )
   	fi
 
 	# if no publication exists on master

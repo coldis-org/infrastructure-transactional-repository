@@ -170,12 +170,6 @@ else
 
 fi
 
-# Create default upgrade publication
-# if [ ! $UPGRADE_SERVICE = "true" ]; then
-# 	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE PUBLICATION upgrade_publication FOR ALL TABLES;" -U ${POSTGRES_ADMIN_USER:=postgres} || true
-# fi
-./psql_subscribe.sh
-
 # If there is a configuration file.
 ${DEBUG} && echo "SQL_CONFIGURATION=${SQL_CONFIGURATION}"
 if [ -f "${SQL_CONFIGURATION}" ]

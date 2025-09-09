@@ -19,8 +19,16 @@ trap - INT TERM
 
 if [ $UPGRADE_SERVICE = "true" ]; then
 
+	EXIST_PUB=$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -At -h "${MASTER_ENDPOINT}" -p "${MASTER_PORT}" -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DEFAULT_DATABASE} -c "SELECT 1 FROM pg_publication WHERE pubname='${PUB_NAME}'" )
+	
+	# Remotely creating publisher
+	if [ "${EXIST_PUB:-0}" -eq 0 ]; then
+		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -h "${MASTER_ENDPOINT}" -p "${MASTER_PORT}" -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DEFAULT_DATABASE}  -c "CREATE PUBLICATION upgrade_publication FOR ALL TABLES;" || true
+		echo "waiting 15s"
+		sleep 15
+  	fi
+
 	# if no publication exists on master
-	EXIST_PUB=$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -At -h "${MASTER_ENDPOINT}" -p "${MASTER_PORT}" -U ${POSTGRES_ADMIN_USER} -d "$POSTGRES_DEFAULT_DATABASE" -c "SELECT 1 FROM pg_publication WHERE pubname='${PUB_NAME}'" )
 	if [ "${EXIST_PUB:-0}" -eq 0 ]; then
     	echo "Exiting... Publication '${PUB_NAME}' does not exists on $MASTER_ENDPOINT:$MASTER_PORT/$POSTGRES_DEFAULT_DATABASE"
     	kill -s TERM 1 

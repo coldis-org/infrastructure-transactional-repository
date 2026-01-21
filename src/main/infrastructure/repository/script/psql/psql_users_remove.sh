@@ -17,7 +17,7 @@ if [ -z "$LDAP_HOST" ]; then
 fi
 
 # Check if LDAP is up
-ldapsearch -w "${LDAP_PASSWORD}" -D "${LDAP_USER}" -H "ldap://${LDAP_HOST}"  -W -s base -b "" "(objectClass=*)" -o nettimeout=2  >/dev/null 2>&1 \
+ldapsearch -w "${LDAP_PASSWORD}" -D "${LDAP_USER}" -H "ldap://${LDAP_HOST}" -s base -b "" "(objectClass=*)" -o nettimeout=2  >/dev/null 2>&1 \
 && echo "Running psql_users_remove" || { echo "LDAP Server not found, psql_users_remove exiting..."; exit 1; }
 
 # Initializing user/group variables

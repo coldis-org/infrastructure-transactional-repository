@@ -2,7 +2,7 @@
 FROM coldis/infrastructure-os:1.0.0 as debian
 
 # From Postgres.
-FROM postgres:18beta3-bookworm
+FROM postgres:16.10-bookworm
 
 # Sets locale and UTF-8 charset.
 ENV TZ=America/Sao_Paulo \
@@ -18,6 +18,11 @@ RUN apt-get update && \
 	apt-get install -y --no-install-recommends \
 		postgresql-contrib-${PG_MAJOR} ldap-utils gettext cron && \
 	apt-get clean -y && \
+	rm -rf /var/lib/apt/lists/*
+
+# Installs extensions.	
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends postgresql-16-pg-hint-plan && \
 	rm -rf /var/lib/apt/lists/*
 
 COPY cron /etc/cron.d

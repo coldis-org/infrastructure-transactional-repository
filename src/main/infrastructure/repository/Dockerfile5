@@ -1,5 +1,5 @@
 # From Debian.
-FROM coldis/infrastructure-os:1.0.0 as debian
+FROM coldis/infrastructure-os:1.1.0 as debian
 
 # From Postgres.
 FROM postgres:16.10-bookworm

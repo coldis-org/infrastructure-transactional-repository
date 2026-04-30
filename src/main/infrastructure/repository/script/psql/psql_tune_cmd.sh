@@ -37,10 +37,15 @@ psql_tune_cmd() {
 	if [ -z "${POSTGRES_CMD##*$postgres*}" ] 
 	then
 	
-		# OS limits. Probe disk on PGDATA's parent — PGDATA itself does not exist on first boot
-		# (initdb has not run yet), so df would fail and AVAILABLE_DISK would be empty. The parent
-		# is on the same mount and always exists.
-		DISK_PATH=$(dirname "${PGDATA}")
+		# OS limits. Probe disk on the closest existing ancestor of PGDATA — PGDATA itself, and
+		# even its immediate parent, may not exist on first boot (the Postgres image creates the
+		# version-specific subdirectory during initdb). Walk up until we hit a directory that is
+		# present, so df returns a real disk size instead of failing silently to 0 MB.
+		DISK_PATH=${PGDATA}
+		while [ -n "${DISK_PATH}" ] && [ "${DISK_PATH}" != "/" ] && [ ! -d "${DISK_PATH}" ]
+		do
+			DISK_PATH=$(dirname "${DISK_PATH}")
+		done
 		. os_limits
 		available_cpus
 		available_memory

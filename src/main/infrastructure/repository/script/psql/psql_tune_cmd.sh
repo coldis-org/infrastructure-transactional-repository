@@ -65,6 +65,14 @@ psql_tune_cmd() {
 		then
 			DISK_SIZE="${AVAILABLE_DISK}"
 		fi
+		# Fall back to 1 GB when neither override nor probe yielded a value. Otherwise the WAL
+		# size formulas below collapse to 0, which Postgres 17+ rejects (min_wal_size minimum
+		# is 2 MB). This typically happens on first boot when df runs against a data dir that
+		# initdb has not created yet.
+		if [ -z "${DISK_SIZE}" ] || [ "${DISK_SIZE}" -eq 0 ]
+		then
+			DISK_SIZE=1073741824
+		fi
 		
 		# Workers.
 		if [ -z "${MAX_WORKER_PROCESSES}" ]
@@ -140,6 +148,11 @@ psql_tune_cmd() {
 		MIN_WAL_SIZE=$(( MIN_WAL_SIZE > MIN_WAL_SIZE_MAX ? MIN_WAL_SIZE_MAX : MIN_WAL_SIZE ))
 		MAX_WAL_SIZE=$(( MAX_WAL_SIZE > MAX_WAL_SIZE_MAX ? MAX_WAL_SIZE_MAX : MAX_WAL_SIZE ))
 		MAX_SLOT_WAL_KEEP_SIZE=$(( MAX_SLOT_WAL_KEEP_SIZE > MAX_SLOT_WAL_KEEP_SIZE_MAX ? MAX_SLOT_WAL_KEEP_SIZE_MAX : MAX_SLOT_WAL_KEEP_SIZE ))
+
+		# Floor min_wal_size / max_wal_size to 32 MB (two default WAL segments). Postgres rejects
+		# values below 2 MB; staying at 32 MB keeps the database responsive on small disks.
+		MIN_WAL_SIZE=$(( MIN_WAL_SIZE < 32 ? 32 : MIN_WAL_SIZE ))
+		MAX_WAL_SIZE=$(( MAX_WAL_SIZE < 32 ? 32 : MAX_WAL_SIZE ))
 
 		# Arguments.
 		POSTGRES_TUNED_ARGS="\

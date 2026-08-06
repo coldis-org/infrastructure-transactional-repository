@@ -54,10 +54,20 @@ else
 	
 fi
 
-# Configures users.
-./psql_users_remove.sh  || true
-./psql_users_add.sh  || true
-./psql_users_alter_group.sh || true
+# Install permissions infrastructure. Fail-hard: without it the wrapper below
+# would fail silently on every run.
+# Passes admin_user as a psql variable so the GRANT EXECUTE in
+# reconcile_permissions.sql targets whichever role is running this script.
+SQL_DIR="$(cd "$(dirname "$0")" && pwd)/sql"
+cat "${SQL_DIR}/permissions_audit.sql" "${SQL_DIR}/reconcile_permissions.sql" \
+  | PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql \
+        -v ON_ERROR_STOP=1 \
+        -v admin_user="${POSTGRES_ADMIN_USER:=postgres}" \
+        -U ${POSTGRES_ADMIN_USER} \
+        -d "${POSTGRES_DEFAULT_DATABASE}"
+
+# Reconcile users against current LDAP. Tolerant: next cron retries.
+RECONCILE_SOURCE=boot ./psql_reconcile_permissions.sh || true
 
 # If stats extension should be confgured.
 ${DEBUG} && echo "ENABLE_STATS=${ENABLE_STATS}"

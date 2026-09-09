@@ -10,6 +10,11 @@ DEBUG_OPT=
 # Enables interruption signal handling.
 trap - INT TERM
 
+# Moves the data of a previous deployment into the data directory of this version, when it only
+# has to be moved. Data of an older version is reported and left alone: migrating it is what the
+# repository-upgrade image is for.
+./psql_relocate.sh
+
 # If it's first run
 if [ -z "$(find ${PGDATA} -mindepth 1 -quit)" ]
 then

@@ -12,7 +12,7 @@
 		"type": "DOCKER",
 		"volumes": [
 			{
-				"containerPath": "/var/lib/postgresql/data",
+				"containerPath": "/var/lib/postgresql",
 				"mode": "RW",
 				"external": {
 					"name": "infrastructure-transactional-repository-data",
@@ -24,7 +24,7 @@
 			}
 		],
 		"docker": {
-			"image": "coldis/infrastructure-transactional-repository",
+			"image": "coldis/infrastructure-transactional-repository-upgrade",
 			"forcePullImage": true,
 			"parameters": []
 		}

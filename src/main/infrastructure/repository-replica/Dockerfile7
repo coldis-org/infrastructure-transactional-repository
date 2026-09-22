@@ -1,5 +1,9 @@
 # From Postgres.
-FROM coldis/infrastructure-transactional-repository:7.0.0
+# From the repository image of the same release as the primary. Both have to be on the same
+# Debian, and so the same glibc: a physical replica copies index blocks, so a replica whose
+# collation orders text differently from its primary reads those indexes wrong. 7.0.0 is the
+# trixie-based build; from 7.0.3 on the repository image is bookworm, like 14 to 17.
+FROM coldis/infrastructure-transactional-repository:7.0.3
 
 # Copies init script.
 COPY script/*.sh /opt/psql-script

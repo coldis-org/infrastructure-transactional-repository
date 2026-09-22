@@ -29,6 +29,28 @@ fi
 # Enables interruption signal handling.
 trap - INT TERM
 
+# A migration that did not finish leaves a cluster that is valid and empty at the data
+# directory, with the data of the deployment staged beside it under .pg_upgrade_old_<version>:
+# from the moment the new cluster is initialized until the migration is recorded, that is what
+# the volume holds. Starting on it would serve an empty database and take writes into it, and
+# the two most likely next steps both lead here — an orchestrator reverting a failed deployment
+# to this image, and an operator moving back to it by hand. Only the repository-upgrade image
+# can finish the migration or undo it, so this stops and says so. Checked before everything
+# below, including the data directory that already holds a cluster: the empty one does.
+# Read from the same place psql_upgrade.sh writes it, override included: a deployment whose
+# volume is somewhere this cannot derive from PGDATA is exactly the one that would otherwise
+# keep the state file where this never looks, and lose the guard.
+UPGRADE_STATE_FILE=${UPGRADE_MOUNT_ROOT:-${RELOCATE_ROOT}}/.pg_upgrade_state
+if [ -f "${UPGRADE_STATE_FILE}" ]
+then
+	read UPGRADE_PHASE UPGRADE_STATE_REST < "${UPGRADE_STATE_FILE}" || UPGRADE_PHASE=
+	if [ "${UPGRADE_PHASE}" != "done" ]
+	then
+		echo "ERROR: ${UPGRADE_STATE_FILE} records a migration that stopped at '${UPGRADE_PHASE}', so ${PGDATA} may hold an empty cluster while the data of the deployment is staged beside it — deploy the repository-upgrade image to finish the migration, or restore the volume from the snapshot taken before it started" >&2
+		exit 1
+	fi
+fi
+
 # The data directory already holds a cluster, which is every start but the first after a mount
 # point changes. Nothing is ever moved on top of existing data.
 if [ -f "${PGDATA}/PG_VERSION" ]

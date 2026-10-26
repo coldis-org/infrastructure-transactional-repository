@@ -170,9 +170,6 @@ else
 
 fi
 
-# Check if should create pub/sub
-./psql_subscribe.sh
-
 # If there is a configuration file.
 ${DEBUG} && echo "SQL_CONFIGURATION=${SQL_CONFIGURATION}"
 if [ -f "${SQL_CONFIGURATION}" ]

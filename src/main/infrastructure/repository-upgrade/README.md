@@ -227,14 +227,14 @@ until a text index stops finding a row — and look again before adopting a majo
 variant upstream has stopped publishing: that is the release where this stops being free, and the
 reindex becomes part of the window rather than something the image avoids.
 
-**Every published 7.0.0 to 7.0.3 is trixie; 7.0.4 is the first bookworm build.** The suffix was
+**Every published 7.0.0 to 7.0.3 is trixie; 7.1.0 is the first bookworm build.** The suffix was
 added here, so the releases before it carry glibc 2.41. Two consequences:
 
-- Migrating from 14 to 17 needs **7.0.4 or newer**, which is what this module pins. An earlier
+- Migrating from 14 to 17 needs **7.1.0 or newer**, which is what this module pins. An earlier
   7.0.x as the destination is the glibc crossing described above, with none of the warning signs
   an operator would notice during the window.
 - A deployment **already running** 7.0.0 to 7.0.3 has its indexes built under glibc 2.41, and
-  raising its `FROM` to 7.0.4 crosses the same boundary in the other direction. Those are already
+  raising its `FROM` to 7.1.0 crosses the same boundary in the other direction. Those are already
   on PostgreSQL 18 and need nothing from this module: leave them pinned where they are until
   there is a reason to move, and when there is, plan the `REINDEX` — or rebuild from a dump,
   which writes the indexes fresh under whichever glibc is running.

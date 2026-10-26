@@ -408,14 +408,16 @@ fi
 upgrade_check_conf "${OLD_BINDIR}" "${OLD_PGDATA}/postgresql.conf"
 
 # The deployment's admin password, which psql_configure.sh needs to reach the migrated cluster
-# and which this writes into it when the old one had none. The repository image defaults it to
-# the literal postgres, a placeholder everywhere else that would become a real superuser
-# password on a cluster psql_init.sh goes on to expose with host all all 0.0.0.0/0 md5. Asked
-# for only once there is something to migrate, and before pg_upgrade, which in link mode is
-# past the point of return.
+# and which this writes into it when the old one had none. Only the empty value is refused:
+# there would be nothing to write, and psql_configure.sh would then wait for a connection it
+# can never make. The literal postgres is accepted, because it is what the repository image
+# defaults to — a deployment that never set one has exactly that password already, and this
+# image refusing what the image it replaces writes by default would stop a migration without
+# making anything safer. Asked for only once there is something to migrate, and before
+# pg_upgrade, which in link mode is past the point of return.
 case "${ADMIN_PASSWORD}" in
-	''|postgres)
-		upgrade_fail "POSTGRES_ADMIN_PASSWORD is unset or still the default — set it to the password of the deployment before migrating."
+	'')
+		upgrade_fail "POSTGRES_ADMIN_PASSWORD is unset — set it to the admin password of the deployment before migrating."
 		;;
 esac
 

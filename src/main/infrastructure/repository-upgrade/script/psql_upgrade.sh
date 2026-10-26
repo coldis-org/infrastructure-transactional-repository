@@ -543,6 +543,20 @@ else
 		then
 			cp ${OLD_PGDATA}/pg_hba.conf ${OLD_PGDATA}/pg_hba.conf.preupgrade
 		fi
+		# pg_upgrade renames the old cluster's control file to pg_control.old as soon as it has
+		# linked the data files, so that nobody starts the cluster that now shares its blocks with
+		# the new one — and it prints that removing the suffix is how to start it again. A run
+		# interrupted after that point would find the old cluster unstartable and die below on a
+		# message about a missing file, with nothing in it saying the migration is what renamed it.
+		# Put the name back, which is only ever reached here: the phase guard above lets a run
+		# past 'linking' only when an operator asked for the retry, and at that point pg_upgrade
+		# has restored the schema into the new cluster but nothing has run on the linked files
+		# yet, so the old cluster is still the consistent copy of the data.
+		if [ ! -f "${OLD_PGDATA}/global/pg_control" ] && [ -f "${OLD_PGDATA}/global/pg_control.old" ]
+		then
+			echo "Putting back the control file pg_upgrade renamed when it linked the data files"
+			mv "${OLD_PGDATA}/global/pg_control.old" "${OLD_PGDATA}/global/pg_control"
+		fi
 		echo "local all all trust" > ${OLD_PGDATA}/pg_hba.conf
 		echo "Starting PostgreSQL ${OLD_VERSION} to complete crash recovery"
 		su postgres -c "${OLD_BINDIR}/pg_ctl start -D ${OLD_PGDATA} -w -t 3600 -o '-c listen_addresses= -c port=${UPGRADE_PORT} -c unix_socket_directories=${UPGRADE_SOCKET_DIR}'"

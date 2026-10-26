@@ -121,10 +121,15 @@ the new server accepts — a parameter a later major version removed keeps it fr
    window, or drop the line. This fails safely — the server refuses to start on data of a version
    it cannot read — but the message names the image already deployed, which is a confusing place
    to start reading from.
-3. Mount the volume at `/var/lib/postgresql`, for the reason above. The container refuses to
+3. **Confirm the job sets `POSTGRES_ADMIN_PASSWORD` to the deployment's real password.** The
+   migration writes it into the migrated cluster and refuses to run on a password that is unset
+   or still the image default, and it refuses at the start of the window rather than before it:
+   the pre-flight check cannot see the job's environment, so it reports a clean migration either
+   way. Nothing is lost, but the window is.
+4. Mount the volume at `/var/lib/postgresql`, for the reason above. The container refuses to
    start when it is mounted anywhere else, rather than writing the migrated data outside the
    volume, so a forgotten mount costs a failed deployment and not data.
-4. **Leave the replica's mount alone.** The replica stays on the old version, and its data is at
+5. **Leave the replica's mount alone.** The replica stays on the old version, and its data is at
    the old path. It is the rollback, and remounting it destroys that.
 
 ## The window

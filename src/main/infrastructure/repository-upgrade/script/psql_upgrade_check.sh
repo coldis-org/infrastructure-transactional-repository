@@ -171,7 +171,7 @@ su postgres -c "${NEW_BINDIR}/initdb -D ${CHECK_DIR}/new -E UTF8 ${NEW_CHECKSUM_
 # detail is the whole point of running this.
 if ! su postgres -c "cd ${CHECK_DIR} && ${NEW_BINDIR}/pg_upgrade --check --old-bindir=${OLD_BINDIR} --new-bindir=${NEW_BINDIR} --old-datadir=${CHECK_DIR}/old --new-datadir=${CHECK_DIR}/new"
 then
-	find ${CHECK_DIR} ${CHECK_DIR}/new/pg_upgrade_output.d -type f -name '*.txt' 2> /dev/null | while read REPORT_FILE
+	find ${CHECK_DIR} -type f -name '*.txt' 2> /dev/null | while read REPORT_FILE
 	do
 		echo "--- $(basename ${REPORT_FILE})"
 		cat ${REPORT_FILE}

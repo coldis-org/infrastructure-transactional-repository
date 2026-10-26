@@ -8,7 +8,10 @@
 # Older major version: pg_upgrade is run with the server binaries of the old version, which
 # are installed when the image is built (see psql_upgrade_install.sh).
 #
-# Parameters, all optional:
+# Parameters. POSTGRES_ADMIN_USER and POSTGRES_ADMIN_PASSWORD come from the deployment and are
+# required once there is data to migrate: this refuses to run on a password that is unset or still
+# the image default, since it writes that password into the migrated cluster. The rest are
+# optional:
 #   UPGRADE_ENABLED         false leaves any old data alone.
 #   UPGRADE_MODE            auto (default), copy or link.
 #   UPGRADE_ANALYZE         false skips rebuilding the planner statistics.
@@ -257,8 +260,11 @@ then
 fi
 
 # If migration is disabled, or has already been done on this volume, hands off right away. This
-# comes before every check below: a deployment that turned the migration off, or one that has
-# already migrated, has to be able to start whatever the volume or the environment say.
+# comes before every check below, so that neither the environment nor the volume can keep a
+# deployment that turned the migration off from reaching the database. It is not a way out of a
+# migration that stopped half way: psql_relocate.sh, which psql_init.sh runs next, refuses to
+# start on a phase that is not done — because at most phases the data directory holds an empty
+# cluster, and starting it serves an empty database and takes writes into it.
 if [ "${UPGRADE_ENABLED}" != "true" ] || [ "${PHASE}" = "done" ]
 then
 	exit 0
@@ -543,9 +549,9 @@ else
 		then
 			cp ${OLD_PGDATA}/pg_hba.conf ${OLD_PGDATA}/pg_hba.conf.preupgrade
 		fi
-		# pg_upgrade renames the old cluster's control file to pg_control.old as soon as it has
-		# linked the data files, so that nobody starts the cluster that now shares its blocks with
-		# the new one — and it prints that removing the suffix is how to start it again. A run
+		# pg_upgrade renames the old cluster's control file to pg_control.old just before it starts
+		# linking the data files, so that nobody starts the cluster whose blocks the new one is
+		# about to share — and it prints that removing the suffix is how to start it again. A run
 		# interrupted after that point would find the old cluster unstartable and die below on a
 		# message about a missing file, with nothing in it saying the migration is what renamed it.
 		# Put the name back, which is only ever reached here: the phase guard above lets a run
@@ -568,6 +574,20 @@ else
 		OLD_ENCODING=$(su postgres -c "psql -h ${UPGRADE_SOCKET_DIR} -p ${UPGRADE_PORT} -U ${ADMIN_USER} -d template1 -At -c \"SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = 'template0';\"")
 		OLD_COLLATE=$(su postgres -c "psql -h ${UPGRADE_SOCKET_DIR} -p ${UPGRADE_PORT} -U ${ADMIN_USER} -d template1 -At -c \"SELECT datcollate FROM pg_database WHERE datname = 'template0';\"")
 		OLD_CTYPE=$(su postgres -c "psql -h ${UPGRADE_SOCKET_DIR} -p ${UPGRADE_PORT} -U ${ADMIN_USER} -d template1 -At -c \"SELECT datctype FROM pg_database WHERE datname = 'template0';\"")
+
+		# Checked like every other value this reads off the volume, and for the same reason: the
+		# three of them are interpolated into the initdb command string a shell parses. PostgreSQL
+		# validates a locale against the operating system when a database is created, so a value
+		# carrying a metacharacter should never be in the catalog — this costs one case statement
+		# and does not rely on that holding.
+		for LOCALE_VALUE in "${OLD_ENCODING}" "${OLD_COLLATE}" "${OLD_CTYPE}"
+		do
+			case "${LOCALE_VALUE}" in
+				''|*[!A-Za-z0-9_.@-]*)
+					upgrade_fail "the PostgreSQL ${OLD_VERSION} cluster reports '${LOCALE_VALUE}' as part of its encoding or locale, which is not a plain name."
+					;;
+			esac
+		done
 		su postgres -c "${OLD_BINDIR}/pg_ctl stop -D ${OLD_PGDATA} -m fast -w"
 
 		# Reproducing a provider other than libc would need options initdb only accepts in
@@ -648,6 +668,11 @@ else
 		rm -rf ${UPGRADE_LOG_DIR}
 		mkdir -p ${UPGRADE_LOG_DIR}
 		chown postgres:postgres ${UPGRADE_LOG_DIR}
+		# pg_upgrade puts the sockets of both transient clusters in its working directory when it
+		# is not given --socketdir, and a postmaster makes those world-writable by default. Both
+		# clusters trust local connections for the length of the migration, so the directory is
+		# closed the same way the socket directory above is.
+		chmod 700 ${UPGRADE_LOG_DIR}
 		if ! su postgres -c "cd ${UPGRADE_LOG_DIR} && ${NEW_BINDIR}/pg_upgrade --old-bindir=${OLD_BINDIR} --new-bindir=${NEW_BINDIR} --old-datadir=${OLD_PGDATA} --new-datadir=${PGDATA} --username=${ADMIN_USER} --${RESOLVED_MODE}"
 		then
 			find ${UPGRADE_LOG_DIR} ${PGDATA}/pg_upgrade_output.d -type f \( -name '*.log' -o -name '*.txt' \) 2> /dev/null | while read LOG_FILE

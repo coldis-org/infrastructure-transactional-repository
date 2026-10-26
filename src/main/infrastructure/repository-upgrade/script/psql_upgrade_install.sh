@@ -47,6 +47,21 @@ then
 	exit 1
 fi
 
+# Only the major version is named, so a rebuild of a given image tag resolves whatever minor the
+# repository serves that day. That is a deliberate choice and not an oversight.
+#
+# The packages come from the signed repository the base image already carries and already
+# installs its own server from, so the publisher is the same one this image trusts for the
+# PostgreSQL it runs: what grows is the number of packages from that publisher, not the set of
+# publishers. And what these binaries do is read the catalog of the version that wrote the data
+# on the volume, which any minor of that major does — the server the deployment is left running
+# afterwards comes from the FROM of this module, where the version is pinned.
+#
+# Pinning each package exactly would make a rebuild reproducible, at the cost of a build that
+# breaks when the pin ages out: apt.postgresql.org keeps roughly the last three minors of each
+# major, so a pin left alone for two or three upstream releases stops resolving. Revisit this
+# when a build of a specific past image has to be reproduced byte for byte, which is the case it
+# would actually buy something for.
 echo "Installing the PostgreSQL ${OLD_VERSIONS} binaries for pg_upgrade"
 sed -e "s/ main .*/ main ${OLD_VERSIONS}/" ${PGDG_LIST} > ${PGDG_UPGRADE_LIST}
 apt-get update

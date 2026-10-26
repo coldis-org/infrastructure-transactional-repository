@@ -46,7 +46,7 @@ then
 	read UPGRADE_PHASE UPGRADE_STATE_REST < "${UPGRADE_STATE_FILE}" || UPGRADE_PHASE=
 	if [ "${UPGRADE_PHASE}" != "done" ]
 	then
-		echo "ERROR: ${UPGRADE_STATE_FILE} records a migration that stopped at '${UPGRADE_PHASE}', so ${PGDATA} may hold an empty cluster while the data of the deployment is staged beside it — deploy the repository-upgrade image to finish the migration, or restore the volume from the snapshot taken before it started" >&2
+		echo "ERROR: ${UPGRADE_STATE_FILE} records a migration that stopped at '${UPGRADE_PHASE}', so ${PGDATA} may hold an empty cluster while the data of the deployment is staged beside it — deploy the repository-upgrade image to finish the migration, or restore the volume from the snapshot taken before it started. At phase 'migrated' the data directory already holds the migrated cluster and only the finishing steps are left, so an operator who runs those by hand can record the phase as done instead" >&2
 		exit 1
 	fi
 fi

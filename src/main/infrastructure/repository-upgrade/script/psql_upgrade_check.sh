@@ -154,6 +154,90 @@ then
 fi
 echo "  every extension of the deployment is present"
 
+# Catalog rows pointing at objects that are not there any more, read from the deployment itself
+# rather than from the rebuilt schema. pg_upgrade restores the schema with --binary-upgrade, which
+# writes out every member of every extension one by one; the dump read above carries only CREATE
+# EXTENSION, so damage inside an extension never reaches the rebuilt cluster and the checks below
+# pass on a deployment the migration then fails on. These three queries read the catalog directly
+# and are plain selects, so they also answer on a physical replica, which is often the only copy
+# reachable from outside the deployment's own network.
+echo "Checking the catalog of ${CHECK_HOST} for rows pointing at objects that are gone"
+HAS_BROKEN_CATALOG=
+for CHECK_DATABASE in ${CHECK_DATABASES}
+do
+	CHECK_FINDINGS=$(psql -h ${CHECK_HOST} -p ${CHECK_PORT} -U ${CHECK_USER} -d ${CHECK_DATABASE} -At -c "
+	-- Referencias de catalogo apontando para funcoes, roles ou membros de extensao que nao existem.
+	-- Somente leitura, roda numa replica.
+	SELECT achado FROM (
+
+		-- 1. colunas que apontam para pg_proc por OID
+		SELECT 'funcao inexistente: ' || origem || ' -> OID ' || fn AS achado
+		  FROM (
+			SELECT 'pg_operator.oprcode' origem, oprcode::oid fn FROM pg_operator WHERE oprcode <> 0
+			UNION ALL SELECT 'pg_operator.oprrest', oprrest::oid FROM pg_operator WHERE oprrest <> 0
+			UNION ALL SELECT 'pg_operator.oprjoin', oprjoin::oid FROM pg_operator WHERE oprjoin <> 0
+			UNION ALL SELECT 'pg_amproc.amproc', amproc::oid FROM pg_amproc WHERE amproc <> 0
+			UNION ALL SELECT 'pg_cast.castfunc', castfunc FROM pg_cast WHERE castfunc <> 0
+			UNION ALL SELECT 'pg_aggregate.aggtransfn', aggtransfn::oid FROM pg_aggregate WHERE aggtransfn <> 0
+			UNION ALL SELECT 'pg_aggregate.aggfinalfn', aggfinalfn::oid FROM pg_aggregate WHERE aggfinalfn <> 0
+			UNION ALL SELECT 'pg_proc.prosupport', prosupport::oid FROM pg_proc WHERE prosupport <> 0
+			UNION ALL SELECT 'pg_trigger.tgfoid', tgfoid::oid FROM pg_trigger WHERE tgfoid <> 0
+			UNION ALL SELECT 'pg_range.rngcanonical', rngcanonical::oid FROM pg_range WHERE rngcanonical <> 0
+			UNION ALL SELECT 'pg_range.rngsubdiff', rngsubdiff::oid FROM pg_range WHERE rngsubdiff <> 0
+		  ) r
+		 WHERE NOT EXISTS (SELECT 1 FROM pg_proc p WHERE p.oid = r.fn)
+
+		UNION ALL
+
+		-- 2. privilegios concedidos a roles que nao existem mais
+		SELECT 'privilegio para role inexistente: ' || origem || ' em ' || alvo || ' -> OID ' || grantee
+		  FROM (
+			SELECT 'pg_proc.proacl' origem, p.oid::regprocedure::text alvo, a.grantee
+			  FROM pg_proc p, aclexplode(p.proacl) a
+			UNION ALL SELECT 'pg_class.relacl', c.oid::regclass::text, a.grantee
+			  FROM pg_class c, aclexplode(c.relacl) a
+			UNION ALL SELECT 'pg_namespace.nspacl', n.nspname, a.grantee
+			  FROM pg_namespace n, aclexplode(n.nspacl) a
+			UNION ALL SELECT 'pg_type.typacl', t.oid::regtype::text, a.grantee
+			  FROM pg_type t, aclexplode(t.typacl) a
+			UNION ALL SELECT 'pg_database.datacl', d.datname, a.grantee
+			  FROM pg_database d, aclexplode(d.datacl) a
+			UNION ALL SELECT 'pg_default_acl.defaclacl', 'padrao', a.grantee
+			  FROM pg_default_acl da, aclexplode(da.defaclacl) a
+		  ) g
+		 WHERE grantee <> 0
+		   AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.oid = g.grantee)
+
+		UNION ALL
+
+		-- 3. membros que a extensao declara mas que nao existem mais
+		SELECT 'membro de extensao ausente: ' || e.extname || ' declara um ' || d.classid::regclass::text || ' OID ' || d.objid
+		  FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid
+		 WHERE d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'
+		   AND ((d.classid = 'pg_proc'::regclass     AND NOT EXISTS (SELECT 1 FROM pg_proc x     WHERE x.oid = d.objid))
+		     OR (d.classid = 'pg_class'::regclass    AND NOT EXISTS (SELECT 1 FROM pg_class x    WHERE x.oid = d.objid))
+		     OR (d.classid = 'pg_type'::regclass     AND NOT EXISTS (SELECT 1 FROM pg_type x     WHERE x.oid = d.objid))
+		     OR (d.classid = 'pg_operator'::regclass AND NOT EXISTS (SELECT 1 FROM pg_operator x WHERE x.oid = d.objid)))
+
+	) achados ORDER BY 1;
+	") || {
+		echo "ERROR: could not read the catalog of ${CHECK_DATABASE} on ${CHECK_HOST}" >&2
+		exit 1
+	}
+	if [ -n "${CHECK_FINDINGS}" ]
+	then
+		echo "  ${CHECK_DATABASE}:"
+		echo "${CHECK_FINDINGS}" | sed -e 's/^/    /'
+		HAS_BROKEN_CATALOG=true
+	fi
+done
+if [ -n "${HAS_BROKEN_CATALOG}" ]
+then
+	echo "ERROR: the migration would fail restoring the schema into the new cluster — the rows above name objects that were removed from the catalog without the rows that reference them. Repair them on the running deployment, which needs no window, and run this again." >&2
+	exit 1
+fi
+echo "  no catalog row points at a missing object"
+
 # The rebuild dropping statements of its own also hides them from the check. The roles the
 # throwaway cluster was initialized with are expected to collide with the dumped ones.
 grep -i error ${CHECK_DIR}/restore.log | grep -v 'role .* already exists' | sort -u > ${CHECK_DIR}/restore_errors.log || true

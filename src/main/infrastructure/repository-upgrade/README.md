@@ -84,6 +84,20 @@ and finding out during the window is expensive.
 It reports the catalog, which is where `pg_upgrade --check` looks. When the schema does not
 rebuild cleanly it says so, rather than reporting a clean result it cannot back.
 
+**It also reads the deployment's own catalog for rows that point at objects which are gone**, and
+refuses the migration when it finds any. This covers what the rebuild above cannot: the dump it
+reads carries only `CREATE EXTENSION`, while `pg_upgrade` restores the schema with
+`--binary-upgrade`, which writes out every member of every extension one by one. A function
+removed from `pg_proc` by hand therefore leaves the rebuilt cluster clean and the real migration
+dead, halfway through, with the old cluster already linked. Three things are read: columns that
+name a function by OID (`pg_operator`, `pg_amproc`, `pg_cast`, `pg_aggregate`, `pg_trigger`,
+`pg_range`, `prosupport`), privileges granted to roles that no longer exist, and members an
+extension still declares after the object itself was removed — that last one is what catches a
+function nothing references, which only fails later, at `ALTER EXTENSION ... UPDATE`.
+
+Repairing any of them needs no window: the deployment is running, and the repair is a statement
+against it. Finding out during the window is what costs.
+
 **Point it at a replica.** Physical replication copies the catalog block for block, so a replica
 answers the same as the primary — checked against both, the reports are identical. That is what
 makes this runnable from a workstation that only reaches the replicas, and it keeps the dump off

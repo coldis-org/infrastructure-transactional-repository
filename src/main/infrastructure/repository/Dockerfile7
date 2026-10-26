@@ -4,8 +4,10 @@ FROM coldis/infrastructure-os:1.1.0 as debian
 # From Postgres, on bookworm rather than the trixie the plain tag points at. The images of 14
 # to 17 are bookworm, so staying on it keeps glibc at 2.36 across a major upgrade: the sort
 # order the collation-aware indexes were built with is the one the server goes on using, and
-# pg_upgrade — which carries indexes over untouched — needs no reindex after.
-FROM postgres:18.1-bookworm
+# pg_upgrade — which carries indexes over untouched — needs no reindex after. The suffix has to
+# survive every minor bump: dropping it moves the image to trixie, which is the same crossing
+# and is invisible until a text index stops finding a row that is there.
+FROM postgres:18.6-bookworm
 
 # Sets locale and UTF-8 charset.
 ENV TZ=America/Sao_Paulo \

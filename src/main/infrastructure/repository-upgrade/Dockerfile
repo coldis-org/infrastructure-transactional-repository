@@ -17,12 +17,19 @@
 # From the newest repository image, which is the version the data is migrated to. It is published
 # by this project, and the tag names an immutable release that is never re-pushed — which is what
 # makes pinning it worth anything. The tag has to be raised along with the one of the repository
-# module, and cannot be older than 7.0.3: before it the shared configuration this image inherits
-# names a parameter PostgreSQL 13 removed and preloads a library only the PostgreSQL 16 image
-# installs, so the check below refuses the image's own file; and before 7.0.2 the lock tables
-# did not follow the available memory, so this asks for gigabytes of shared memory on a small
-# deployment and is killed by the kernel right after migrating.
-FROM coldis/infrastructure-transactional-repository:7.0.3
+# module, and cannot be older than 7.0.4, for three reasons that accumulated across releases.
+#
+# 7.0.0 to 7.0.3 are built on trixie, and 7.0.4 is the first on bookworm. That is the one that
+# matters here: 14 to 17 are bookworm, so migrating from any of them with an earlier 7.0.x
+# crosses glibc 2.36 to 2.41, and pg_upgrade carries the collation-aware indexes over untouched —
+# which is the reindex this whole module exists to avoid. See the README.
+#
+# Before 7.0.4 the shared configuration this image inherits names a parameter PostgreSQL 13
+# removed and preloads a library only the PostgreSQL 16 image installs, so the check below
+# refuses the image's own file. And before 7.0.2 the lock tables did not follow the available
+# memory, so this asks for gigabytes of shared memory on a small deployment and is killed by the
+# kernel right after migrating.
+FROM coldis/infrastructure-transactional-repository:7.0.4
 
 # Copies the migration scripts, which the repository image does not carry: it holds no
 # migration code at all, so a database can never migrate itself by accident.

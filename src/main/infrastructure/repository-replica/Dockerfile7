@@ -1,9 +1,9 @@
-# From Postgres.
 # From the repository image of the same release as the primary. Both have to be on the same
 # Debian, and so the same glibc: a physical replica copies index blocks, so a replica whose
-# collation orders text differently from its primary reads those indexes wrong. 7.0.0 is the
-# trixie-based build; from 7.0.3 on the repository image is bookworm, like 14 to 17.
-FROM coldis/infrastructure-transactional-repository:7.0.3
+# collation orders text differently from its primary reads those indexes wrong. Every published
+# 7.0.0 to 7.0.3 is trixie; 7.0.4 is the first bookworm build, so a replica on it belongs to a
+# primary on it and not to one still running an earlier 7.0.x.
+FROM coldis/infrastructure-transactional-repository:7.0.4
 
 # Copies init script.
 COPY script/*.sh /opt/psql-script

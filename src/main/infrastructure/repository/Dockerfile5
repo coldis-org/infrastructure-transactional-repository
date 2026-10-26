@@ -29,9 +29,12 @@ COPY cron /etc/cron.d
 RUN chmod -R 0644 /etc/cron.d/ \
 	&& crontab /etc/cron.d/cron_job
 
-# Copies the server configuration.
+# Copies the server configuration, and declares the extension only this image installs: the
+# shared file has to stay valid for every version, and the other images do not carry it.
 COPY conf /tmp
-RUN chown -R postgres:postgres /tmp
+RUN printf "\nshared_preload_libraries = '%s'\n" pg_hint_plan >> /tmp/postgresql.conf && \
+	grep -qx "shared_preload_libraries = 'pg_hint_plan'" /tmp/postgresql.conf && \
+	chown -R postgres:postgres /tmp
 
 # Copies init script.
 COPY --from=debian /opt/os-script /opt/os-script

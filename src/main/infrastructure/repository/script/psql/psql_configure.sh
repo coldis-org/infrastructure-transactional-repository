@@ -119,7 +119,12 @@ then
 	# Creates unaccent extension.
 	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE EXTENSION IF NOT EXISTS unaccent;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}
 	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "ALTER EXTENSION unaccent UPDATE;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}
-	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE OR REPLACE FUNCTION immutable_unaccent(text) RETURNS text LANGUAGE SQL IMMUTABLE AS \$\$SELECT unaccent(\$1)\$\$;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}
+	# The call names its schema because pg_upgrade cannot restore an index whose expression
+	# reaches an unqualified name: pg_restore runs with an empty search_path, inlines this
+	# function while it creates the index, and stops when unaccent does not resolve. A search_path
+	# on the function would fix that too, but a SQL function carrying SET is not inlined and the
+	# index would stop being used for the expression it was built for.
+	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE OR REPLACE FUNCTION immutable_unaccent(text) RETURNS text LANGUAGE SQL IMMUTABLE AS \$\$SELECT public.unaccent(\$1)\$\$;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}
 
 	# Creates pg_trgm extension.
 	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}

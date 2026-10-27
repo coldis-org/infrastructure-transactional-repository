@@ -590,6 +590,67 @@ else
 					;;
 			esac
 		done
+
+		# An index whose expression calls a SQL function that names an object without its schema
+		# is an index pg_upgrade cannot restore. pg_restore runs with an empty search_path, so
+		# while it creates the index the function is inlined and the unqualified name does not
+		# resolve; the restore stops and the migration fails with the old cluster still whole.
+		#
+		# The repository image creates exactly one such function, in psql_configure.sh:
+		#
+		#   CREATE OR REPLACE FUNCTION immutable_unaccent(text) RETURNS text LANGUAGE SQL
+		#     IMMUTABLE AS $$SELECT unaccent($1)$$;
+		#
+		# and a deployment that indexes on it cannot be migrated until it is qualified. Only the
+		# body changes and both spellings resolve to the same function, so what the function
+		# returns is unchanged and the index built from it stays valid: no reindex follows.
+		#
+		# Qualifying rather than giving the function a search_path of its own is deliberate. A
+		# SQL function carrying SET is not inlined, and the index would stop being used for the
+		# expression it was built for.
+		UPGRADE_UNACCENT_SQL=$(mktemp /tmp/upgrade_unaccent_XXXXXX.sql)
+		cat > ${UPGRADE_UNACCENT_SQL} <<'UPGRADE_UNACCENT_SQL_END'
+-- Qualifica o schema do unaccent chamado pela immutable_unaccent, onde as duas existem.
+DO $upgrade$
+DECLARE
+	target record;
+	unaccent_name text;
+BEGIN
+	SELECT quote_ident(n.nspname) || '.' || quote_ident(p.proname) INTO unaccent_name
+		FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE p.proname = 'unaccent' AND p.pronargs = 1 AND p.proargtypes[0] = 'text'::regtype
+		LIMIT 1;
+	IF unaccent_name IS NULL THEN
+		RETURN;
+	END IF;
+	-- prosrc sem um ponto antes do unaccent e o corpo nao qualificado. Reescrever um ja
+	-- qualificado nao faria mal, mas nao ha o que dizer no log sobre ele.
+	FOR target IN
+		SELECT n.nspname
+			FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE p.proname = 'immutable_unaccent' AND p.pronargs = 1
+				AND p.proargtypes[0] = 'text'::regtype
+				AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'sql')
+				AND p.prosrc !~ '\.\s*unaccent'
+	LOOP
+		EXECUTE format(
+			'CREATE OR REPLACE FUNCTION %I.immutable_unaccent(text) RETURNS text '
+			|| 'LANGUAGE SQL IMMUTABLE AS $body$SELECT %s($1)$body$',
+			target.nspname, unaccent_name);
+		RAISE NOTICE 'qualified %.immutable_unaccent in % to call %',
+			target.nspname, current_database(), unaccent_name;
+	END LOOP;
+END
+$upgrade$;
+UPGRADE_UNACCENT_SQL_END
+		chown postgres:postgres ${UPGRADE_UNACCENT_SQL}
+		for UPGRADE_DATABASE in $(su postgres -c "psql -h ${UPGRADE_SOCKET_DIR} -p ${UPGRADE_PORT} -U ${ADMIN_USER} -d template1 -At -c \"SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0';\"")
+		do
+			# The notice names the database itself: the severity label psql prints in front of it
+			# is translated, so nothing here can key on it.
+			su postgres -c "psql -h ${UPGRADE_SOCKET_DIR} -p ${UPGRADE_PORT} -U ${ADMIN_USER} -d ${UPGRADE_DATABASE} -q -v ON_ERROR_STOP=1 -f ${UPGRADE_UNACCENT_SQL}" || upgrade_fail "could not qualify immutable_unaccent in ${UPGRADE_DATABASE}."
+		done
+		rm -f ${UPGRADE_UNACCENT_SQL}
 		su postgres -c "${OLD_BINDIR}/pg_ctl stop -D ${OLD_PGDATA} -m fast -w"
 
 		# Reproducing a provider other than libc would need options initdb only accepts in

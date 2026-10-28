@@ -86,6 +86,18 @@ echo "Changing folder permissions"
 chmod 750 ${PGDATA} -R
 chown postgres ${PGDATA} -R
 
+# From PostgreSQL 18 on the data directory sits in a folder named after the major version, and
+# pg_basebackup creates that folder along with the data directory, as root and 0700. The chown
+# above only reaches inside the data directory, so postgres is left unable to traverse into it
+# and the server stops at "could not access directory". Nothing below the parent is touched:
+# a volume holding other versions keeps them as they are.
+PGDATA_PARENT=$(dirname ${PGDATA})
+if [ "$(basename ${PGDATA_PARENT})" = "${PG_MAJOR}" ]
+then
+	chmod 750 ${PGDATA_PARENT}
+	chown postgres ${PGDATA_PARENT}
+fi
+
 # Tune command.
 . ./psql_tune_cmd.sh
 psql_tune_cmd "$@"

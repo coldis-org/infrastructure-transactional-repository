@@ -39,13 +39,16 @@ then
 	${DEBUG} && echo "Configuring default database"
 	
 	# Creates the default user and database.
-	while !(PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_DEFAULT_USER})
+	# Connects to the default database, not to one named after the user: psql falls back to the
+	# user name when no database is given, and then a module whose database has another name
+	# never sees the probe succeed, so the loop below never ends. Empty keeps the old fallback.
+	while !(PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_DEFAULT_USER} ${POSTGRES_DEFAULT_DATABASE})
 	do
 		sleep 1
 		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_ADMIN_USER:=postgres} || true
 		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE DATABASE ${POSTGRES_DEFAULT_DATABASE} OWNER ${POSTGRES_DEFAULT_USER};" -U ${POSTGRES_ADMIN_USER:=postgres} || true
 	done
-	PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} || true
+	PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} ${POSTGRES_DEFAULT_DATABASE} || true
 
 # If the user has been (or should not) configured yet.
 else

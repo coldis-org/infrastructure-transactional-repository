@@ -45,7 +45,17 @@ RUN chown -R root:root /opt/psql-script && \
 # read the catalog of the data they wrote, and nothing is downloaded while a database is
 # starting. What gets migrated is the version the volume actually holds, so listing them all
 # costs only image size.
-ENV PG_UPGRADE_FROM="14 15 16 17"
+#
+# 12 and 13 are out of support upstream and apt.postgresql.org still serves their binaries,
+# which is all pg_upgrade reads the old catalog with. 12 is listed because deployments of it are
+# still around; 13 because the tag of an image is a poor way to tell which major it runs — this
+# list was written from one and had the wrong version in it. The list is contiguous so that
+# being wrong again costs image size rather than a migration window.
+#
+# Those two are also the versions whose images predate bookworm, so their data was written under
+# an older glibc and crossing to this one needs the REINDEX the rest of this list is pinned to
+# avoid. See the README.
+ENV PG_UPGRADE_FROM="12 13 14 15 16 17"
 RUN /opt/psql-script/psql_upgrade_install.sh
 
 # Hard links the data files into the new cluster instead of copying them, as pg_upgrade --link

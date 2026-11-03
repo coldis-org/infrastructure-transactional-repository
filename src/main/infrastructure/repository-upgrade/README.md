@@ -248,6 +248,16 @@ added here, so the releases before it carry glibc 2.41. Two consequences:
 - Migrating from 14 to 17 needs **7.1.0 or newer**, which is what this module pins. An earlier
   7.0.x as the destination is the glibc crossing described above, with none of the warning signs
   an operator would notice during the window.
+- **PostgreSQL 12 and 13 are the exception the destination cannot fix.** Their images are older
+  than bookworm, so their data was written under glibc 2.28 or 2.31 and reaches 2.36 whatever
+  this module migrates to. Plan the `REINDEX` and the `ALTER DATABASE ... REFRESH COLLATION
+  VERSION` as part of that window, and do not wait for the server to ask for it.
+  `datcollversion` only exists from PostgreSQL 15 on, so a 12 or a 13 records no collation
+  version at all, and `pg_upgrade` fills the column with the version of the library running at
+  migration time. Measured here: a cluster written under glibc 2.31 arrives reading
+  `2.36 | 2.36`, which is the catalog claiming the indexes are current when they were built
+  under another library. The mismatch warning that flagged every other version of this list
+  never appears for them.
 - A deployment **already running** 7.0.0 to 7.0.3 has its indexes built under glibc 2.41, and
   raising its `FROM` to 7.1.0 crosses the same boundary in the other direction. Those are already
   on PostgreSQL 18 and need nothing from this module: leave them pinned where they are until

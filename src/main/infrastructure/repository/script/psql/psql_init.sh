@@ -15,28 +15,20 @@ trap - INT TERM
 # repository-upgrade image is for.
 ./psql_relocate.sh
 
-# If it's first run
-if [ -z "$(find ${PGDATA} -mindepth 1 -quit)" ]
+# PG_VERSION is what initdb leaves behind: its presence means there is a cluster in the data
+# directory, whatever state its configuration files are in.
+if [ ! -f "${PGDATA}/PG_VERSION" ]
 then
+	# First run: initdb refuses a non empty directory, and a fresh volume may carry lost+found.
 	echo "Removing lost+found folder to initialize"
-	rm -rf ${PGDATA}/lost+found || true
-fi
-
-# Makes sure configuration is updated
-if [ -f ${PGDATA}/postgresql.conf ]
-then
+	rm -rf "${PGDATA}/lost+found" || true
+else
+	# Makes sure configuration is updated. Overwrites in place rather than removing first, so a
+	# boot interrupted half way never leaves the cluster without them, and restores them if they
+	# went missing (the server does not start without postgresql.conf).
 	${DEBUG} && echo "Updating configuration"
-	rm -Rf ${PGDATA}/postgresql.conf
-	cp /tmp/postgresql.conf ${PGDATA}/postgresql.conf
-	rm -Rf ${PGDATA}/pg_hba.conf
-	envsubst < /tmp/pg_hba.conf > ${PGDATA}/pg_hba.conf
-fi
-
-# Only if DB exist and postgresql.conf is missing
-if [ -f /tmp/postgresql.conf ] && [ ! -f ${PGDATA}/postgresql.conf ] && [ ! -z "$(find ${PGDATA} -mindepth 1 -quit)" ]
-then
-	echo "Updating missing configuration"
-	cp /tmp/postgresql.conf ${PGDATA}/postgresql.conf
+	cp /tmp/postgresql.conf "${PGDATA}/postgresql.conf"
+	envsubst < /tmp/pg_hba.conf > "${PGDATA}/pg_hba.conf"
 fi
 
 # To use cron

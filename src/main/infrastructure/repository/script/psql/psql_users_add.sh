@@ -3,6 +3,12 @@
 # Default parameters.
 DEBUG=${DEBUG:=true}
 DEBUG_OPT=
+ENV_FILE="/local/application.env"
+
+# Update environment variables
+if [ -f "$ENV_FILE" ]; then
+  . "$ENV_FILE"
+fi
 
 # If not exist
 if [ -z "$LDAP_HOST" ]; then

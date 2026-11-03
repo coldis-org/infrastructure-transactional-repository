@@ -4,6 +4,13 @@
 DEBUG=${DEBUG:=true}
 SKIP_ALTER_GROUP=${SKIP_ALTER_GROUP:=true}
 
+ENV_FILE="/local/application.env"
+
+# Update environment variables
+if [ -f "$ENV_FILE" ]; then
+  . "$ENV_FILE"
+fi
+
 # If not exist
 if [ -z "$LDAP_HOST" ]; then
 	${DEBUG} && echo MOUNTING LDAP_HOST VAR - ${LDAP_URI}:${LDAP_PORT}

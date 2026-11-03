@@ -37,8 +37,15 @@ psql_tune_cmd() {
 	if [ -z "${POSTGRES_CMD##*$postgres*}" ] 
 	then
 	
-		# OS limits.
+		# OS limits. Probe disk on the closest existing ancestor of PGDATA — PGDATA itself, and
+		# even its immediate parent, may not exist on first boot (the Postgres image creates the
+		# version-specific subdirectory during initdb). Walk up until we hit a directory that is
+		# present, so df returns a real disk size instead of failing silently to 0 MB.
 		DISK_PATH=${PGDATA}
+		while [ -n "${DISK_PATH}" ] && [ "${DISK_PATH}" != "/" ] && [ ! -d "${DISK_PATH}" ]
+		do
+			DISK_PATH=$(dirname "${DISK_PATH}")
+		done
 		. os_limits
 		available_cpus
 		available_memory
@@ -64,6 +71,14 @@ psql_tune_cmd() {
 		if [ -z "${DISK_SIZE}" ]
 		then
 			DISK_SIZE="${AVAILABLE_DISK}"
+		fi
+		# Fall back to 1 GB when neither override nor probe yielded a value. Otherwise the WAL
+		# size formulas below collapse to 0, which Postgres 17+ rejects (min_wal_size minimum
+		# is 2 MB). This typically happens on first boot when df runs against a data dir that
+		# initdb has not created yet.
+		if [ -z "${DISK_SIZE}" ] || [ "${DISK_SIZE}" -eq 0 ]
+		then
+			DISK_SIZE=1073741824
 		fi
 		
 		# Workers.
@@ -116,8 +131,20 @@ psql_tune_cmd() {
 			TOTAL_MAINTENANCE_WORK_MEM=$(( NON_RESERVED_MAX_MEMORY * TOTAL_MAINTENANCE_WORK_MEM_PERC / 100 ))
 			MAINTENANCE_WORK_MEM=$(( TOTAL_MAINTENANCE_WORK_MEM / (MAX_PARALLEL_MAINTENANCE_WORKERS + AUTOVACUUM_MAX_WORKERS )))
 			
+			# Lock tables. The shared memory they take is reserved at startup whether it is used
+			# or not, and it grows with max_locks_per_transaction times the connection limit: a
+			# fixed value large enough for a partitioned warehouse keeps a small database from
+			# starting at all, since the kernel kills the server before it can report anything.
+			# Measured at about 768 bytes, or three quarters of a kilobyte, for each lock slot of
+			# each connection, covering the predicate lock table along with the regular one.
+			TOTAL_LOCKS_MEMORY=$(( NON_RESERVED_MAX_MEMORY * TOTAL_LOCKS_MEMORY_PERC / 100 ))
+			MAX_LOCKS_PER_TRANSACTION=$(( TOTAL_LOCKS_MEMORY * 4 / (MAX_CONNECTIONS * 3) ))
+			MAX_LOCKS_PER_TRANSACTION=$(( MAX_LOCKS_PER_TRANSACTION > MAX_LOCKS_PER_TRANSACTION_MAX ? MAX_LOCKS_PER_TRANSACTION_MAX : MAX_LOCKS_PER_TRANSACTION ))
+			MAX_LOCKS_PER_TRANSACTION=$(( MAX_LOCKS_PER_TRANSACTION < MAX_LOCKS_PER_TRANSACTION_MIN ? MAX_LOCKS_PER_TRANSACTION_MIN : MAX_LOCKS_PER_TRANSACTION ))
+			TOTAL_LOCKS_MEMORY=$(( MAX_LOCKS_PER_TRANSACTION * MAX_CONNECTIONS * 3 / 4 ))
+
 			# Updates reserved memory.
-			TOTAL_CONFIGURED_MEMORY=$(( WAL_BUFFERS + WAL_WRITER_FLUSH_AFTER + WAL_DECODE_BUFFER_SIZE + TOTAL_LOGICAL_DECODING_WORK_MEM + SHARED_BUFFERS + TOTAL_WORK_MEM + TOTAL_MAINTENANCE_WORK_MEM ))
+			TOTAL_CONFIGURED_MEMORY=$(( WAL_BUFFERS + WAL_WRITER_FLUSH_AFTER + WAL_DECODE_BUFFER_SIZE + TOTAL_LOGICAL_DECODING_WORK_MEM + SHARED_BUFFERS + TOTAL_WORK_MEM + TOTAL_MAINTENANCE_WORK_MEM + TOTAL_LOCKS_MEMORY ))
 			ACTUAL_RESERVED_MEMORY=$(( MAX_MEMORY - TOTAL_CONFIGURED_MEMORY ))
 			ACTUAL_RESERVED_MEMORY_PERC=$(( ACTUAL_RESERVED_MEMORY * 100 / MAX_MEMORY ))
 			NON_RESERVED_MAX_MEMORY=$(( NON_RESERVED_MAX_MEMORY - (MAX_MEMORY / 50 )))
@@ -140,6 +167,11 @@ psql_tune_cmd() {
 		MIN_WAL_SIZE=$(( MIN_WAL_SIZE > MIN_WAL_SIZE_MAX ? MIN_WAL_SIZE_MAX : MIN_WAL_SIZE ))
 		MAX_WAL_SIZE=$(( MAX_WAL_SIZE > MAX_WAL_SIZE_MAX ? MAX_WAL_SIZE_MAX : MAX_WAL_SIZE ))
 		MAX_SLOT_WAL_KEEP_SIZE=$(( MAX_SLOT_WAL_KEEP_SIZE > MAX_SLOT_WAL_KEEP_SIZE_MAX ? MAX_SLOT_WAL_KEEP_SIZE_MAX : MAX_SLOT_WAL_KEEP_SIZE ))
+
+		# Floor min_wal_size / max_wal_size to 32 MB (two default WAL segments). Postgres rejects
+		# values below 2 MB; staying at 32 MB keeps the database responsive on small disks.
+		MIN_WAL_SIZE=$(( MIN_WAL_SIZE < 32 ? 32 : MIN_WAL_SIZE ))
+		MAX_WAL_SIZE=$(( MAX_WAL_SIZE < 32 ? 32 : MAX_WAL_SIZE ))
 
 		# Arguments.
 		POSTGRES_TUNED_ARGS="\
@@ -198,8 +230,8 @@ psql_tune_cmd() {
  -c deadlock_timeout=1s \
  -c default_statistics_target=500 \
  -c jit=on \
- -c max_locks_per_transaction=16384 \
- -c max_pred_locks_per_transaction=16384 \
+ -c max_locks_per_transaction=${MAX_LOCKS_PER_TRANSACTION} \
+ -c max_pred_locks_per_transaction=${MAX_LOCKS_PER_TRANSACTION} \
  -c max_pred_locks_per_page=3 \
  -c max_pred_locks_per_relation=128 \
  -c max_standby_streaming_delay=2h \

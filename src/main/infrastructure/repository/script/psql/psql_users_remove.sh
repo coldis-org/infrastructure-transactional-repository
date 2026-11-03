@@ -3,12 +3,22 @@
 # Default parameters
 DEBUG=${DEBUG:=true}
 SKIP_DELETE=${SKIP_DELETE:=false}
+ENV_FILE="/local/application.env"
+
+# Update environment variables
+if [ -f "$ENV_FILE" ]; then
+  . "$ENV_FILE"
+fi
 
 # If not exist
 if [ -z "$LDAP_HOST" ]; then
 	${DEBUG} && echo MOUNTING LDAP_HOST VAR - ${LDAP_URI}:${LDAP_PORT}
 	LDAP_HOST=${LDAP_URI}:${LDAP_PORT}
 fi
+
+# Check if LDAP is up
+ldapsearch -w "${LDAP_PASSWORD}" -D "${LDAP_USER}" -H "ldap://${LDAP_HOST}" -s base -b "" "(objectClass=*)" -o nettimeout=2  >/dev/null 2>&1 \
+&& echo "Running psql_users_remove" || { echo "LDAP Server not found, psql_users_remove exiting..."; exit 1; }
 
 # Initializing user/group variables
 USER_READ_GROUP_VARS=$(env | grep "PSQL_READ_SCHEMA_" | sed -e "s/PSQL_READ_SCHEMA_//")

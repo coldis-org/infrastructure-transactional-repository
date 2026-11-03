@@ -5,7 +5,6 @@ set -o errexit
 
 # Default parameters.
 DEBUG=true
-DEBUG_OPT=
 
 # Enables interruption signal handling.
 trap - INT TERM
@@ -23,12 +22,15 @@ then
 	echo "Removing lost+found folder to initialize"
 	rm -rf "${PGDATA}/lost+found" || true
 else
-	# Makes sure configuration is updated. Overwrites in place rather than removing first, so a
-	# boot interrupted half way never leaves the cluster without them, and restores them if they
-	# went missing (the server does not start without postgresql.conf).
+	# Makes sure configuration is updated, and restores it if it went missing (the server does
+	# not start without postgresql.conf). Each file is written beside the live one and renamed
+	# over it, so a boot interrupted half way leaves either the old file or the new one, never a
+	# missing or truncated one.
 	${DEBUG} && echo "Updating configuration"
-	cp /tmp/postgresql.conf "${PGDATA}/postgresql.conf"
-	envsubst < /tmp/pg_hba.conf > "${PGDATA}/pg_hba.conf"
+	cp /tmp/postgresql.conf "${PGDATA}/postgresql.conf.new"
+	mv "${PGDATA}/postgresql.conf.new" "${PGDATA}/postgresql.conf"
+	envsubst < /tmp/pg_hba.conf > "${PGDATA}/pg_hba.conf.new"
+	mv "${PGDATA}/pg_hba.conf.new" "${PGDATA}/pg_hba.conf"
 fi
 
 # To use cron
@@ -43,8 +45,12 @@ service cron start
 . ./psql_tune_cmd.sh
 psql_tune_cmd "$@"
 
-# Check if LDAP has changed
-. ./psql_update_conn.sh --skip-reload
+# Check if LDAP has changed. The dot command takes no arguments in sh/dash, so
+# --skip-reload goes in as positional parameters (the exec below uses
+# POSTGRES_TUNED_CMD, not "$@"); without it the script reloads a server that is
+# not running yet.
+set -- --skip-reload
+. ./psql_update_conn.sh
 
 # Executes the init command.
 echo "exec env POSTGRES_USER=${POSTGRES_ADMIN_USER:=postgres} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} ${POSTGRES_TUNED_CMD}"

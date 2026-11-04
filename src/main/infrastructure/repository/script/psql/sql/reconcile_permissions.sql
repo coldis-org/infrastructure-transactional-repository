@@ -66,6 +66,7 @@ DECLARE
     desired_privileges     TEXT[];
     held_privileges      TEXT[];
     privilege        TEXT;
+    grant_row     RECORD;
     access_level       TEXT;
     read_tables      TEXT[];
     is_first_run   BOOLEAN;
@@ -254,7 +255,17 @@ BEGIN
                 END IF;
             END LOOP;
             FOR privilege IN SELECT unnest(held_privileges) INTERSECT SELECT unnest(ARRAY['CONNECT','TEMPORARY','CREATE']) EXCEPT SELECT unnest(desired_privileges) LOOP
-                EXECUTE format('REVOKE %s ON DATABASE %I FROM %I', privilege, database_name, role_row.rolname);
+                -- Revoked once per grantor. A grant made by another role (with grant option) is
+                -- revoked as that role: a revoke by the owner would leave it in place while the run
+                -- reports it revoked. A failure (that role cannot see the object) is this user's ERROR.
+                FOR grant_row IN SELECT DISTINCT x.grantor::regrole::TEXT AS grantor_name, x.grantor = d.datdba AS by_owner
+                                   FROM pg_database d, aclexplode(d.datacl) x WHERE d.datname = database_name AND x.grantee = role_row.oid AND x.privilege_type = privilege LOOP
+                    IF NOT grant_row.by_owner THEN
+                        EXECUTE format('SET ROLE %s', grant_row.grantor_name);
+                    END IF;
+                    EXECUTE format('REVOKE %s ON DATABASE %I FROM %I', privilege, database_name, role_row.rolname);
+                    RESET ROLE;
+                END LOOP;
                 INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, permission, detail)
                 VALUES ('permanent_sync', 'REVOKE', run_source, role_row.rolname, privilege, jsonb_build_object('database', database_name));
                 INSERT INTO _out(action, username, detail) VALUES ('REVOKE', role_row.rolname, privilege || ' ON DATABASE ' || database_name);
@@ -277,7 +288,17 @@ BEGIN
                     INSERT INTO _out(action, username, detail) VALUES ('GRANT', role_row.rolname, privilege || ' ON SCHEMA ' || schema_row.schema_name);
                 END LOOP;
                 FOR privilege IN SELECT unnest(held_privileges) EXCEPT SELECT unnest(desired_privileges) LOOP
-                    EXECUTE format('REVOKE %s ON SCHEMA %I FROM %I', privilege, schema_row.schema_name, role_row.rolname);
+                    -- Revoked once per grantor. A grant made by another role (with grant option) is
+                    -- revoked as that role: a revoke by the owner would leave it in place while the run
+                    -- reports it revoked. A failure (that role cannot see the object) is this user's ERROR.
+                    FOR grant_row IN SELECT DISTINCT x.grantor::regrole::TEXT AS grantor_name, x.grantor = n.nspowner AS by_owner
+                                       FROM pg_namespace n, aclexplode(n.nspacl) x WHERE n.oid = schema_row.schema_oid AND x.grantee = role_row.oid AND x.privilege_type = privilege LOOP
+                        IF NOT grant_row.by_owner THEN
+                            EXECUTE format('SET ROLE %s', grant_row.grantor_name);
+                        END IF;
+                        EXECUTE format('REVOKE %s ON SCHEMA %I FROM %I', privilege, schema_row.schema_name, role_row.rolname);
+                        RESET ROLE;
+                    END LOOP;
                     INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, schema_name, permission)
                     VALUES ('permanent_sync', 'REVOKE', run_source, role_row.rolname, schema_row.schema_name, privilege);
                     INSERT INTO _out(action, username, detail) VALUES ('REVOKE', role_row.rolname, privilege || ' ON SCHEMA ' || schema_row.schema_name);
@@ -307,8 +328,18 @@ BEGIN
                         INSERT INTO _out(action, username, detail) VALUES ('GRANT', role_row.rolname, privilege || ' ON ' || relation_row.schema_name || '.' || relation_row.relname);
                     END LOOP;
                     FOR privilege IN SELECT unnest(held_privileges) EXCEPT SELECT unnest(desired_privileges) LOOP
-                        EXECUTE format('REVOKE %s ON %s %I.%I FROM %I', privilege, CASE WHEN relation_row.relkind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END,
+                        -- Revoked once per grantor. A grant made by another role (with grant option) is
+                        -- revoked as that role: a revoke by the owner would leave it in place while the run
+                        -- reports it revoked. A failure (that role cannot see the object) is this user's ERROR.
+                        FOR grant_row IN SELECT DISTINCT x.grantor::regrole::TEXT AS grantor_name, x.grantor = c.relowner AS by_owner
+                                           FROM pg_class c, aclexplode(c.relacl) x WHERE c.oid = relation_row.rel_oid AND x.grantee = role_row.oid AND x.privilege_type = privilege LOOP
+                            IF NOT grant_row.by_owner THEN
+                                EXECUTE format('SET ROLE %s', grant_row.grantor_name);
+                            END IF;
+                            EXECUTE format('REVOKE %s ON %s %I.%I FROM %I', privilege, CASE WHEN relation_row.relkind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END,
                                        relation_row.schema_name, relation_row.relname, role_row.rolname);
+                            RESET ROLE;
+                        END LOOP;
                         INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, schema_name, table_name, permission)
                         VALUES ('permanent_sync', 'REVOKE', run_source, role_row.rolname, relation_row.schema_name, relation_row.relname, privilege);
                         INSERT INTO _out(action, username, detail) VALUES ('REVOKE', role_row.rolname, privilege || ' ON ' || relation_row.schema_name || '.' || relation_row.relname);
@@ -335,7 +366,17 @@ BEGIN
                     INSERT INTO _out(action, username, detail) VALUES ('GRANT', role_row.rolname, 'EXECUTE ON ' || function_row.signature);
                 END LOOP;
                 FOR privilege IN SELECT unnest(held_privileges) EXCEPT SELECT unnest(desired_privileges) LOOP
-                    EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM %I', function_row.signature, role_row.rolname);
+                    -- Revoked once per grantor. A grant made by another role (with grant option) is
+                    -- revoked as that role: a revoke by the owner would leave it in place while the run
+                    -- reports it revoked. A failure (that role cannot see the object) is this user's ERROR.
+                    FOR grant_row IN SELECT DISTINCT x.grantor::regrole::TEXT AS grantor_name, x.grantor = p.proowner AS by_owner
+                                       FROM pg_proc p, aclexplode(p.proacl) x WHERE p.oid = function_row.fn_oid AND x.grantee = role_row.oid AND x.privilege_type = privilege LOOP
+                        IF NOT grant_row.by_owner THEN
+                            EXECUTE format('SET ROLE %s', grant_row.grantor_name);
+                        END IF;
+                        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM %I', function_row.signature, role_row.rolname);
+                        RESET ROLE;
+                    END LOOP;
                     INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, schema_name, table_name, permission)
                     VALUES ('permanent_sync', 'REVOKE', run_source, role_row.rolname, function_row.schema_name, function_row.signature, 'EXECUTE');
                     INSERT INTO _out(action, username, detail) VALUES ('REVOKE', role_row.rolname, 'EXECUTE ON ' || function_row.signature);

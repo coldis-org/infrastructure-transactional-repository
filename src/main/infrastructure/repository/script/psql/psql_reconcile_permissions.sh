@@ -102,7 +102,8 @@ CONFIG_SPEC=$(env | awk -F= -v alter="$SKIP_ALTER_GROUP" '
 		group_count = split(value, group_names, ",")
 		for (position = 1; position <= group_count; position++) {
 			group_name = group_names[position]; gsub(/^[ \t]+|[ \t]+$/, "", group_name)
-			if (group_name != "") { printf "%s\t%s\t%s\t%s\n", kind, tolower(object), tolower(table), group_name; emitted = 1 }
+			# Group names compare without case, as LDAP compares cn.
+			if (group_name != "") { printf "%s\t%s\t%s\t%s\n", kind, tolower(object), tolower(table), tolower(group_name); emitted = 1 }
 		}
 		# A variable with no group (an empty value rendered from a template) is an error,
 		# not "nobody": it would silently remove that permission from everyone.
@@ -181,19 +182,26 @@ LDIF=$(ldap_search "$LDAP_GROUPS" sub "$FILTER" cn objectClass memberUid 2>> "$L
 # Entries as "group<TAB>member" lines ("group<TAB>" for a group without members). Attribute
 # names are matched without case. Values in base64 (attr::) are not plain names, and an entry
 # that is not a posixGroup (groupOfNames has member, not memberUid) cannot be read as one:
-# both are refused rather than read as empty.
-MEMBERSHIP=$(printf '%s\n' "$LDIF" | awk '
+# both are refused rather than read as empty. Group names are lowercased (cn compares without
+# case); of several cn values, the one that is a configured group is the entry's name.
+MEMBERSHIP=$(printf '%s\n' "$LDIF" | awk -v configured=" $(printf '%s' "$LDAP_GROUP_NAMES" | tr '\n' ' ') " '
 	function flush(    position) {
 		if (dn == 0) return
 		if (cn == "") { print "NOCN\t"; return }
+		if (configured_cn != "") cn = configured_cn
 		if (!posix) { printf "NOTPOSIX\t%s\n", cn; return }
 		printf "%s\t\n", cn
 		for (position = 1; position <= count; position++) printf "%s\t%s\n", cn, member[position]
 	}
 	{ name = tolower($0); sub(/:.*/, "", name) }
-	name == "dn" { flush(); dn = 1; cn = ""; count = 0; posix = 0; next }
+	name == "dn" { flush(); dn = 1; cn = ""; configured_cn = ""; count = 0; posix = 0; next }
 	/^[A-Za-z]+::/ { print "BASE64\t" $0; next }
-	name == "cn" { cn = substr($0, index($0, ":") + 2); next }
+	name == "cn" {
+		value = tolower(substr($0, index($0, ":") + 2))
+		if (cn == "") cn = value
+		if (index(configured, " " value " ")) configured_cn = value
+		next
+	}
 	name == "objectclass" { if (tolower(substr($0, index($0, ":") + 2)) == "posixgroup") posix = 1; next }
 	name == "memberuid" { member[++count] = substr($0, index($0, ":") + 2); next }
 	END { flush() }

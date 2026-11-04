@@ -95,6 +95,7 @@ gidNumber: 5003
 dn: cn=staff,$GROUPS_DN
 objectClass: posixGroup
 cn: staff
+cn: staff-team
 gidNumber: 5004
 memberUid: alice
 memberUid: henry
@@ -177,6 +178,23 @@ if [ $RC = 0 ] && exists svc2 && ! managed svc2 && can svc2 s1.t_a SELECT; then 
 sql "CREATE ROLE svc3 LOGIN; GRANT alice TO svc3; GRANT USAGE ON SCHEMA s1 TO svc3; GRANT SELECT ON s1.t_a TO svc3;" >/dev/null
 reconcile
 if [ $RC = 0 ] && exists svc3 && ! managed svc3 && [ "$(sql "SELECT has_table_privilege('svc3', 's1.t_a', 'SELECT WITH GRANT OPTION') OR has_table_privilege('svc3', 's1.t_a', 'SELECT')")" = t ] && ! grep -q "svc3" <<<"$OUT"; then ok "a role granted a managed user's role is left alone"; else bad "a role granted a managed user's role is left alone"; fi
+
+# A privilege granted by a role other than the owner is revoked too, and stays revoked.
+sql "CREATE ROLE delegator NOLOGIN; GRANT USAGE ON SCHEMA s3 TO delegator; GRANT SELECT ON s3.w1 TO delegator WITH GRANT OPTION;
+     SET ROLE delegator; GRANT SELECT ON s3.w1 TO alice; RESET ROLE;" >/dev/null
+reconcile
+FIRST=$OUT
+reconcile
+if [ $RC = 0 ] && ! can alice s3.w1 SELECT && grep -q "REVOKE alice SELECT ON s3.w1" <<<"$FIRST" && ! grep -q "s3.w1" <<<"$OUT"; then ok "a grant from a third role is revoked once and does not come back as a change"; else bad "a grant from a third role is revoked once and does not come back as a change"; fi
+
+# Group names compare without case, and an entry with several cn values is found by any of them.
+config "PSQL_READ_SCHEMA_S1=Readers,Staff-Team
+PSQL_READ_SCHEMA_S2_TABLE_T1=temp
+PSQL_WRITE_SCHEMA_S3=WRITERS"
+reconcile
+if [ $RC = 0 ] && can alice s1.t_a SELECT && can henry s1.t_a SELECT && exists carol; then ok "group names match without case, and a second cn value names the group"; else bad "group names match without case, and a second cn value names the group"; fi
+config "$BASE_CONFIG"
+reconcile
 
 # Sequences and functions follow the schema level.
 if [ "$(sql "SELECT has_sequence_privilege('alice', 's1.q', 'SELECT') AND NOT has_sequence_privilege('alice', 's1.q', 'UPDATE') AND has_function_privilege('alice', 's1.f()', 'EXECUTE')")" = t ]; then ok "readers get SELECT on the schema's sequences and EXECUTE on its functions"; else bad "readers get SELECT on the schema's sequences and EXECUTE on its functions"; fi

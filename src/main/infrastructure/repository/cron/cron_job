@@ -1,1 +1,1 @@
-0 * * * * set -a; . /etc/env_vars; set +a; RECONCILE_SOURCE=cron sh /opt/psql-script/psql_reconcile_permissions.sh > /dev/null 2>> /var/log/reconcile_permissions.err
+0 * * * * set -a; . /etc/env_vars; set +a; RECONCILE_SOURCE=cron flock -n /var/lock/reconcile_permissions.lock sh /opt/psql-script/psql_reconcile_permissions.sh > /dev/null 2>> /var/log/reconcile_permissions.err

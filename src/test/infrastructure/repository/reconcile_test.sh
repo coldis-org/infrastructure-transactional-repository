@@ -43,7 +43,7 @@ config() { # lines for /local/application.env (sourced by the wrapper every run)
 }
 reconcile() { OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && RECONCILE_SOURCE=manual ./psql_reconcile_permissions.sh' 2>&1); RC=$?; }
 exists() { [ "$(sql "SELECT count(*) FROM pg_roles WHERE rolname = '$1'")" = 1 ]; }
-managed() { [ "$(sql "SELECT pg_has_role('$1', 'ldap_managed', 'MEMBER')")" = t ]; }
+managed() { [ "$(sql "SELECT count(*) FROM pg_auth_members WHERE member = '$1'::regrole AND roleid = 'ldap_managed'::regrole")" = 1 ]; }
 can() { [ "$(sql "SELECT has_table_privilege('$1', '$2', '$3')")" = t ]; }
 # Everything a reconcile may change: roles, memberships, and the ACLs of the database and of
 # every object in the test schemas.
@@ -166,6 +166,11 @@ sql "CREATE ROLE svc2 LOGIN; GRANT USAGE ON SCHEMA s1 TO svc2; GRANT SELECT ON s
 reconcile
 if [ $RC = 0 ] && exists svc2 && ! managed svc2 && can svc2 s1.t_a SELECT; then ok "a role granted a read schema after the first run is left alone"; else bad "a role granted a read schema after the first run is left alone"; fi
 
+# A role granted a managed user's role is not managed through it.
+sql "CREATE ROLE svc3 LOGIN; GRANT alice TO svc3; GRANT USAGE ON SCHEMA s1 TO svc3; GRANT SELECT ON s1.t_a TO svc3;" >/dev/null
+reconcile
+if [ $RC = 0 ] && exists svc3 && ! managed svc3 && [ "$(sql "SELECT has_table_privilege('svc3', 's1.t_a', 'SELECT WITH GRANT OPTION') OR has_table_privilege('svc3', 's1.t_a', 'SELECT')")" = t ] && ! grep -q "svc3" <<<"$OUT"; then ok "a role granted a managed user's role is left alone"; else bad "a role granted a managed user's role is left alone"; fi
+
 # Sequences and functions follow the schema level.
 if [ "$(sql "SELECT has_sequence_privilege('alice', 's1.q', 'SELECT') AND NOT has_sequence_privilege('alice', 's1.q', 'UPDATE') AND has_function_privilege('alice', 's1.f()', 'EXECUTE')")" = t ]; then ok "readers get SELECT on the schema's sequences and EXECUTE on its functions"; else bad "readers get SELECT on the schema's sequences and EXECUTE on its functions"; fi
 
@@ -211,6 +216,26 @@ PSQL_READ_SCHEMA_S2=gon"
 reconcile
 if [ $RC = 1 ] && grep -q "not posixGroup" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a group that is not a posixGroup stops the run, nothing changes"; else bad "a group that is not a posixGroup stops the run, nothing changes"; fi
 
+config "$BASE_CONFIG
+PSQL_WRITE_SCHEMA_LDAP_RECONCILE=writers"
+reconcile
+if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "the reconcile's own schema cannot be configured, nothing changes"; else bad "the reconcile's own schema cannot be configured, nothing changes"; fi
+
+config "$BASE_CONFIG
+PSQL_READ_SCHEMA_PG_CATALOG=readers"
+reconcile
+if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "a system schema cannot be configured, nothing changes"; else bad "a system schema cannot be configured, nothing changes"; fi
+
+sql "CREATE ROLE danger NOLOGIN; GRANT pg_write_server_files TO danger;" >/dev/null
+BEFORE=$(snapshot)
+for target in POSTGRES DANGER APP; do
+	config "$BASE_CONFIG
+PSQL_ALTER_GROUP_$target=readers
+SKIP_ALTER_GROUP=false"
+	reconcile
+	if [ $RC = 2 ] && grep -q "privileged or a login role" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a privileged or login group role ($target) is refused, nothing changes"; else bad "a privileged or login group role ($target) is refused, nothing changes"; fi
+done
+
 config "$BASE_CONFIG"
 members readers alice erin carol "Bad User"
 reconcile
@@ -239,7 +264,8 @@ members readers alice erin george
 reconcile
 if [ $RC = 3 ] && grep -q "ERROR carol drop:" <<<"$OUT" && exists carol && exists george && managed george; then ok "a database error on one user skips that user (exit 3) and applies the rest"; else bad "a database error on one user skips that user (exit 3) and applies the rest"; fi
 if [ "$(sql "SELECT count(*) FROM ldap_reconcile.permissions_audit WHERE action = 'ERROR' AND grantee = 'carol'")" -ge 1 ] && [ "$(sql "SELECT count(*) FROM ldap_reconcile.permissions_audit WHERE action = 'DROP_USER' AND grantee = 'carol'")" = 0 ]; then ok "the failed step is recorded as ERROR, and none of its changes"; else bad "the failed step is recorded as ERROR, and none of its changes"; fi
-if [ "$(sql "SELECT count(*) FROM ldap_reconcile.permissions_audit WHERE action = 'REASSIGN' OR (action = 'DROP_USER' AND grantee = 'carol')")" = 0 ] && ! can carol s1.t_a SELECT; then ok "carol's failed drop is rolled back, and her configured access is still revoked (she left LDAP)"; else bad "carol's failed drop is rolled back, and her configured access is still revoked (she left LDAP)"; fi
+CAROL_KEEP=$(docker exec "$DB" psql -X -tA -U postgres -d otherdb -c "SELECT tableowner FROM pg_tables WHERE tablename = 'keep'")
+if [ "$CAROL_KEEP" = carol ] && [ "$(sql "SELECT count(*) FROM ldap_reconcile.permissions_audit WHERE action = 'DROP_USER' AND grantee = 'carol'")" = 0 ] && ! can carol s1.t_a SELECT; then ok "carol's failed drop is rolled back, and her configured access is still revoked (she left LDAP)"; else bad "carol's failed drop is rolled back, and her configured access is still revoked (she left LDAP)"; fi
 docker exec "$DB" psql -X -q -U postgres -d otherdb -c "DROP TABLE keep;" >/dev/null
 reconcile
 if [ $RC = 0 ] && ! exists carol; then ok "once the cause is gone the next run applies"; else bad "once the cause is gone the next run applies"; fi

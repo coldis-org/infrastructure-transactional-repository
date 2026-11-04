@@ -10,7 +10,8 @@
 --   membership_lines  ldap_group, user (a group with no members has no line: it is a
 --              valid, empty group).
 --
--- Ownership: a role is managed when it is a member of ldap_managed (NOLOGIN).
+-- Ownership: a role is managed when it is a direct member of ldap_managed (NOLOGIN);
+-- a role granted a managed user's role is not managed through it.
 -- Only managed roles are created, changed or dropped. Login roles are adopted
 -- when they are in LDAP, or when they hold a privilege on a configured read
 -- schema (the population psql_users_remove used to consider). Superusers,
@@ -44,7 +45,9 @@ CREATE OR REPLACE FUNCTION ldap_reconcile.reconcile_permissions(
 )
 RETURNS TABLE(action TEXT, username TEXT, detail TEXT)
 LANGUAGE plpgsql
-SET search_path = pg_catalog, ldap_reconcile, pg_temp
+-- Only the catalog and this session's temp tables: everything in ldap_reconcile is
+-- qualified, and no schema a configured user could write is searched.
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     valid_name_pattern     CONSTANT TEXT := '^[a-z_][a-z0-9_.-]*$';
@@ -94,7 +97,9 @@ BEGIN
     FOR config_row IN SELECT * FROM _config LOOP
         IF config_row.kind NOT IN ('read', 'write', 'member') OR config_row.object !~ valid_identifier_pattern
            OR (config_row.tbl IS NOT NULL AND config_row.tbl !~ valid_identifier_pattern) OR config_row.ldap_group = ''
-           OR (config_row.kind <> 'read' AND config_row.tbl IS NOT NULL) THEN
+           OR (config_row.kind <> 'read' AND config_row.tbl IS NOT NULL)
+           OR (config_row.kind IN ('read', 'write') AND (config_row.object IN ('ldap_reconcile', 'information_schema')
+                                                       OR config_row.object LIKE 'pg\_%')) THEN
             RAISE EXCEPTION 'reconcile_permissions: invalid configuration row (%, %, %, %)', config_row.kind, config_row.object, config_row.tbl, config_row.ldap_group;
         END IF;
     END LOOP;
@@ -134,6 +139,24 @@ BEGIN
             OR a.rolname = 'ldap_managed' OR a.rolname = owner_role OR a.rolname = current_user
             OR a.rolname = ANY(COALESCE(protected_role_names, ARRAY[]::TEXT[]));
 
+    -- A group role (PSQL_ALTER_GROUP_*) must be a plain NOLOGIN role with no
+    -- privileged attribute and no membership in a privileged or predefined role:
+    -- membership in it is handed to whoever LDAP lists.
+    FOR group_row IN
+        SELECT DISTINCT c.object AS role_name FROM _config c
+          JOIN pg_roles a ON a.rolname = c.object
+         WHERE c.kind = 'member'
+           AND (a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR a.rolbypassrls OR a.rolcanlogin
+                OR a.rolname LIKE 'pg\_%' OR a.oid IN (SELECT oid FROM _protected)
+                OR EXISTS (SELECT 1 FROM pg_roles privileged
+                            WHERE privileged.oid <> a.oid
+                              AND (privileged.rolsuper OR privileged.rolcreaterole OR privileged.rolcreatedb
+                                   OR privileged.rolreplication OR privileged.rolbypassrls OR privileged.rolname LIKE 'pg\_%')
+                              AND pg_has_role(a.oid, privileged.oid, 'MEMBER')))
+    LOOP
+        RAISE EXCEPTION 'reconcile_permissions: group role % is privileged or a login role; refusing to manage its membership', group_row.role_name;
+    END LOOP;
+
     -- Adoption: login roles in LDAP that are not managed yet; on the first run
     -- only, also login roles with a privilege on a schema configured for a
     -- whole-schema read, when drops are enabled: exactly the users
@@ -144,7 +167,7 @@ BEGIN
         SELECT a.rolname FROM pg_roles a
          WHERE a.rolcanlogin
            AND a.oid NOT IN (SELECT oid FROM _protected)
-           AND NOT pg_has_role(a.oid, 'ldap_managed', 'MEMBER')
+           AND NOT EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole)
            AND (a.rolname IN (SELECT tg.username FROM _target tg)
                 OR (is_first_run AND drops_allowed AND EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) x
                             WHERE x.grantee = a.oid
@@ -180,7 +203,7 @@ BEGIN
     -- Managed roles no longer in LDAP.
     FOR role_row IN
         SELECT a.rolname FROM pg_roles a
-         WHERE pg_has_role(a.oid, 'ldap_managed', 'MEMBER') AND a.rolname <> 'ldap_managed'
+         WHERE EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole) AND a.rolname <> 'ldap_managed'
            AND a.oid NOT IN (SELECT oid FROM _protected)
            AND a.rolname NOT IN (SELECT tg.username FROM _target tg)
          ORDER BY a.rolname
@@ -207,7 +230,7 @@ BEGIN
     -- kept although not in LDAP (drops disabled) get none of the configured access.
     FOR role_row IN
         SELECT a.rolname, a.oid FROM pg_roles a
-         WHERE pg_has_role(a.oid, 'ldap_managed', 'MEMBER') AND a.rolname <> 'ldap_managed'
+         WHERE EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole) AND a.rolname <> 'ldap_managed'
            AND a.oid NOT IN (SELECT oid FROM _protected)
          ORDER BY a.rolname
     LOOP
@@ -333,7 +356,7 @@ BEGIN
         END IF;
         FOR role_row IN
             SELECT a.rolname FROM pg_roles a
-             WHERE pg_has_role(a.oid, 'ldap_managed', 'MEMBER') AND a.oid NOT IN (SELECT oid FROM _protected)
+             WHERE EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole) AND a.oid NOT IN (SELECT oid FROM _protected)
                AND a.rolname IN (SELECT m.username FROM _members m JOIN _config c ON c.ldap_group = m.ldap_group
                                   WHERE c.kind = 'member' AND c.object = group_row.role_name)
                AND NOT EXISTS (SELECT 1 FROM pg_auth_members am JOIN pg_roles gr ON gr.oid = am.roleid
@@ -354,7 +377,7 @@ BEGIN
         FOR role_row IN
             SELECT a.rolname FROM pg_roles a
               JOIN pg_auth_members am ON am.member = a.oid JOIN pg_roles gr ON gr.oid = am.roleid AND gr.rolname = group_row.role_name
-             WHERE pg_has_role(a.oid, 'ldap_managed', 'MEMBER') AND a.oid NOT IN (SELECT oid FROM _protected)
+             WHERE EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole) AND a.oid NOT IN (SELECT oid FROM _protected)
                AND a.rolname NOT IN (SELECT m.username FROM _members m JOIN _config c ON c.ldap_group = m.ldap_group
                                       WHERE c.kind = 'member' AND c.object = group_row.role_name)
              ORDER BY 1

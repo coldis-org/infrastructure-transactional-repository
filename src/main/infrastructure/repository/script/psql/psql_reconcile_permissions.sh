@@ -124,6 +124,7 @@ if [ -z "$CONFIG_SPEC" ]; then
 fi
 BAD=$(printf '%s\n' "$CONFIG_SPEC" | awk -F'\t' '
 	$1 == "empty" { print "a PSQL_* variable for " $2 ($3 != "" ? "." $3 : "") " names no LDAP group"; next }
+	($1 == "read" || $1 == "write") && ($2 ~ /^pg_/ || $2 == "information_schema" || $2 == "ldap_reconcile") { print "system schema " $2 " cannot be configured"; next }
 	$2 !~ /^[a-z_][a-z0-9_]*$/ || ($3 != "" && $3 !~ /^[a-z_][a-z0-9_]*$/) || $4 !~ /^[A-Za-z0-9._-]+$/ { print }
 	$1 == "write" && $3 != "" { print "write on a single table is not supported: " $0 }')
 [ -z "$BAD" ] || fail 1 "invalid PSQL_* configuration: $(printf '%s' "$BAD" | tr '\n\t' '; ')"
@@ -156,7 +157,9 @@ chmod 600 "$LDAP_PASSWORD_FILE"
 printf '%s' "$LDAP_PASSWORD" > "$LDAP_PASSWORD_FILE"
 ldap_search() { # base scope filter attributes...
 	base=$1; scope=$2; filter=$3; shift 3
-	ldapsearch -LLL -x -o "nettimeout=${LDAP_NETTIMEOUT}" -o ldif-wrap=no \
+	# nettimeout bounds the connection; -l and LDAPTIMEOUT bound a server that
+	# accepts it and then stalls.
+	LDAPTIMEOUT=${LDAP_NETTIMEOUT} ldapsearch -LLL -x -o "nettimeout=${LDAP_NETTIMEOUT}" -l "${LDAP_NETTIMEOUT}" -o ldif-wrap=no \
 		-H "$LDAP_URL" -D "$LDAP_USER" -y "$LDAP_PASSWORD_FILE" -b "$base" -s "$scope" "$filter" "$@"
 }
 

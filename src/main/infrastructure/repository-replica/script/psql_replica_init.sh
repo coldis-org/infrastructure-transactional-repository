@@ -12,11 +12,37 @@ REPLICATION_LOCK_FILE=${PGDATA}/replication_configured.lock
 trap - INT TERM
 
 
+# Drops the slot on the copy source, terminating whatever still holds it. A dead replica can leave
+# its walsender alive on the master (see wal_sender_timeout), and then the slot stays "active" and
+# cannot be dropped, so terminate first and retry. Silent no-op when the slot does not exist, which
+# makes this safe to run both on a fresh replica and on a rebuild.
+psql_reset_slot() {
+	if [ -z "${REPLICATION_SLOT_NAME}" ]
+	then
+		return 0
+	fi
+	echo "Resetting replication slot ${REPLICATION_SLOT_NAME} on ${COPY_ENDPOINT}:${COPY_PORT}"
+	ATTEMPT=0
+	while [ ${ATTEMPT} -lt 10 ]
+	do
+		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -h "${COPY_ENDPOINT}" -p "${COPY_PORT}" \
+			-U "${POSTGRES_ADMIN_USER}" -v ON_ERROR_STOP=1 \
+			-c "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = '${REPLICATION_SLOT_NAME}' AND active;" \
+			-c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '${REPLICATION_SLOT_NAME}';" \
+			&& return 0
+		ATTEMPT=$(( ATTEMPT + 1 ))
+		sleep 3
+	done
+	echo "Could not reset replication slot ${REPLICATION_SLOT_NAME}"
+	return 1
+}
+
+
 # If the replication has not been configured yet.
 if [ "${FORCE_BACKUP}" = "true" ]
 then
 	echo "Removing replication file"
-	rm ${REPLICATION_LOCK_FILE}
+	rm -f ${REPLICATION_LOCK_FILE}
 fi
 
 if [ ! -f ${REPLICATION_LOCK_FILE} ] 
@@ -45,12 +71,11 @@ then
 
 	BACKUP_PARAMS="""--host=${COPY_ENDPOINT} --port=${COPY_PORT} --pgdata=${PGDATA} --username=${POSTGRES_REPLICATOR_USER}\
 					 --wal-method=stream  --write-recovery-conf --checkpoint=fast --progress --verbose ${SLOT_PARAM}"""
+	# Makes sure no leftover slot from a previous run blocks --create-slot.
+	psql_reset_slot
+
 	# Starts replication streaming.
-	(echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS} --create-slot) || \
-	( \
-		(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD} psql -h "${MASTER_ENDPOINT}" -c "SELECT pg_drop_replication_slot('${REPLICATION_SLOT_NAME}');" -U ${POSTGRES_ADMIN_USER}) \
-		&& (echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS} --create-slot) \
-	)
+	echo ${POSTGRES_REPLICATOR_PASSWORD} | pg_basebackup ${BACKUP_PARAMS} --create-slot
 	# Sets that replication has been configured.
 	touch ${REPLICATION_LOCK_FILE}
 
@@ -60,6 +85,18 @@ fi
 echo "Changing folder permissions"
 chmod 750 ${PGDATA} -R
 chown postgres ${PGDATA} -R
+
+# From PostgreSQL 18 on the data directory sits in a folder named after the major version, and
+# pg_basebackup creates that folder along with the data directory, as root and 0700. The chown
+# above only reaches inside the data directory, so postgres is left unable to traverse into it
+# and the server stops at "could not access directory". Nothing below the parent is touched:
+# a volume holding other versions keeps them as they are.
+PGDATA_PARENT=$(dirname ${PGDATA})
+if [ "$(basename ${PGDATA_PARENT})" = "${PG_MAJOR}" ]
+then
+	chmod 750 ${PGDATA_PARENT}
+	chown postgres ${PGDATA_PARENT}
+fi
 
 # Tune command.
 . ./psql_tune_cmd.sh

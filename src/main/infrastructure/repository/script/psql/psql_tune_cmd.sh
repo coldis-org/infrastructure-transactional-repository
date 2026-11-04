@@ -131,8 +131,20 @@ psql_tune_cmd() {
 			TOTAL_MAINTENANCE_WORK_MEM=$(( NON_RESERVED_MAX_MEMORY * TOTAL_MAINTENANCE_WORK_MEM_PERC / 100 ))
 			MAINTENANCE_WORK_MEM=$(( TOTAL_MAINTENANCE_WORK_MEM / (MAX_PARALLEL_MAINTENANCE_WORKERS + AUTOVACUUM_MAX_WORKERS )))
 			
+			# Lock tables. The shared memory they take is reserved at startup whether it is used
+			# or not, and it grows with max_locks_per_transaction times the connection limit: a
+			# fixed value large enough for a partitioned warehouse keeps a small database from
+			# starting at all, since the kernel kills the server before it can report anything.
+			# Measured at about 768 bytes, or three quarters of a kilobyte, for each lock slot of
+			# each connection, covering the predicate lock table along with the regular one.
+			TOTAL_LOCKS_MEMORY=$(( NON_RESERVED_MAX_MEMORY * TOTAL_LOCKS_MEMORY_PERC / 100 ))
+			MAX_LOCKS_PER_TRANSACTION=$(( TOTAL_LOCKS_MEMORY * 4 / (MAX_CONNECTIONS * 3) ))
+			MAX_LOCKS_PER_TRANSACTION=$(( MAX_LOCKS_PER_TRANSACTION > MAX_LOCKS_PER_TRANSACTION_MAX ? MAX_LOCKS_PER_TRANSACTION_MAX : MAX_LOCKS_PER_TRANSACTION ))
+			MAX_LOCKS_PER_TRANSACTION=$(( MAX_LOCKS_PER_TRANSACTION < MAX_LOCKS_PER_TRANSACTION_MIN ? MAX_LOCKS_PER_TRANSACTION_MIN : MAX_LOCKS_PER_TRANSACTION ))
+			TOTAL_LOCKS_MEMORY=$(( MAX_LOCKS_PER_TRANSACTION * MAX_CONNECTIONS * 3 / 4 ))
+
 			# Updates reserved memory.
-			TOTAL_CONFIGURED_MEMORY=$(( WAL_BUFFERS + WAL_WRITER_FLUSH_AFTER + WAL_DECODE_BUFFER_SIZE + TOTAL_LOGICAL_DECODING_WORK_MEM + SHARED_BUFFERS + TOTAL_WORK_MEM + TOTAL_MAINTENANCE_WORK_MEM ))
+			TOTAL_CONFIGURED_MEMORY=$(( WAL_BUFFERS + WAL_WRITER_FLUSH_AFTER + WAL_DECODE_BUFFER_SIZE + TOTAL_LOGICAL_DECODING_WORK_MEM + SHARED_BUFFERS + TOTAL_WORK_MEM + TOTAL_MAINTENANCE_WORK_MEM + TOTAL_LOCKS_MEMORY ))
 			ACTUAL_RESERVED_MEMORY=$(( MAX_MEMORY - TOTAL_CONFIGURED_MEMORY ))
 			ACTUAL_RESERVED_MEMORY_PERC=$(( ACTUAL_RESERVED_MEMORY * 100 / MAX_MEMORY ))
 			NON_RESERVED_MAX_MEMORY=$(( NON_RESERVED_MAX_MEMORY - (MAX_MEMORY / 50 )))
@@ -218,8 +230,8 @@ psql_tune_cmd() {
  -c deadlock_timeout=1s \
  -c default_statistics_target=500 \
  -c jit=on \
- -c max_locks_per_transaction=16384 \
- -c max_pred_locks_per_transaction=16384 \
+ -c max_locks_per_transaction=${MAX_LOCKS_PER_TRANSACTION} \
+ -c max_pred_locks_per_transaction=${MAX_LOCKS_PER_TRANSACTION} \
  -c max_pred_locks_per_page=3 \
  -c max_pred_locks_per_relation=128 \
  -c max_standby_streaming_delay=2h \

@@ -39,13 +39,16 @@ then
 	${DEBUG} && echo "Configuring default database"
 	
 	# Creates the default user and database.
-	while !(PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_DEFAULT_USER})
+	# Connects to the default database, not to one named after the user: psql falls back to the
+	# user name when no database is given, and then a module whose database has another name
+	# never sees the probe succeed, so the loop below never ends. Empty keeps the old fallback.
+	while !(PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_DEFAULT_USER} ${POSTGRES_DEFAULT_DATABASE})
 	do
 		sleep 1
 		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_ADMIN_USER:=postgres} || true
 		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE DATABASE ${POSTGRES_DEFAULT_DATABASE} OWNER ${POSTGRES_DEFAULT_USER};" -U ${POSTGRES_ADMIN_USER:=postgres} || true
 	done
-	PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} || true
+	PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c "ALTER USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_DEFAULT_USER} ${POSTGRES_DEFAULT_DATABASE} || true
 
 # If the user has been (or should not) configured yet.
 else
@@ -129,7 +132,12 @@ then
 	# Creates unaccent extension.
 	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE EXTENSION IF NOT EXISTS unaccent;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}
 	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "ALTER EXTENSION unaccent UPDATE;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}
-	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE OR REPLACE FUNCTION immutable_unaccent(text) RETURNS text LANGUAGE SQL IMMUTABLE AS \$\$SELECT unaccent(\$1)\$\$;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}
+	# The call names its schema because pg_upgrade cannot restore an index whose expression
+	# reaches an unqualified name: pg_restore runs with an empty search_path, inlines this
+	# function while it creates the index, and stops when unaccent does not resolve. A search_path
+	# on the function would fix that too, but a SQL function carrying SET is not inlined and the
+	# index would stop being used for the expression it was built for.
+	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE OR REPLACE FUNCTION immutable_unaccent(text) RETURNS text LANGUAGE SQL IMMUTABLE AS \$\$SELECT public.unaccent(\$1)\$\$;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}
 
 	# Creates pg_trgm extension.
 	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" -U ${POSTGRES_ADMIN_USER:=postgres} ${POSTGRES_DEFAULT_DATABASE}
@@ -179,9 +187,6 @@ else
 	${DEBUG} && echo "Skipping replication"
 
 fi
-
-# Check if should create pub/sub
-./psql_subscribe.sh
 
 # If there is a configuration file.
 ${DEBUG} && echo "SQL_CONFIGURATION=${SQL_CONFIGURATION}"

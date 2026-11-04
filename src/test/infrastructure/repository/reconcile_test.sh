@@ -219,6 +219,9 @@ PSQL_ALTER_GROUP_GRP=staff
 SKIP_ALTER_GROUP=false"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = t ] && ! exists henry; then ok "an alter-group mapping adds users who have a permission, and creates no one (henry is only in it)"; else bad "an alter-group mapping adds users who have a permission, and creates no one (henry is only in it)"; fi
+sql "CREATE ROLE grpadmin NOLOGIN; GRANT grp TO grpadmin WITH ADMIN OPTION; SET ROLE grpadmin; GRANT grp TO erin; RESET ROLE;" >/dev/null
+reconcile
+if [ $RC = 0 ] && [ "$(sql "SELECT count(*) FROM pg_auth_members WHERE member = 'erin'::regrole AND roleid = 'grp'::regrole")" = 0 ]; then ok "a membership granted by another role is revoked when the user is not in the mapped group"; else bad "a membership granted by another role is revoked when the user is not in the mapped group"; fi
 config "$BASE_CONFIG"
 
 # The cron line itself, as the image installs it.
@@ -256,9 +259,9 @@ PSQL_READ_SCHEMA_PG_CATALOG=readers"
 reconcile
 if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "a system schema cannot be configured, nothing changes"; else bad "a system schema cannot be configured, nothing changes"; fi
 
-sql "CREATE ROLE danger NOLOGIN; GRANT pg_write_server_files TO danger;" >/dev/null
+sql "CREATE ROLE danger NOLOGIN; GRANT pg_write_server_files TO danger; CREATE ROLE ownergrp NOLOGIN; GRANT app TO ownergrp;" >/dev/null
 BEFORE=$(snapshot)
-for target in POSTGRES DANGER APP; do
+for target in POSTGRES DANGER APP OWNERGRP; do
 	config "$BASE_CONFIG
 PSQL_ALTER_GROUP_$target=readers
 SKIP_ALTER_GROUP=false"

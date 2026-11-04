@@ -65,7 +65,7 @@ then
 		-f "${SQL_DIR}/permissions_audit.sql" -f "${SQL_DIR}/reconcile_permissions.sql" \
 		|| echo "ERROR: could not install the permissions reconcile"
 	# Tolerant: an LDAP outage at boot must not stop the database; cron retries hourly.
-	RECONCILE_SOURCE=boot ./psql_reconcile_permissions.sh || true
+	RECONCILE_SOURCE=boot flock -w 60 /var/lock/reconcile_permissions.lock ./psql_reconcile_permissions.sh || true
 fi
 
 # If stats extension should be confgured.

@@ -151,6 +151,8 @@ BEGIN
          WHERE c.kind = 'member'
            AND (a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR a.rolbypassrls OR a.rolcanlogin
                 OR a.rolname LIKE 'pg\_%' OR a.oid IN (SELECT oid FROM _protected)
+                OR EXISTS (SELECT 1 FROM _protected protected_role
+                            WHERE protected_role.oid <> a.oid AND pg_has_role(a.oid, protected_role.oid, 'MEMBER'))
                 OR EXISTS (SELECT 1 FROM pg_roles privileged
                             WHERE privileged.oid <> a.oid
                               AND (privileged.rolsuper OR privileged.rolcreaterole OR privileged.rolcreatedb
@@ -419,7 +421,7 @@ BEGIN
             END;
         END LOOP;
         FOR role_row IN
-            SELECT a.rolname FROM pg_roles a
+            SELECT DISTINCT a.rolname FROM pg_roles a
               JOIN pg_auth_members am ON am.member = a.oid JOIN pg_roles gr ON gr.oid = am.roleid AND gr.rolname = group_row.role_name
              WHERE EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole) AND a.oid NOT IN (SELECT oid FROM _protected)
                AND a.rolname NOT IN (SELECT m.username FROM _members m JOIN _config c ON c.ldap_group = m.ldap_group
@@ -428,7 +430,19 @@ BEGIN
              ORDER BY 1
         LOOP
             BEGIN
-                EXECUTE format('REVOKE %I FROM %I', group_row.role_name, role_row.rolname);
+                -- From 16 on a membership is one row per grantor, and a plain REVOKE only
+                -- removes the bootstrap superuser's: each grantor's is revoked by name.
+                IF current_setting('server_version_num')::INT >= 160000 THEN
+                    FOR grant_row IN SELECT DISTINCT am.grantor::regrole::TEXT AS grantor_name FROM pg_auth_members am
+                                      WHERE am.member = role_row.rolname::regrole AND am.roleid = group_row.role_name::regrole LOOP
+                        EXECUTE format('REVOKE %I FROM %I GRANTED BY %s', group_row.role_name, role_row.rolname, grant_row.grantor_name);
+                    END LOOP;
+                ELSE
+                    EXECUTE format('REVOKE %I FROM %I', group_row.role_name, role_row.rolname);
+                END IF;
+                IF EXISTS (SELECT 1 FROM pg_auth_members am WHERE am.member = role_row.rolname::regrole AND am.roleid = group_row.role_name::regrole) THEN
+                    RAISE EXCEPTION 'membership of % in % is still held after the revoke', role_row.rolname, group_row.role_name;
+                END IF;
                 INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, permission)
                 VALUES ('permanent_sync', 'REVOKE', run_source, role_row.rolname, 'MEMBER OF ' || group_row.role_name);
                 INSERT INTO _out(action, username, detail) VALUES ('REVOKE', role_row.rolname, 'MEMBER OF ' || group_row.role_name);

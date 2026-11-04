@@ -157,8 +157,10 @@ members writers; members readers alice bob erin carol; reconcile
 if [ $RC = 0 ] && ! can carol s3.w1 INSERT && ! can carol s3.w1 SELECT && can carol s1.t_a SELECT; then ok "a writer moved to readers loses write on s3 and reads s1"; else bad "a writer moved to readers loses write on s3 and reads s1"; fi
 
 # A user's objects survive the user.
-sql "CREATE TABLE s1.bob_t(i int); INSERT INTO s1.bob_t SELECT generate_series(1, 42); ALTER TABLE s1.bob_t OWNER TO bob;" >/dev/null
+sql "CREATE TABLE s1.bob_t(i int); INSERT INTO s1.bob_t SELECT generate_series(1, 42); ALTER TABLE s1.bob_t OWNER TO bob;
+     CREATE FUNCTION s1.bob_f() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION s1.bob_f() OWNER TO bob;" >/dev/null
 members readers alice erin carol; reconcile
+if [ "$(sql "SELECT prosecdef FROM pg_proc WHERE proname = 'bob_f'")" = f ] && grep -q "SECURITY_INVOKER bob s1.bob_f()" <<<"$OUT"; then ok "a dropped user's SECURITY DEFINER function is made SECURITY INVOKER before it is reassigned"; else bad "a dropped user's SECURITY DEFINER function is made SECURITY INVOKER before it is reassigned"; fi
 if [ $RC = 0 ] && ! exists bob; then ok "a user removed from LDAP is dropped"; else bad "a user removed from LDAP is dropped"; fi
 if [ "$(sql "SELECT count(*) || ' '|| tableowner FROM s1.bob_t, pg_tables WHERE tablename = 'bob_t' GROUP BY tableowner")" = "42 app" ]; then ok "their table survives, with its data, owned by the application user"; else bad "their table survives, with its data, owned by the application user"; fi
 
@@ -196,6 +198,19 @@ if [ $RC = 0 ] && can alice s1.t_a SELECT && can henry s1.t_a SELECT && exists c
 config "$BASE_CONFIG"
 reconcile
 
+# A time budget commits part of the work; the users left go first next run.
+sql "REVOKE SELECT ON s1.t_a FROM alice; REVOKE SELECT ON s1.t_a FROM erin;" >/dev/null
+config "$BASE_CONFIG
+RECONCILE_TIME_BUDGET=0"
+reconcile
+if [ $RC = 3 ] && grep -q "DEFERRED" <<<"$OUT" && [ "$(grep -cE "GRANT (alice|erin) SELECT ON s1.t_a" <<<"$OUT")" -le 1 ]; then ok "with the time budget spent, one user is done and the rest deferred (exit 3)"; else bad "with the time budget spent, one user is done and the rest deferred (exit 3)"; fi
+# shellcheck disable=SC2034  # iteration only counts the runs
+for iteration in 1 2 3 4 5 6 7 8 9 10; do reconcile; done
+if can alice s1.t_a SELECT && can erin s1.t_a SELECT; then ok "successive budgeted runs reach every user (least recently reconciled first)"; else bad "successive budgeted runs reach every user (least recently reconciled first)"; fi
+config "$BASE_CONFIG"
+reconcile
+if [ $RC = 0 ] && ! grep -q "DEFERRED" <<<"$OUT" && grep -qE "done: .* in [0-9]+s" <<<"$OUT"; then ok "without the budget reached the run completes, and logs its duration"; else bad "without the budget reached the run completes, and logs its duration"; fi
+
 # Sequences and functions follow the schema level.
 if [ "$(sql "SELECT has_sequence_privilege('alice', 's1.q', 'SELECT') AND NOT has_sequence_privilege('alice', 's1.q', 'UPDATE') AND has_function_privilege('alice', 's1.f()', 'EXECUTE')")" = t ]; then ok "readers get SELECT on the schema's sequences and EXECUTE on its functions"; else bad "readers get SELECT on the schema's sequences and EXECUTE on its functions"; fi
 
@@ -219,9 +234,10 @@ PSQL_ALTER_GROUP_GRP=staff
 SKIP_ALTER_GROUP=false"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = t ] && ! exists henry; then ok "an alter-group mapping adds users who have a permission, and creates no one (henry is only in it)"; else bad "an alter-group mapping adds users who have a permission, and creates no one (henry is only in it)"; fi
-sql "CREATE ROLE grpadmin NOLOGIN; GRANT grp TO grpadmin WITH ADMIN OPTION; SET ROLE grpadmin; GRANT grp TO erin; RESET ROLE;" >/dev/null
+members readers alice erin carol jane.doe; reconcile
+sql "CREATE ROLE grpadmin NOLOGIN; GRANT grp TO grpadmin WITH ADMIN OPTION; SET ROLE grpadmin; GRANT grp TO erin; GRANT grp TO \"jane.doe\"; RESET ROLE;" >/dev/null
 reconcile
-if [ $RC = 0 ] && [ "$(sql "SELECT count(*) FROM pg_auth_members WHERE member = 'erin'::regrole AND roleid = 'grp'::regrole")" = 0 ]; then ok "a membership granted by another role is revoked when the user is not in the mapped group"; else bad "a membership granted by another role is revoked when the user is not in the mapped group"; fi
+if [ $RC = 0 ] && [ "$(sql "SELECT count(*) FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.member WHERE r.rolname IN ('erin', 'jane.doe') AND am.roleid = 'grp'::regrole")" = 0 ]; then ok "a membership granted by another role is revoked when the user is not in the mapped group (also for a dotted name)"; else bad "a membership granted by another role is revoked when the user is not in the mapped group (also for a dotted name)"; fi
 config "$BASE_CONFIG"
 
 # The cron line itself, as the image installs it.

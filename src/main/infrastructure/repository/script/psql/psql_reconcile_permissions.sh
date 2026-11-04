@@ -16,6 +16,9 @@
 #                                                  group has any member (otherwise refused
 #                                                  while managed users exist)
 #   RECONCILE_STATEMENT_TIMEOUT=300s               upper bound for one run's database side
+#   RECONCILE_TIME_BUDGET=240s                     the per-user privilege step stops after
+#                                                  this and commits; the users left go first
+#                                                  next run (keep it below the timeout)
 #
 # The managed population follows the configuration: a user with no read or write permission
 # is dropped, also when a PSQL_* mapping is removed and the user was only in it. A
@@ -30,7 +33,8 @@
 # and is reported; everyone else is still reconciled.
 #
 # Exit status: 0 applied (or nothing to do), 1 configuration or LDAP error (nothing changed),
-# 2 database error (nothing changed), 3 applied except for the users reported as ERROR.
+# 2 database error (nothing changed), 3 applied except for the users reported as ERROR, or
+# with users DEFERRED to the next run by the time budget.
 
 set -u
 
@@ -78,6 +82,9 @@ fail() { # status message
 	report "$2"
 	exit "$1"
 }
+# Superuser sessions resolve nothing from schemas other roles own (public belongs to the
+# database owner on 15+).
+export PGOPTIONS="${PGOPTIONS:-} -c search_path=pg_catalog"
 psql_admin() { # extra psql arguments
 	PGPASSWORD="$POSTGRES_ADMIN_PASSWORD" psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_ADMIN_USER" -d "$POSTGRES_DEFAULT_DATABASE" "$@"
 }
@@ -94,6 +101,7 @@ case "$LDAP_HOST" in
 esac
 
 log "start (source=${RECONCILE_SOURCE})"
+RUN_STARTED=$(date +%s)
 
 # The desired configuration. A key splits at its first _TABLE_.
 CONFIG_SPEC=$(env | awk -F= -v alter="$SKIP_ALTER_GROUP" '
@@ -251,8 +259,9 @@ PROTECTED="${POSTGRES_ADMIN_USER},${POSTGRES_DEFAULT_USER:-},${POSTGRES_REPLICAT
 RESULT=$(psql_admin -tA -F ' ' \
 	-v config="$CONFIG_SPEC" -v members="$MEMBERS" -v source="$RECONCILE_SOURCE" \
 	-v owner="${POSTGRES_DEFAULT_USER:-}" -v allow_drops="$ALLOW_DROPS" -v protected="$PROTECTED" \
-	-v statement_timeout="${RECONCILE_STATEMENT_TIMEOUT:-300s}" 2>&1 <<'SQL'
+	-v statement_timeout="${RECONCILE_STATEMENT_TIMEOUT:-300s}" -v time_budget="${RECONCILE_TIME_BUDGET:-240s}" 2>&1 <<'SQL'
 SET statement_timeout = :'statement_timeout';
+SET reconcile.time_budget = :'time_budget';
 SET lock_timeout = '30s';
 SELECT action, coalesce(username, '-'), coalesce(detail, '')
   FROM ldap_reconcile.reconcile_permissions(:'config', :'members', :'source', :'owner', :'allow_drops'::boolean,
@@ -263,8 +272,8 @@ SQL
 if [ -n "$RESULT" ]; then
 	printf '%s\n' "$RESULT" | while IFS= read -r line; do log "$line"; done
 fi
-log "done: $(printf '%s\n' "$RESULT" | sed '/^$/d' | awk '{ per_action[$1]++ } END { summary = ""; for (action in per_action) summary = summary action "=" per_action[action] " "; print (summary == "" ? "no changes" : summary) }')"
-ERRORS=$(printf '%s\n' "$RESULT" | awk '$1 == "ERROR"')
+log "done: $(printf '%s\n' "$RESULT" | sed '/^$/d' | awk '{ per_action[$1]++ } END { summary = ""; for (action in per_action) summary = summary action "=" per_action[action] " "; print (summary == "" ? "no changes " : summary) }')in $(( $(date +%s) - RUN_STARTED ))s"
+ERRORS=$(printf '%s\n' "$RESULT" | awk '$1 == "ERROR" || $1 == "DEFERRED"')
 if [ -n "$ERRORS" ]; then
 	report "applied except for: $(printf '%s' "$ERRORS" | tr '\n' ';')"
 	exit 3

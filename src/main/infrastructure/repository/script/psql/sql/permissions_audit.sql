@@ -35,4 +35,11 @@ CREATE TABLE IF NOT EXISTS ldap_reconcile.permissions_audit (
 CREATE INDEX IF NOT EXISTS idx_audit_applied ON ldap_reconcile.permissions_audit(applied_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_grantee ON ldap_reconcile.permissions_audit(grantee, schema_name, table_name);
 CREATE INDEX IF NOT EXISTS idx_audit_ticket  ON ldap_reconcile.permissions_audit(ticket_ref) WHERE ticket_ref IS NOT NULL;
+-- When each managed user's privileges were last reconciled: the order of the next
+-- run, so a run cut short by its time budget continues where it stopped.
+CREATE TABLE IF NOT EXISTS ldap_reconcile.privilege_progress (
+    username      TEXT PRIMARY KEY,
+    reconciled_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_audit_flow    ON ldap_reconcile.permissions_audit(flow, action);

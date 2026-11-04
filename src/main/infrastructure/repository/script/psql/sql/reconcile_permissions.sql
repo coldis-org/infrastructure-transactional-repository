@@ -71,8 +71,16 @@ DECLARE
     read_tables      TEXT[];
     is_first_run   BOOLEAN;
     is_in_ldap   BOOLEAN;
+    run_started      TIMESTAMPTZ := clock_timestamp();
+    time_budget      INTERVAL;
+    processed_count  INT := 0;
+    deferred_count   INT := 0;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('reconcile_permissions'));
+    -- Time budget for the per-user privilege step (unset = none), set by the caller
+    -- below its statement timeout, so a large run commits part of the work instead of
+    -- being cancelled and rolled back whole.
+    time_budget := NULLIF(current_setting('reconcile.time_budget', true), '')::INTERVAL;
     IF current_setting('server_version_num')::INT >= 170000 THEN
         all_table_privileges := array_append(all_table_privileges, 'MAINTAIN');
     END IF;
@@ -215,9 +223,19 @@ BEGIN
     LOOP
         IF drops_allowed THEN
             BEGIN
+                -- A SECURITY DEFINER routine would run as the new owner (the application
+                -- user) for anyone allowed to call it: it is made SECURITY INVOKER first.
+                FOR function_row IN SELECT p.oid::regprocedure::TEXT AS signature FROM pg_proc p
+                                     WHERE p.proowner = (SELECT oid FROM pg_roles WHERE rolname = role_row.rolname) AND p.prosecdef ORDER BY 1 LOOP
+                    EXECUTE format('ALTER ROUTINE %s SECURITY INVOKER', function_row.signature);
+                    INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, table_name)
+                    VALUES ('permanent_sync', 'SECURITY_INVOKER', run_source, role_row.rolname, function_row.signature);
+                    INSERT INTO _out(action, username, detail) VALUES ('SECURITY_INVOKER', role_row.rolname, function_row.signature);
+                END LOOP;
                 EXECUTE format('REASSIGN OWNED BY %I TO %I', role_row.rolname, owner_role);
                 EXECUTE format('DROP OWNED BY %I', role_row.rolname);
                 EXECUTE format('DROP ROLE %I', role_row.rolname);
+                DELETE FROM ldap_reconcile.privilege_progress progress WHERE progress.username = role_row.rolname;
                 INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, detail)
                 VALUES ('permanent_sync', 'DROP_USER', run_source, role_row.rolname, jsonb_build_object('reassigned_to', owner_role));
                 INSERT INTO _out(action, username, detail) VALUES ('DROP_USER', role_row.rolname, 'objects reassigned to ' || owner_role);
@@ -233,12 +251,20 @@ BEGIN
 
     -- Privileges of managed users: those in LDAP get the desired state; those
     -- kept although not in LDAP (drops disabled) get none of the configured access.
+    -- Least recently reconciled first: when the time budget runs out, the users left
+    -- are the first ones of the next run. At least one user is always done.
     FOR role_row IN
         SELECT a.rolname, a.oid FROM pg_roles a
+          LEFT JOIN ldap_reconcile.privilege_progress progress ON progress.username = a.rolname
          WHERE EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole) AND a.rolname <> 'ldap_managed'
            AND a.oid NOT IN (SELECT oid FROM _protected)
-         ORDER BY a.rolname
+         ORDER BY progress.reconciled_at NULLS FIRST, a.rolname
     LOOP
+        IF time_budget IS NOT NULL AND processed_count > 0 AND clock_timestamp() - run_started > time_budget THEN
+            deferred_count := deferred_count + 1;
+            CONTINUE;
+        END IF;
+        processed_count := processed_count + 1;
         BEGIN
             is_in_ldap := role_row.rolname IN (SELECT tg.username FROM _target tg);
             -- Database.
@@ -389,7 +415,13 @@ BEGIN
             VALUES ('permanent_sync', 'ERROR', run_source, role_row.rolname, jsonb_build_object('op', 'privileges', 'sqlstate', SQLSTATE, 'sqlerrm', SQLERRM));
             INSERT INTO _out(action, username, detail) VALUES ('ERROR', role_row.rolname, 'privileges: ' || SQLERRM);
         END;
+        INSERT INTO ldap_reconcile.privilege_progress(username, reconciled_at) VALUES (role_row.rolname, clock_timestamp())
+            ON CONFLICT ON CONSTRAINT privilege_progress_pkey DO UPDATE SET reconciled_at = EXCLUDED.reconciled_at;
     END LOOP;
+    IF deferred_count > 0 THEN
+        INSERT INTO _out(action, username, detail)
+        VALUES ('DEFERRED', NULL, deferred_count || ' user(s) left for the next run: time budget ' || time_budget || ' reached');
+    END IF;
 
     -- Group roles (PSQL_ALTER_GROUP_*): managed users in the mapped LDAP groups
     -- are members; managed users outside them are not. A role that does not
@@ -434,13 +466,13 @@ BEGIN
                 -- removes the bootstrap superuser's: each grantor's is revoked by name.
                 IF current_setting('server_version_num')::INT >= 160000 THEN
                     FOR grant_row IN SELECT DISTINCT am.grantor::regrole::TEXT AS grantor_name FROM pg_auth_members am
-                                      WHERE am.member = role_row.rolname::regrole AND am.roleid = group_row.role_name::regrole LOOP
+                                      WHERE am.member = (SELECT oid FROM pg_roles WHERE rolname = role_row.rolname) AND am.roleid = (SELECT oid FROM pg_roles WHERE rolname = group_row.role_name) LOOP
                         EXECUTE format('REVOKE %I FROM %I GRANTED BY %s', group_row.role_name, role_row.rolname, grant_row.grantor_name);
                     END LOOP;
                 ELSE
                     EXECUTE format('REVOKE %I FROM %I', group_row.role_name, role_row.rolname);
                 END IF;
-                IF EXISTS (SELECT 1 FROM pg_auth_members am WHERE am.member = role_row.rolname::regrole AND am.roleid = group_row.role_name::regrole) THEN
+                IF EXISTS (SELECT 1 FROM pg_auth_members am WHERE am.member = (SELECT oid FROM pg_roles WHERE rolname = role_row.rolname) AND am.roleid = (SELECT oid FROM pg_roles WHERE rolname = group_row.role_name)) THEN
                     RAISE EXCEPTION 'membership of % in % is still held after the revoke', role_row.rolname, group_row.role_name;
                 END IF;
                 INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, permission)

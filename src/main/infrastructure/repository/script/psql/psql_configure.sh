@@ -63,8 +63,12 @@ if [ "$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -tA -c 'SELECT p
 then
 	# search_path pinned: public belongs to the database owner on 15+.
 	PGOPTIONS="-c search_path=pg_catalog" PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -q -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres} -d "${POSTGRES_DEFAULT_DATABASE}" \
-		-f "${SQL_DIR}/permissions_audit.sql" -f "${SQL_DIR}/reconcile_permissions.sql" \
+		-v checksum="$(md5sum "${SQL_DIR}/reconcile_permissions.sql" | cut -d' ' -f1)" \
+		-f "${SQL_DIR}/permissions_audit.sql" -f "${SQL_DIR}/reconcile_permissions.sql" -f - <<'SQL' \
 		|| echo "ERROR: could not install the permissions reconcile"
+-- The checksum of the SQL just installed: the wrapper runs only a function that matches it.
+SELECT format('COMMENT ON FUNCTION ldap_reconcile.reconcile_permissions(TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT[]) IS %L', 'sql md5 ' || :'checksum') \gexec
+SQL
 	# Tolerant: an LDAP outage at boot must not stop the database; cron retries hourly.
 	RECONCILE_SOURCE=boot flock -w 60 /var/lock/reconcile_permissions.lock ./psql_reconcile_permissions.sh || true
 fi

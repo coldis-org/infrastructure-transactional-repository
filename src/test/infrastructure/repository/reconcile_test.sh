@@ -159,9 +159,10 @@ if [ $RC = 0 ] && ! can carol s3.w1 INSERT && ! can carol s3.w1 SELECT && can ca
 # A user's objects survive the user.
 sql "CREATE TABLE s1.bob_t(i int); INSERT INTO s1.bob_t SELECT generate_series(1, 42); ALTER TABLE s1.bob_t OWNER TO bob;
      CREATE FUNCTION s1.bob_f() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION s1.bob_f() OWNER TO bob;
-     CREATE VIEW s1.bob_v AS SELECT * FROM s1.t_a; ALTER VIEW s1.bob_v OWNER TO bob; GRANT SELECT ON s1.bob_v TO PUBLIC;" >/dev/null
+     CREATE VIEW s1.bob_v AS SELECT * FROM s1.t_a; ALTER VIEW s1.bob_v OWNER TO bob; GRANT SELECT ON s1.bob_v TO PUBLIC;
+     GRANT INSERT ON s1.bob_t TO PUBLIC; GRANT SELECT (i) ON s1.bob_t TO svc;" >/dev/null
 members readers alice erin carol; reconcile
-if [ "$(sql "SELECT prosecdef FROM pg_proc WHERE proname = 'bob_f'")" = f ] && grep -q "SECURITY_INVOKER bob s1.bob_f()" <<<"$OUT" && [ "$(sql "SELECT has_table_privilege('public', 's1.bob_v', 'SELECT')")" = f ] && grep -q "REVOKE_VIEW_GRANTS bob s1.bob_v" <<<"$OUT"; then ok "a dropped user's SECURITY DEFINER function becomes SECURITY INVOKER and their view loses its grants before the reassign"; else bad "a dropped user's SECURITY DEFINER function becomes SECURITY INVOKER and their view loses its grants before the reassign"; fi
+if [ "$(sql "SELECT prosecdef FROM pg_proc WHERE proname = 'bob_f'")" = f ] && grep -q "SECURITY_INVOKER bob s1.bob_f()" <<<"$OUT" && [ "$(sql "SELECT has_table_privilege('public', 's1.bob_v', 'SELECT') OR has_table_privilege('public', 's1.bob_t', 'INSERT') OR has_column_privilege('svc', 's1.bob_t', 'i', 'SELECT')")" = f ] && grep -q "REVOKE_OBJECT_GRANTS bob s1.bob_v" <<<"$OUT"; then ok "a dropped user's SECURITY DEFINER function becomes SECURITY INVOKER and their view loses its grants before the reassign"; else bad "a dropped user's SECURITY DEFINER function becomes SECURITY INVOKER and their view loses its grants before the reassign"; fi
 if [ $RC = 0 ] && ! exists bob; then ok "a user removed from LDAP is dropped"; else bad "a user removed from LDAP is dropped"; fi
 if [ "$(sql "SELECT count(*) || ' '|| tableowner FROM s1.bob_t, pg_tables WHERE tablename = 'bob_t' GROUP BY tableowner")" = "42 app" ]; then ok "their table survives, with its data, owned by the application user"; else bad "their table survives, with its data, owned by the application user"; fi
 
@@ -171,6 +172,14 @@ if [ "$(sql "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pro
 APP_DROP=$(docker exec "$DB" sh -c "PGPASSWORD=app psql -X -tA -h 127.0.0.1 -U app -d appdb -c 'DROP FUNCTION ldap_reconcile.reconcile_permissions(text, text, text, text, boolean, text[])'" 2>&1)
 APP_CREATE=$(docker exec "$DB" sh -c "PGPASSWORD=app psql -X -tA -h 127.0.0.1 -U app -d appdb -c 'CREATE TABLE ldap_reconcile.x(i int)'" 2>&1)
 if [ "$(sql "SELECT count(*) FROM pg_proc WHERE proname = 'reconcile_permissions'")" = 1 ] && grep -qiE "denied|negad" <<<"$APP_DROP" && grep -qiE "denied|negad" <<<"$APP_CREATE"; then ok "the application user can neither drop the function nor create in its schema"; else bad "the application user can neither drop the function nor create in its schema"; fi
+
+# A function that is not this image's (a failed install left an older one) is not run.
+INSTALLED_COMMENT=$(sql "SELECT obj_description('ldap_reconcile.reconcile_permissions(text, text, text, text, boolean, text[])'::regprocedure, 'pg_proc')")
+sql "COMMENT ON FUNCTION ldap_reconcile.reconcile_permissions(text, text, text, text, boolean, text[]) IS 'sql md5 older'" >/dev/null
+BEFORE=$(snapshot)
+reconcile
+if [ $RC = 2 ] && grep -q "not installed from this image" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] && [ -n "$INSTALLED_COMMENT" ]; then ok "a function from other SQL than the image's is not run"; else bad "a function from other SQL than the image's is not run"; fi
+sql "COMMENT ON FUNCTION ldap_reconcile.reconcile_permissions(text, text, text, text, boolean, text[]) IS '$INSTALLED_COMMENT'" >/dev/null
 
 # After the first run, a role granted access by other means is never taken over.
 sql "CREATE ROLE svc2 LOGIN; GRANT USAGE ON SCHEMA s1 TO svc2; GRANT SELECT ON s1.t_a TO svc2;" >/dev/null
@@ -304,7 +313,12 @@ reconcile
 if [ $RC = 0 ] && exists Jo.Mixed && exists 9lives && can Jo.Mixed s1.t_a SELECT; then ok "mixed-case names and a leading digit are valid usernames (as the old scripts allowed)"; else bad "mixed-case names and a leading digit are valid usernames (as the old scripts allowed)"; fi
 LEGACY_OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && ./psql_users_add.sh' 2>&1); LEGACY_RC=$?
 if [ $LEGACY_RC = 0 ] && grep -q "done:" <<<"$LEGACY_OUT"; then ok "psql_users_add.sh (still called by the on-demand pipeline) runs the reconcile"; else bad "psql_users_add.sh (still called by the on-demand pipeline) runs the reconcile"; fi
+config "$BASE_CONFIG
+POSTGRES_DEFAULT_USER="
 members readers alice erin carol
+reconcile
+if [ $RC = 3 ] && exists Jo.Mixed && grep -q "no non-superuser owner" <<<"$OUT"; then ok "with no default user, a drop is refused rather than handing objects to the superuser"; else bad "with no default user, a drop is refused rather than handing objects to the superuser"; fi
+config "$BASE_CONFIG"
 reconcile
 BEFORE=$(snapshot)
 

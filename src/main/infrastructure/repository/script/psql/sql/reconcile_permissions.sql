@@ -81,12 +81,16 @@ DECLARE
     processed_count  INT := 0;
     deferred_count   INT := 0;
     cut_short        BOOLEAN;
+    hard_ceiling     INTERVAL;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('reconcile_permissions'));
     -- Time budget for the per-user privilege step (unset = none), set by the caller
     -- below its statement timeout, so a large run commits part of the work instead of
     -- being cancelled and rolled back whole.
     time_budget := NULLIF(current_setting('reconcile.time_budget', true), '')::INTERVAL;
+    -- 90% of the statement timeout stops any user's step, the first one too, so the rest
+    -- of the run (drops, revocations, other users) still commits.
+    hard_ceiling := NULLIF(current_setting('statement_timeout'), '0')::INTERVAL * 0.9;
     IF current_setting('server_version_num')::INT >= 170000 THEN
         all_table_privileges := array_append(all_table_privileges, 'MAINTAIN');
     END IF;
@@ -231,6 +235,10 @@ BEGIN
     LOOP
         IF drops_allowed THEN
             BEGIN
+                -- Objects go to the default (application) user; never to a superuser.
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = owner_role AND rolsuper) THEN
+                    RAISE EXCEPTION 'no non-superuser owner to reassign % objects to (POSTGRES_DEFAULT_USER is empty or a superuser)', role_row.rolname;
+                END IF;
                 -- A SECURITY DEFINER routine would run as the new owner (the application
                 -- user) for anyone allowed to call it: it is made SECURITY INVOKER first.
                 FOR function_row IN SELECT p.oid::regprocedure::TEXT AS signature FROM pg_proc p
@@ -240,19 +248,24 @@ BEGIN
                     VALUES ('permanent_sync', 'SECURITY_INVOKER', run_source, role_row.rolname, function_row.signature);
                     INSERT INTO _out(action, username, detail) VALUES ('SECURITY_INVOKER', role_row.rolname, function_row.signature);
                 END LOOP;
-                -- A view reads its tables with its owner's rights: after the reassign, a
-                -- view the user granted to others would expose the application user's
-                -- access. Its grants to other roles are revoked first.
-                FOR relation_row IN SELECT c.oid::regclass::TEXT AS relation_name, x.grantee
-                                      FROM pg_class c, aclexplode(c.relacl) x
+                -- Views and rules run with their owner's rights: after the reassign, a
+                -- relation the user granted to others would act with the application
+                -- user's access. Every grant to another role on the user's relations,
+                -- column grants included, is revoked first (REVOKE ALL on the table also
+                -- revokes its column privileges).
+                FOR relation_row IN SELECT DISTINCT c.oid::regclass::TEXT AS relation_name, x.grantee
+                                      FROM pg_class c
+                                      CROSS JOIN LATERAL (SELECT acl.grantee FROM aclexplode(c.relacl) acl
+                                                          UNION SELECT acl.grantee FROM pg_attribute att, aclexplode(att.attacl) acl
+                                                                 WHERE att.attrelid = c.oid AND att.attacl IS NOT NULL) x
                                      WHERE c.relowner = (SELECT oid FROM pg_roles WHERE rolname = role_row.rolname)
-                                       AND c.relkind IN ('v', 'm') AND x.grantee <> c.relowner ORDER BY 1 LOOP
+                                       AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND x.grantee <> c.relowner ORDER BY 1 LOOP
                     EXECUTE format('REVOKE ALL ON TABLE %s FROM %s', relation_row.relation_name,
                                    CASE WHEN relation_row.grantee = 0 THEN 'PUBLIC' ELSE relation_row.grantee::regrole::TEXT END);
                     INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, table_name, detail)
-                    VALUES ('permanent_sync', 'REVOKE_VIEW_GRANTS', run_source, role_row.rolname, relation_row.relation_name,
+                    VALUES ('permanent_sync', 'REVOKE_OBJECT_GRANTS', run_source, role_row.rolname, relation_row.relation_name,
                             jsonb_build_object('from', CASE WHEN relation_row.grantee = 0 THEN 'PUBLIC' ELSE relation_row.grantee::regrole::TEXT END));
-                    INSERT INTO _out(action, username, detail) VALUES ('REVOKE_VIEW_GRANTS', role_row.rolname, relation_row.relation_name);
+                    INSERT INTO _out(action, username, detail) VALUES ('REVOKE_OBJECT_GRANTS', role_row.rolname, relation_row.relation_name);
                 END LOOP;
                 EXECUTE format('REASSIGN OWNED BY %I TO %I', role_row.rolname, owner_role);
                 EXECUTE format('DROP OWNED BY %I', role_row.rolname);
@@ -284,7 +297,8 @@ BEGIN
          ORDER BY a.rolname IN (SELECT tg.username FROM _target tg), progress.reconciled_at NULLS FIRST, a.rolname
     LOOP
         cut_short := false;
-        IF time_budget IS NOT NULL AND processed_count > 0 AND clock_timestamp() - run_started > time_budget THEN
+        IF (time_budget IS NOT NULL AND processed_count > 0 AND clock_timestamp() - run_started > time_budget)
+           OR (hard_ceiling IS NOT NULL AND clock_timestamp() - run_started > hard_ceiling) THEN
             deferred_count := deferred_count + 1;
             CONTINUE;
         END IF;
@@ -364,7 +378,8 @@ BEGIN
                 LOOP
                     -- The budget also stops a long step midway (not the first user's): that
                     -- user's step is rolled back and goes first next run.
-                    IF time_budget IS NOT NULL AND processed_count > 1 AND clock_timestamp() - run_started > time_budget THEN
+                    IF (time_budget IS NOT NULL AND processed_count > 1 AND clock_timestamp() - run_started > time_budget)
+                       OR (hard_ceiling IS NOT NULL AND clock_timestamp() - run_started > hard_ceiling) THEN
                         RAISE EXCEPTION USING ERRCODE = 'P0B01', MESSAGE = 'time budget reached';
                     END IF;
                     IF relation_row.relkind = 'S' THEN

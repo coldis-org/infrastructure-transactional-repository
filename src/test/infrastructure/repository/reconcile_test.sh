@@ -314,5 +314,12 @@ reconcile
 if [ $RC = 0 ] && ! exists alice && ! exists erin && ! exists george && ! exists frank; then ok "with RECONCILE_ALLOW_EMPTY=true, every group empty drops every managed user"; else bad "with RECONCILE_ALLOW_EMPTY=true, every group empty drops every managed user"; fi
 if exists svc && exists handmade && exists app && exists postgres && exists ldap_managed; then ok "and leaves every unmanaged role"; else bad "and leaves every unmanaged role"; fi
 
+# First run with every group empty: the legacy users it would adopt are not dropped.
+sql "DROP ROLE ldap_managed; CREATE ROLE legacy LOGIN; GRANT USAGE ON SCHEMA s1 TO legacy; GRANT SELECT ON s1.t_a TO legacy;" >/dev/null
+config "$BASE_CONFIG"
+BEFORE=$(snapshot)
+reconcile
+if [ $RC = 1 ] && grep -q "first run" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] && exists legacy; then ok "every group empty on the first run is refused, the legacy users stay"; else bad "every group empty on the first run is refused, the legacy users stay"; fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

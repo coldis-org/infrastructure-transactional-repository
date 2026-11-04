@@ -218,14 +218,21 @@ log "LDAP: ${GROUP_COUNT} group(s), ${USER_COUNT} user(s)"
 
 # No member in any read/write group would drop (or revoke) every managed user. Single empty
 # groups are normal (temporary permissions); all of them empty at once is more likely a
-# directory that stopped answering memberUid, so it needs RECONCILE_ALLOW_EMPTY=true.
+# directory that stopped answering memberUid, so it needs RECONCILE_ALLOW_EMPTY=true. On the
+# first run (no ldap_managed yet) with drops enabled, the legacy users about to be adopted
+# would be dropped in the same run, so that is refused as well.
 PERMISSION_GROUPS=$(printf '%s\n' "$CONFIG_SPEC" | awk -F'\t' '$1 == "read" || $1 == "write" { print $4 }' | sort -u | tr '\n' ' ')
 PERMISSION_USER_COUNT=$(printf '%s\n' "$MEMBERS" | awk -F'\t' -v groups=" ${PERMISSION_GROUPS}" '$2 != "" && index(groups, " " $1 " ") { print $2 }' \
 	| sort -u | wc -l | tr -d ' ')
 if [ "$PERMISSION_USER_COUNT" = 0 ] && [ "${RECONCILE_ALLOW_EMPTY:-false}" != true ]; then
-	MANAGED_COUNT=$(psql_admin -tA -c "SELECT count(*) FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.roleid WHERE r.rolname = 'ldap_managed'") \
+	# -1: first run, ldap_managed does not exist yet.
+	MANAGED_COUNT=$(psql_admin -tA -c "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ldap_managed') THEN -1
+		ELSE (SELECT count(*) FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.roleid WHERE r.rolname = 'ldap_managed') END") \
 		|| fail 2 "cannot query the database"
-	[ "$MANAGED_COUNT" = 0 ] \
+	if [ "$MANAGED_COUNT" = -1 ] && [ "$SKIP_DELETE" != true ]; then
+		fail 1 "no configured read/write LDAP group has any member on the first run; refusing to adopt and drop the existing users (set RECONCILE_ALLOW_EMPTY=true if this is intended)"
+	fi
+	[ "$MANAGED_COUNT" = 0 ] || [ "$MANAGED_COUNT" = -1 ] \
 		|| fail 1 "no configured read/write LDAP group has any member, and ${MANAGED_COUNT} managed user(s) exist; refusing (set RECONCILE_ALLOW_EMPTY=true if this is intended)"
 fi
 

@@ -5,9 +5,7 @@ set +e
 
 # Default parameters.
 DEBUG=true
-DEBUG_OPT=
 SQL_CONFIGURATION=/tmp/config.sql
-USER_LOCK_FILE="${PGDATA}/user_configured.lock"
 REPLICATION_LOCK_FILE="${PGDATA}/replication_configured.lock"
 
 # Enables interruption signal handling.
@@ -15,13 +13,13 @@ trap - INT TERM
 
 # Waits until database is available.
 echo "Waiting database initialization..."
-while !(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres})
+while ! (PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres})
 do
 	sleep 1
 done
 sleep 2
 echo "Waiting database initialization..."
-while !(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres})
+while ! (PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres})
 do
 	sleep 1
 done
@@ -42,7 +40,7 @@ then
 	# Connects to the default database, not to one named after the user: psql falls back to the
 	# user name when no database is given, and then a module whose database has another name
 	# never sees the probe succeed, so the loop below never ends. Empty keeps the old fallback.
-	while !(PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_DEFAULT_USER} ${POSTGRES_DEFAULT_DATABASE})
+	while ! (PGPASSWORD=${POSTGRES_DEFAULT_PASSWORD} psql -c 'SELECT 1;' -v ON_ERROR_STOP=1 -U ${POSTGRES_DEFAULT_USER} ${POSTGRES_DEFAULT_DATABASE})
 	do
 		sleep 1
 		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -c "CREATE USER ${POSTGRES_DEFAULT_USER} WITH PASSWORD '${POSTGRES_DEFAULT_PASSWORD}';" -U ${POSTGRES_ADMIN_USER:=postgres} || true
@@ -57,20 +55,18 @@ else
 	
 fi
 
-# Install permissions infrastructure. Fail-hard: without it the wrapper below
-# would fail silently on every run.
-# Passes admin_user as a psql variable so the GRANT EXECUTE in
-# reconcile_permissions.sql targets whichever role is running this script.
+# Installs the permissions reconcile (history table and function) and runs it once. A
+# read-only replica gets both from its primary. psql -f fails on a missing file, so an
+# incomplete image does not install half of it.
 SQL_DIR="$(cd "$(dirname "$0")" && pwd)/sql"
-cat "${SQL_DIR}/permissions_audit.sql" "${SQL_DIR}/reconcile_permissions.sql" \
-  | PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql \
-        -v ON_ERROR_STOP=1 \
-        -v admin_user="${POSTGRES_ADMIN_USER:=postgres}" \
-        -U ${POSTGRES_ADMIN_USER} \
-        -d "${POSTGRES_DEFAULT_DATABASE}"
-
-# Reconcile users against current LDAP. Tolerant: next cron retries.
-RECONCILE_SOURCE=boot ./psql_reconcile_permissions.sh || true
+if [ "$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -tA -c 'SELECT pg_is_in_recovery()' -U ${POSTGRES_ADMIN_USER:=postgres} -d "${POSTGRES_DEFAULT_DATABASE}")" = f ]
+then
+	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -q -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres} -d "${POSTGRES_DEFAULT_DATABASE}" \
+		-f "${SQL_DIR}/permissions_audit.sql" -f "${SQL_DIR}/reconcile_permissions.sql" \
+		|| echo "ERROR: could not install the permissions reconcile"
+	# Tolerant: an LDAP outage at boot must not stop the database; cron retries hourly.
+	RECONCILE_SOURCE=boot ./psql_reconcile_permissions.sh || true
+fi
 
 # If stats extension should be confgured.
 ${DEBUG} && echo "ENABLE_STATS=${ENABLE_STATS}"

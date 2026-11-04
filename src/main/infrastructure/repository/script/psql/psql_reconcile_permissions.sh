@@ -1,226 +1,236 @@
 #!/bin/sh
 #
-# Wrapper for reconcile_permissions() (v0 — USER lifecycle).
-# Replaces psql_users_add.sh + psql_users_remove.sh. Reads the existing
-# PSQL_* env vars, resolves LDAP membership, calls the SQL function.
+# Reconciles LDAP-managed database users with LDAP (see sql/reconcile_permissions.sql).
+# Replaces psql_users_add, psql_users_remove and psql_users_alter_group. Run at boot by
+# psql_configure.sh and hourly by cron.
 #
-# Performance: 1 ldapsearch (OR filter across all groups), 1 psql -c.
-# Invoked from psql_configure.sh at boot and from cron hourly.
+# Configuration, from the environment (and /local/application.env, re-read every run):
+#   PSQL_READ_SCHEMA_<SCHEMA>=g1,g2               read on a whole schema
+#   PSQL_READ_SCHEMA_<SCHEMA>_TABLE_<TABLE>=g1     read on one table
+#   PSQL_WRITE_SCHEMA_<SCHEMA>=g1                  write on a whole schema
+#   PSQL_ALTER_GROUP_<ROLE>=g1                     membership of a group role
+#                                                  (only when SKIP_ALTER_GROUP=false)
+#   SKIP_DELETE=true                               never drop users (their configured access
+#                                                  is revoked; the role is kept)
+#   RECONCILE_STATEMENT_TIMEOUT=300s               upper bound for one run's database side
+#
+# The managed population follows the configuration: a user who is in none of the configured
+# LDAP groups is dropped, also when a PSQL_* mapping is removed and the user was only in it.
+#   LDAP_HOST (or LDAP_URI + LDAP_PORT), LDAP_USER, LDAP_PASSWORD, LDAP_GROUPS (base DN)
+#
+# Fails closed: LDAP unreachable, a failed bind, an incomplete search, a configured group
+# that does not exist, or a username it cannot trust stops the run before the database is
+# touched. A group that exists with no members is a valid answer. On the database side a
+# failure on one user (a role that cannot be dropped, a conflicting grant) skips that user
+# and is reported; everyone else is still reconciled.
+#
+# Exit status: 0 applied (or nothing to do), 1 configuration or LDAP error (nothing changed),
+# 2 database error (nothing changed), 3 applied except for the users reported as ERROR.
 
-set -eu
+set -u
 
-DEBUG=${DEBUG:=false}
 ENV_FILE="${RECONCILE_ENV_FILE:-/local/application.env}"
-LOG_FILE="/tmp/reconcile_permissions.log"
+if [ -f "$ENV_FILE" ]; then
+	# Rendered at runtime by the scheduler; nothing to follow. Exported, so the PSQL_* lines in
+	# it count: the configuration below is read from the environment.
+	set -a
+	# shellcheck source=/dev/null
+	. "$ENV_FILE"
+	set +a
+fi
+
+DEBUG=${DEBUG:-false}
 RECONCILE_SOURCE="${RECONCILE_SOURCE:-cron}"   # boot | cron | manual
 LDAP_NETTIMEOUT="${LDAP_NETTIMEOUT:-10}"
-
-# Boot/manual: surface logs to stdout for the operator. Cron stays quiet.
-if [ "$RECONCILE_SOURCE" = "boot" ] || [ "$RECONCILE_SOURCE" = "manual" ]; then
-    DEBUG=true
-fi
-
-printf '[psql_reconcile_permissions] start (source=%s, debug=%s, ldap_nettimeout=%ss)\n' \
-    "$RECONCILE_SOURCE" "$DEBUG" "$LDAP_NETTIMEOUT" >&2
-
-if [ -f "$ENV_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$ENV_FILE"
-fi
-
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || LOG_FILE="/tmp/reconcile_permissions.log"
-
-# Legacy fallback: build LDAP_HOST from LDAP_URI:LDAP_PORT if unset.
-# Strip ldap://, ldaps:// prefix defensively (LDAP_URI is sometimes set to a
-# full URL — without stripping we'd end up with "ldap://ldap://host:389").
-if [ -z "${LDAP_HOST:-}" ]; then
-    LDAP_HOST="${LDAP_URI:-}:${LDAP_PORT:-}"
-    LDAP_HOST="${LDAP_HOST#ldap://}"
-    LDAP_HOST="${LDAP_HOST#ldaps://}"
-    [ "$LDAP_HOST" = ":" ] && LDAP_HOST=""
-fi
-# Same scheme strip if LDAP_HOST itself was set with a scheme prefix.
-LDAP_HOST="${LDAP_HOST#ldap://}"
-LDAP_HOST="${LDAP_HOST#ldaps://}"
-
-: "${POSTGRES_ADMIN_USER:=postgres}"
-: "${POSTGRES_ADMIN_PASSWORD:=postgres}"
-
-timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+SKIP_DELETE="${SKIP_DELETE:-false}"
+SKIP_ALTER_GROUP="${SKIP_ALTER_GROUP:-true}"
+POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-postgres}"
+POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-postgres}"
+# The last run only: each run starts the file afresh.
+LOG_FILE="${RECONCILE_LOG_FILE:-/var/log/reconcile_permissions.log}"
+: > "$LOG_FILE" 2>/dev/null || LOG_FILE=/dev/null
 
 log() {
-    printf '[%s] %s\n' "$(timestamp)" "$*" >> "$LOG_FILE"
-    ${DEBUG} && printf '[%s] %s\n' "$(timestamp)" "$*"
-    return 0
+	printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG_FILE"
+	if [ "$DEBUG" = true ] || [ "$RECONCILE_SOURCE" != cron ]; then
+		printf '[psql_reconcile_permissions] %s\n' "$*"
+	fi
+}
+# Errors always reach stderr, even when the caller ignores the exit status, and the server
+# log as a WARNING (best effort), so they show in the container log: cron cannot write to
+# PID 1's output here, the server runs as postgres.
+report() { # message
+	printf '[%s] ERROR: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$LOG_FILE"
+	printf '[psql_reconcile_permissions] ERROR: %s\n' "$1" >&2
+	# psql interpolates :'message' only in input it reads, not in -c.
+	PGPASSWORD="$POSTGRES_ADMIN_PASSWORD" psql -X -q -U "$POSTGRES_ADMIN_USER" -d "${POSTGRES_DEFAULT_DATABASE:-postgres}" \
+		-v message="psql_reconcile_permissions (${RECONCILE_SOURCE}): $1" >/dev/null 2>&1 <<'SQL' || true
+SELECT set_config('reconcile.message', :'message', false);
+DO $$ BEGIN RAISE WARNING '%', current_setting('reconcile.message'); END $$;
+SQL
+}
+fail() { # status message
+	report "$2"
+	exit "$1"
+}
+psql_admin() { # extra psql arguments
+	PGPASSWORD="$POSTGRES_ADMIN_PASSWORD" psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_ADMIN_USER" -d "$POSTGRES_DEFAULT_DATABASE" "$@"
 }
 
-# err: writes to LOG_FILE and stderr, so it surfaces even when the caller
-# uses `|| true`.
-err() {
-    printf '[%s] ERROR: %s\n' "$(timestamp)" "$*" >> "$LOG_FILE"
-    printf '[psql_reconcile_permissions] ERROR: %s\n' "$*" >&2
-    return 0
-}
-
-mask() {
-    s="${1:-}"; len=${#s}
-    if [ "$len" -le 4 ]; then printf '****'
-    else printf '%s****%s' "$(printf '%s' "$s" | cut -c1-2)" "$(printf '%s' "$s" | cut -c$((len-1))-)"; fi
-}
-
-# Fail-fast on missing env vars, otherwise `set -u` would abort at a less
-# obvious point and the `|| true` in the caller would swallow it.
-MISSING=""
-for v in LDAP_HOST LDAP_USER LDAP_PASSWORD LDAP_GROUPS POSTGRES_DEFAULT_DATABASE; do
-    eval "val=\${$v:-}"
-    [ -z "$val" ] && MISSING="$MISSING $v"
-done
-if [ -n "$MISSING" ]; then
-    err "missing env vars:$MISSING"
-    err "set them via ENV_FILE=$ENV_FILE or docker -e ... Aborting."
-    exit 3
+# LDAP_HOST is host:port; older deployments give LDAP_URI and LDAP_PORT, sometimes with a scheme.
+if [ -z "${LDAP_HOST:-}" ] && [ -n "${LDAP_URI:-}" ]; then
+	LDAP_HOST="${LDAP_URI}:${LDAP_PORT:-389}"
 fi
+LDAP_HOST="${LDAP_HOST:-}"
+# A configured scheme is kept (ldaps:// stays TLS); a bare host:port is ldap://.
+case "$LDAP_HOST" in
+	ldap://*|ldaps://*) LDAP_URL="$LDAP_HOST" ;;
+	*) LDAP_URL="ldap://${LDAP_HOST}" ;;
+esac
 
-log "LDAP config: host=${LDAP_HOST} base=${LDAP_GROUPS} bind_dn=${LDAP_USER} password=$(mask "${LDAP_PASSWORD}")"
+log "start (source=${RECONCILE_SOURCE})"
 
-# Isolated bind test: separates connectivity/auth issues from filter issues.
-log "Testing LDAP bind..."
-LDAP_BIND_TEST=$(ldapsearch -LLL -o "nettimeout=${LDAP_NETTIMEOUT}" \
-    -w "${LDAP_PASSWORD}" -D "${LDAP_USER}" \
-    -H "ldap://${LDAP_HOST}" -b "${LDAP_GROUPS}" -s base \
-    "(objectClass=*)" dn 2>&1) || {
-    rc=$?
-    err "LDAP bind failed (exit $rc) at ldap://${LDAP_HOST}"
-    printf '%s\n' "$LDAP_BIND_TEST" | sed 's/^/  | /' >> "$LOG_FILE"
-    err "Check: host reachable (telnet $LDAP_HOST 389), bind DN, base DN. Log: $LOG_FILE"
-    exit $rc
-}
-log "Bind OK."
-
-# Union of LDAP groups referenced across PSQL_READ_SCHEMA_*, PSQL_WRITE_SCHEMA_*,
-# PSQL_ALTER_GROUP_* env vars. Comma-separated values are split.
-GROUPS=$(env | awk -F= '
-    /^PSQL_READ_SCHEMA_|^PSQL_WRITE_SCHEMA_|^PSQL_ALTER_GROUP_/ {
-        n = split($2, parts, ",")
-        for (i = 1; i <= n; i++) {
-            g = parts[i]
-            gsub(/^[ \t]+|[ \t]+$/, "", g)
-            if (g != "") print g
-        }
-    }
+# The desired configuration. A key splits at its first _TABLE_.
+CONFIG_SPEC=$(env | awk -F= -v alter="$SKIP_ALTER_GROUP" '
+	function emit(kind, object, table, value,    group_count, group_names, position, group_name, emitted) {
+		emitted = 0
+		group_count = split(value, group_names, ",")
+		for (position = 1; position <= group_count; position++) {
+			group_name = group_names[position]; gsub(/^[ \t]+|[ \t]+$/, "", group_name)
+			if (group_name != "") { printf "%s\t%s\t%s\t%s\n", kind, tolower(object), tolower(table), group_name; emitted = 1 }
+		}
+		# A variable with no group (an empty value rendered from a template) is an error,
+		# not "nobody": it would silently remove that permission from everyone.
+		if (!emitted) printf "empty\t%s\t%s\t-\n", tolower(object), tolower(table)
+	}
+	/^PSQL_(READ|WRITE)_SCHEMA_/ {
+		kind = ($1 ~ /^PSQL_READ_/) ? "read" : "write"
+		key = $1; sub(/^PSQL_(READ|WRITE)_SCHEMA_/, "", key)
+		value = substr($0, length($1) + 2)
+		table = ""
+		separator = index(key, "_TABLE_")
+		if (separator > 0) { table = substr(key, separator + 7); key = substr(key, 1, separator - 1) }
+		emit(kind, key, table, value)
+	}
+	/^PSQL_ALTER_GROUP_/ && alter == "false" {
+		key = $1; sub(/^PSQL_ALTER_GROUP_/, "", key)
+		emit("member", key, "", substr($0, length($1) + 2))
+	}
 ' | sort -u)
 
-if [ -z "$GROUPS" ]; then
-    err "no LDAP groups referenced in PSQL_* env vars; aborting (likely misconfig)"
-    exit 2
+if [ -z "$CONFIG_SPEC" ]; then
+	log "no PSQL_* permissions configured; nothing to reconcile"
+	exit 0
 fi
+BAD=$(printf '%s\n' "$CONFIG_SPEC" | awk -F'\t' '
+	$1 == "empty" { print "a PSQL_* variable for " $2 ($3 != "" ? "." $3 : "") " names no LDAP group"; next }
+	$2 !~ /^[a-z_][a-z0-9_]*$/ || ($3 != "" && $3 !~ /^[a-z_][a-z0-9_]*$/) || $4 !~ /^[A-Za-z0-9._-]+$/ { print }
+	$1 == "write" && $3 != "" { print "write on a single table is not supported: " $0 }')
+[ -z "$BAD" ] || fail 1 "invalid PSQL_* configuration: $(printf '%s' "$BAD" | tr '\n\t' '; ')"
+LDAP_GROUP_NAMES=$(printf '%s\n' "$CONFIG_SPEC" | cut -f4 | sort -u)
+GROUP_COUNT=$(printf '%s\n' "$LDAP_GROUP_NAMES" | wc -l | tr -d ' ')
 
-GROUP_COUNT=$(printf '%s\n' "$GROUPS" | wc -l)
+[ -n "${LDAP_HOST}" ] || fail 1 "missing LDAP_HOST (or LDAP_URI)"
+[ -n "${LDAP_USER:-}" ] || fail 1 "missing LDAP_USER"
+[ -n "${LDAP_PASSWORD:-}" ] || fail 1 "missing LDAP_PASSWORD"
+[ -n "${LDAP_GROUPS:-}" ] || fail 1 "missing LDAP_GROUPS"
+[ -n "${POSTGRES_DEFAULT_DATABASE:-}" ] || fail 1 "missing POSTGRES_DEFAULT_DATABASE"
 
-# LDAP filter injection guard: validate group names against a strict character
-# set before interpolating into `(cn=...)`. RFC 4515 requires escaping of
-# `( ) * \ NUL`; we reject instead of escape since group names should never
-# contain those.
-INVALID_GROUPS=$(printf '%s\n' "$GROUPS" | grep -Ev '^[a-zA-Z0-9._-]+$' || true)
-if [ -n "$INVALID_GROUPS" ]; then
-    err "invalid LDAP group name(s) — only [a-zA-Z0-9._-] allowed:"
-    printf '%s\n' "$INVALID_GROUPS" | sed 's/^/  - /' >&2
-    exit 4
+# A read-only replica follows its primary's catalog: nothing to do there.
+IN_RECOVERY=$(psql_admin -tA -c "SELECT pg_is_in_recovery()") || fail 2 "cannot query the database"
+if [ "$IN_RECOVERY" = t ]; then
+	log "read-only replica; skipping"
+	exit 0
 fi
+# The function must be the admin's, in the admin's schema: anything else is not run.
+FUNCTION_INSTALLED=$(psql_admin -tA -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+	WHERE n.nspname = 'ldap_reconcile' AND p.proname = 'reconcile_permissions' AND p.pronargs = 6
+	  AND p.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AND n.nspowner = p.proowner") \
+	|| fail 2 "cannot query the database"
+[ "$FUNCTION_INSTALLED" = 1 ] || fail 2 "ldap_reconcile.reconcile_permissions() is not installed, or not owned by ${POSTGRES_ADMIN_USER} (psql_configure.sh installs it)"
 
-log "Resolving ${GROUP_COUNT} LDAP group(s) (with intended schema/table context):"
-
-# Per-group context: which env var referenced this group and for what
-# (READ/WRITE on which schema/table, or GROUP-MEMBER-OF a derived group).
-# Informational only — v0 of reconcile_permissions doesn't materialize GRANTs
-# yet, but the context is useful for debug and primes the next iteration.
-env | awk -F= '
-    function parse_schema_table(key,    idx, schema, table) {
-        idx = index(key, "_TABLE_")
-        if (idx > 0) {
-            schema = substr(key, 1, idx - 1)
-            table  = substr(key, idx + length("_TABLE_"))
-            return tolower(schema) "." tolower(table)
-        }
-        return tolower(key)
-    }
-    function emit_groups(line, action, target,    n, gs, i, g) {
-        n = split(line, gs, ",")
-        for (i = 1; i <= n; i++) {
-            g = gs[i]; gsub(/^[ \t]+|[ \t]+$/, "", g)
-            if (g != "") printf "  - %s\t%s %s\n", g, action, target
-        }
-    }
-    /^PSQL_READ_SCHEMA_/  { key = $1; sub(/^PSQL_READ_SCHEMA_/,  "", key); emit_groups($2, "READ",  parse_schema_table(key)) }
-    /^PSQL_WRITE_SCHEMA_/ { key = $1; sub(/^PSQL_WRITE_SCHEMA_/, "", key); emit_groups($2, "WRITE", parse_schema_table(key)) }
-    /^PSQL_ALTER_GROUP_/  { key = $1; sub(/^PSQL_ALTER_GROUP_/,  "", key); emit_groups($2, "GROUP-MEMBER-OF", tolower(key)) }
-' | sort | tee -a "$LOG_FILE"
-
-LDAP_FILTER=$(printf '%s\n' "$GROUPS" | awk '
-    BEGIN { f = "(|" }
-    { f = f "(cn=" $0 ")" }
-    END { print f ")" }
-')
-log "LDAP filter: ${LDAP_FILTER}"
-
-LDAP_OUTPUT=$(ldapsearch -LLL -o "nettimeout=${LDAP_NETTIMEOUT}" \
-    -w "$LDAP_PASSWORD" -D "$LDAP_USER" \
-    -H "ldap://$LDAP_HOST" -b "$LDAP_GROUPS" \
-    "$LDAP_FILTER" memberUid 2>>"$LOG_FILE") || {
-    rc=$?
-    err "ldapsearch failed (exit $rc). Filter: $LDAP_FILTER. Log: $LOG_FILE"
-    exit $rc
+# The bind password goes through a private file, not argv (visible to every process).
+LDAP_PASSWORD_FILE=$(mktemp) || fail 1 "cannot create a temporary file"
+trap 'rm -f "$LDAP_PASSWORD_FILE"' EXIT
+chmod 600 "$LDAP_PASSWORD_FILE"
+printf '%s' "$LDAP_PASSWORD" > "$LDAP_PASSWORD_FILE"
+ldap_search() { # base scope filter attributes...
+	base=$1; scope=$2; filter=$3; shift 3
+	ldapsearch -LLL -x -o "nettimeout=${LDAP_NETTIMEOUT}" -o ldif-wrap=no \
+		-H "$LDAP_URL" -D "$LDAP_USER" -y "$LDAP_PASSWORD_FILE" -b "$base" -s "$scope" "$filter" "$@"
 }
 
-USERS=$(printf '%s\n' "$LDAP_OUTPUT" | awk '/^memberUid: / { print $2 }' | sort -u)
-if [ -z "$USERS" ]; then
-    USER_COUNT=0
-    log "no users resolved — filter likely didn't match any group; check group names"
-else
-    USER_COUNT=$(printf '%s\n' "$USERS" | wc -l)
+# Reachability, bind and base DN, apart from the group search.
+ldap_search "$LDAP_GROUPS" base "(objectClass=*)" dn > /dev/null 2>> "$LOG_FILE" \
+	|| fail 1 "LDAP bind or base DN check failed at ${LDAP_URL} (base ${LDAP_GROUPS})"
+
+# One search for every configured group. A non-zero status (size or time limit, referral,
+# server error) means the answer may be incomplete.
+FILTER="(|$(printf '%s\n' "$LDAP_GROUP_NAMES" | sed 's/.*/(cn=&)/' | tr -d '\n'))"
+LDIF=$(ldap_search "$LDAP_GROUPS" sub "$FILTER" cn objectClass memberUid 2>> "$LOG_FILE") \
+	|| fail 1 "LDAP group search failed (status $?); filter ${FILTER}"
+
+# Entries as "group<TAB>member" lines ("group<TAB>" for a group without members). Attribute
+# names are matched without case. Values in base64 (attr::) are not plain names, and an entry
+# that is not a posixGroup (groupOfNames has member, not memberUid) cannot be read as one:
+# both are refused rather than read as empty.
+MEMBERSHIP=$(printf '%s\n' "$LDIF" | awk '
+	function flush(    position) {
+		if (dn == 0) return
+		if (cn == "") { print "NOCN\t"; return }
+		if (!posix) { printf "NOTPOSIX\t%s\n", cn; return }
+		printf "%s\t\n", cn
+		for (position = 1; position <= count; position++) printf "%s\t%s\n", cn, member[position]
+	}
+	{ name = tolower($0); sub(/:.*/, "", name) }
+	name == "dn" { flush(); dn = 1; cn = ""; count = 0; posix = 0; next }
+	/^[A-Za-z]+::/ { print "BASE64\t" $0; next }
+	name == "cn" { cn = substr($0, index($0, ":") + 2); next }
+	name == "objectclass" { if (tolower(substr($0, index($0, ":") + 2)) == "posixgroup") posix = 1; next }
+	name == "memberuid" { member[++count] = substr($0, index($0, ":") + 2); next }
+	END { flush() }
+')
+case "$MEMBERSHIP" in
+	*BASE64*) fail 1 "LDAP returned base64-encoded values; refusing to guess names" ;;
+esac
+NOT_POSIX=$(printf '%s\n' "$MEMBERSHIP" | awk -F'\t' '$1 == "NOTPOSIX" || $1 == "NOCN" { print $2 }')
+[ -z "$NOT_POSIX" ] || fail 1 "LDAP groups that are not posixGroup entries (no memberUid to read): $(printf '%s' "$NOT_POSIX" | tr '\n' ' ')"
+
+# Every configured group must come back exactly once.
+for group in $LDAP_GROUP_NAMES; do
+	found=$(printf '%s\n' "$MEMBERSHIP" | awk -F'\t' -v wanted="$group" '$1 == wanted && $2 == "" { entries++ } END { print entries + 0 }')
+	[ "$found" = 1 ] || fail 1 "LDAP group ${group} came back ${found} times (expected exactly once under ${LDAP_GROUPS})"
+done
+MEMBERS=$(printf '%s\n' "$MEMBERSHIP" | awk -F'\t' '$2 != ""' | sort -u)
+INVALID=$(printf '%s\n' "$MEMBERS" | awk -F'\t' '$2 != "" && $2 !~ /^[a-z_][a-z0-9_.-]*$/ { print $2 }' | sort -u)
+[ -z "$INVALID" ] || fail 1 "LDAP returned usernames that are not valid role names: $(printf '%s' "$INVALID" | tr '\n' ' ')"
+
+USER_COUNT=$(printf '%s\n' "$MEMBERS" | cut -f2 | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
+log "LDAP: ${GROUP_COUNT} group(s), ${USER_COUNT} user(s)"
+
+ALLOW_DROPS=true
+[ "$SKIP_DELETE" = true ] && ALLOW_DROPS=false
+PROTECTED="${POSTGRES_ADMIN_USER},${POSTGRES_DEFAULT_USER:-},${POSTGRES_REPLICATOR_USER:-}"
+
+RESULT=$(psql_admin -tA -F ' ' \
+	-v config="$CONFIG_SPEC" -v members="$MEMBERS" -v source="$RECONCILE_SOURCE" \
+	-v owner="${POSTGRES_DEFAULT_USER:-}" -v allow_drops="$ALLOW_DROPS" -v protected="$PROTECTED" \
+	-v statement_timeout="${RECONCILE_STATEMENT_TIMEOUT:-300s}" 2>&1 <<'SQL'
+SET statement_timeout = :'statement_timeout';
+SET lock_timeout = '30s';
+SELECT action, coalesce(username, '-'), coalesce(detail, '')
+  FROM ldap_reconcile.reconcile_permissions(:'config', :'members', :'source', :'owner', :'allow_drops'::boolean,
+                             array_remove(string_to_array(:'protected', ','), ''));
+SQL
+) || fail 2 "reconcile failed, nothing was changed: $(printf '%s' "$RESULT" | tr '\n' ' ')"
+
+if [ -n "$RESULT" ]; then
+	printf '%s\n' "$RESULT" | while IFS= read -r line; do log "$line"; done
 fi
-log "${USER_COUNT} unique user(s) resolved"
-
-# PG array literal: each user wrapped in single quotes (string literal).
-# Double quotes would be identifier quoting and cause "column does not exist".
-if [ -z "$USERS" ]; then
-    PG_ARRAY=""
-else
-    PG_ARRAY=$(printf '%s\n' "$USERS" \
-        | sed "s/'/''/g; s/.*/'&'/" \
-        | paste -sd ',' -)
+log "done: $(printf '%s\n' "$RESULT" | sed '/^$/d' | awk '{ per_action[$1]++ } END { summary = ""; for (action in per_action) summary = summary action "=" per_action[action] " "; print (summary == "" ? "no changes" : summary) }')"
+ERRORS=$(printf '%s\n' "$RESULT" | awk '$1 == "ERROR"')
+if [ -n "$ERRORS" ]; then
+	report "applied except for: $(printf '%s' "$ERRORS" | tr '\n' ';')"
+	exit 3
 fi
-
-# Owner fallback for REASSIGN OWNED on DROP USER. Optional: if
-# POSTGRES_DEFAULT_USER is unset (cluster ran without a default app user),
-# pass NULL and let the SQL function fall back to CURRENT_USER (admin).
-if [ -n "${POSTGRES_DEFAULT_USER:-}" ]; then
-    OWNER_ARG="'${POSTGRES_DEFAULT_USER}'"
-else
-    OWNER_ARG="NULL"
-fi
-
-log "Calling reconcile_permissions (source=${RECONCILE_SOURCE}, target=${USER_COUNT}, owner_fallback=${POSTGRES_DEFAULT_USER:-<CURRENT_USER>})"
-
-PGPASSWORD="$POSTGRES_ADMIN_PASSWORD" psql \
-    -v ON_ERROR_STOP=1 \
-    -U "$POSTGRES_ADMIN_USER" \
-    -d "$POSTGRES_DEFAULT_DATABASE" \
-    -t -A -F '|' \
-    -c "SET statement_timeout = '60s';
-        SELECT action || '|' || username
-          FROM reconcile_permissions(
-              ARRAY[${PG_ARRAY}]::TEXT[],
-              '${RECONCILE_SOURCE}',
-              ${OWNER_ARG}
-          );" \
-    >> "$LOG_FILE" 2>&1
-rc=$?
-
-if [ $rc -eq 0 ]; then
-    log "OK"
-    exit 0
-else
-    err "psql exit $rc"
-    exit $rc
-fi
+exit 0

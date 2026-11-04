@@ -34,8 +34,10 @@ else
 fi
 
 # To use cron
-env > /etc/env_vars
-chmod +x /etc/env_vars
+# Quoted, so values with spaces or ; survive being sourced by cron. It holds the passwords:
+# root only (cron sources it, nothing executes it).
+(umask 077 && export -p > /etc/env_vars)
+chmod 600 /etc/env_vars
 service cron start
 
 # Configures database

@@ -53,7 +53,8 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    valid_name_pattern     CONSTANT TEXT := '^[a-z_][a-z0-9_.-]*$';
+    -- What the old scripts created (quoted), minus anything unsafe to carry around.
+    valid_name_pattern     CONSTANT TEXT := '^[A-Za-z0-9_][A-Za-z0-9_.-]*$';
     valid_identifier_pattern    CONSTANT TEXT := '^[a-z_][a-z0-9_]*$';
     all_table_privileges   TEXT[] := ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER'];
     all_sequence_privileges     CONSTANT TEXT[] := ARRAY['USAGE','SELECT','UPDATE'];
@@ -79,6 +80,7 @@ DECLARE
     time_budget      INTERVAL;
     processed_count  INT := 0;
     deferred_count   INT := 0;
+    cut_short        BOOLEAN;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('reconcile_permissions'));
     -- Time budget for the per-user privilege step (unset = none), set by the caller
@@ -117,7 +119,7 @@ BEGIN
         END IF;
     END LOOP;
     FOR member_row IN SELECT * FROM _members LOOP
-        IF member_row.username !~ valid_name_pattern OR NOT EXISTS (SELECT 1 FROM _config c WHERE c.ldap_group = member_row.ldap_group) THEN
+        IF member_row.username !~ valid_name_pattern OR octet_length(member_row.username) > 63 OR NOT EXISTS (SELECT 1 FROM _config c WHERE c.ldap_group = member_row.ldap_group) THEN
             RAISE EXCEPTION 'reconcile_permissions: invalid member row (%, %)', member_row.ldap_group, member_row.username;
         END IF;
     END LOOP;
@@ -278,8 +280,10 @@ BEGIN
           LEFT JOIN ldap_reconcile.privilege_progress progress ON progress.username = a.rolname
          WHERE EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole) AND a.rolname <> 'ldap_managed'
            AND a.oid NOT IN (SELECT oid FROM _protected)
-         ORDER BY progress.reconciled_at NULLS FIRST, a.rolname
+         -- Users no longer in LDAP (kept, drops disabled) first: their revocation is never deferred.
+         ORDER BY a.rolname IN (SELECT tg.username FROM _target tg), progress.reconciled_at NULLS FIRST, a.rolname
     LOOP
+        cut_short := false;
         IF time_budget IS NOT NULL AND processed_count > 0 AND clock_timestamp() - run_started > time_budget THEN
             deferred_count := deferred_count + 1;
             CONTINUE;
@@ -358,6 +362,11 @@ BEGIN
                       FROM pg_class c WHERE c.relnamespace = schema_row.schema_oid AND c.relkind IN ('r','p','v','m','f','S')
                      ORDER BY c.relname
                 LOOP
+                    -- The budget also stops a long step midway (not the first user's): that
+                    -- user's step is rolled back and goes first next run.
+                    IF time_budget IS NOT NULL AND processed_count > 1 AND clock_timestamp() - run_started > time_budget THEN
+                        RAISE EXCEPTION USING ERRCODE = 'P0B01', MESSAGE = 'time budget reached';
+                    END IF;
                     IF relation_row.relkind = 'S' THEN
                         desired_privileges := CASE
                             WHEN access_level = 'write' THEN all_sequence_privileges
@@ -435,11 +444,16 @@ BEGIN
                     INSERT INTO _out(action, username, detail) VALUES ('REVOKE', role_row.rolname, 'EXECUTE ON ' || function_row.signature);
                 END LOOP;
             END LOOP;
-        EXCEPTION WHEN OTHERS THEN
-            INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, detail)
-            VALUES ('permanent_sync', 'ERROR', run_source, role_row.rolname, jsonb_build_object('op', 'privileges', 'sqlstate', SQLSTATE, 'sqlerrm', SQLERRM));
-            INSERT INTO _out(action, username, detail) VALUES ('ERROR', role_row.rolname, 'privileges: ' || SQLERRM);
+        EXCEPTION
+            WHEN SQLSTATE 'P0B01' THEN
+                deferred_count := deferred_count + 1;
+                cut_short := true;
+            WHEN OTHERS THEN
+                INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, detail)
+                VALUES ('permanent_sync', 'ERROR', run_source, role_row.rolname, jsonb_build_object('op', 'privileges', 'sqlstate', SQLSTATE, 'sqlerrm', SQLERRM));
+                INSERT INTO _out(action, username, detail) VALUES ('ERROR', role_row.rolname, 'privileges: ' || SQLERRM);
         END;
+        CONTINUE WHEN cut_short;
         INSERT INTO ldap_reconcile.privilege_progress(username, reconciled_at) VALUES (role_row.rolname, clock_timestamp())
             ON CONFLICT ON CONSTRAINT privilege_progress_pkey DO UPDATE SET reconciled_at = EXCLUDED.reconciled_at;
     END LOOP;

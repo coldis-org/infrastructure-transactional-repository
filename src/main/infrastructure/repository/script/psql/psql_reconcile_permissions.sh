@@ -228,7 +228,8 @@ for group in $LDAP_GROUP_NAMES; do
 	[ "$found" = 1 ] || fail 1 "LDAP group ${group} came back ${found} times (expected exactly once under ${LDAP_GROUPS})"
 done
 MEMBERS=$(printf '%s\n' "$MEMBERSHIP" | awk -F'\t' '$2 != ""' | sort -u)
-INVALID=$(printf '%s\n' "$MEMBERS" | awk -F'\t' '$2 != "" && $2 !~ /^[a-z_][a-z0-9_.-]*$/ { print $2 }' | sort -u)
+# Letters of either case, digits, _ . - (what the old scripts created, quoted), at most 63 bytes.
+INVALID=$(printf '%s\n' "$MEMBERS" | awk -F'\t' '$2 != "" && ($2 !~ /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/ || length($2) > 63) { print $2 }' | sort -u)
 [ -z "$INVALID" ] || fail 1 "LDAP returned usernames that are not valid role names: $(printf '%s' "$INVALID" | tr '\n' ' ')"
 
 USER_COUNT=$(printf '%s\n' "$MEMBERS" | cut -f2 | sed '/^$/d' | sort -u | wc -l | tr -d ' ')

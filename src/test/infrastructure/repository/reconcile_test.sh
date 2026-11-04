@@ -299,6 +299,14 @@ config "$BASE_CONFIG"
 members readers alice erin carol "Bad User"
 reconcile
 if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "an untrusted username stops the run, nothing changes"; else bad "an untrusted username stops the run, nothing changes"; fi
+members readers alice erin carol Jo.Mixed 9lives
+reconcile
+if [ $RC = 0 ] && exists Jo.Mixed && exists 9lives && can Jo.Mixed s1.t_a SELECT; then ok "mixed-case names and a leading digit are valid usernames (as the old scripts allowed)"; else bad "mixed-case names and a leading digit are valid usernames (as the old scripts allowed)"; fi
+LEGACY_OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && ./psql_users_add.sh' 2>&1); LEGACY_RC=$?
+if [ $LEGACY_RC = 0 ] && grep -q "done:" <<<"$LEGACY_OUT"; then ok "psql_users_add.sh (still called by the on-demand pipeline) runs the reconcile"; else bad "psql_users_add.sh (still called by the on-demand pipeline) runs the reconcile"; fi
+members readers alice erin carol
+reconcile
+BEFORE=$(snapshot)
 
 members readers alice erin carol george
 config "$BASE_CONFIG

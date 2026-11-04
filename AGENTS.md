@@ -18,8 +18,8 @@ All under `src/main/infrastructure/`.
 |------|-------|
 | `repository/Dockerfile3` .. `Dockerfile7` | PostgreSQL 14, 15, 16, 17, 18 (`postgres:18.6-bookworm` in `Dockerfile7`) |
 | `repository/conf/` | `postgresql.conf`, `pg_hba.conf` (copied to `/tmp`, put into `PGDATA` at boot) |
-| `repository/script/psql/` | `psql_init` (entrypoint), `psql_configure`, `psql_tune_cmd`, `psql_relocate`, `psql_update_conn`, `psql_users_*` |
-| `repository/cron/cron_job` | Nightly LDAP user sync (`psql_users_remove`/`_add`/`_alter_group`) |
+| `repository/script/psql/` | `psql_init` (entrypoint), `psql_configure`, `psql_tune_cmd`, `psql_relocate`, `psql_update_conn`, `psql_reconcile_permissions` (+ `sql/`, `psql_install_reconcile`, `psql_users_add` entry point) |
+| `repository/cron/cron_job` | Hourly LDAP permissions reconcile (`psql_reconcile_permissions.sh`, under flock) |
 | `repository-replica/` | `Dockerfile5`..`7`, `psql_replica_init.sh` (`pg_basebackup` replica); its `conf/` is not copied by any of its Dockerfiles |
 | `repository-upgrade/` | Major-version migration image (`pg_upgrade`), pre-flight check; read its `README.md` |
 | `repository-tuner/` | `FROM jfcoz/postgresqltuner`, nothing else |

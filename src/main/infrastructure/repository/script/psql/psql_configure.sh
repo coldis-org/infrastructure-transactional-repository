@@ -55,20 +55,14 @@ else
 	
 fi
 
-# Installs the permissions reconcile (history table and function) and runs it once. A
-# read-only replica gets both from its primary. psql -f fails on a missing file, so an
-# incomplete image does not install half of it.
-SQL_DIR="$(cd "$(dirname "$0")" && pwd)/sql"
-if [ "$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -tA -c 'SELECT pg_is_in_recovery()' -U ${POSTGRES_ADMIN_USER:=postgres} -d "${POSTGRES_DEFAULT_DATABASE}")" = f ]
+# Installs the permissions reconcile and runs it once. A read-only replica gets both from its
+# primary.
+RECOVERY=$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -tA -c 'SELECT pg_is_in_recovery()' -U ${POSTGRES_ADMIN_USER:=postgres} -d "${POSTGRES_DEFAULT_DATABASE}")
+[ "$RECOVERY" = t ] || [ "$RECOVERY" = f ] || echo "ERROR: cannot tell whether the database is a replica; the reconcile install is left to its first run"
+if [ "$RECOVERY" = f ]
 then
-	# search_path pinned: public belongs to the database owner on 15+.
-	PGOPTIONS="-c search_path=pg_catalog" PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -q -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres} -d "${POSTGRES_DEFAULT_DATABASE}" \
-		-v checksum="$(md5sum "${SQL_DIR}/reconcile_permissions.sql" | cut -d' ' -f1)" \
-		-f "${SQL_DIR}/permissions_audit.sql" -f "${SQL_DIR}/reconcile_permissions.sql" -f - <<'SQL' \
-		|| echo "ERROR: could not install the permissions reconcile"
--- The checksum of the SQL just installed: the wrapper runs only a function that matches it.
-SELECT format('COMMENT ON FUNCTION ldap_reconcile.reconcile_permissions(TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT[]) IS %L', 'sql md5 ' || :'checksum') \gexec
-SQL
+	POSTGRES_ADMIN_USER="$POSTGRES_ADMIN_USER" POSTGRES_ADMIN_PASSWORD="$POSTGRES_ADMIN_PASSWORD" POSTGRES_DEFAULT_DATABASE="$POSTGRES_DEFAULT_DATABASE" \
+		./psql_install_reconcile.sh || echo "ERROR: could not install the permissions reconcile (the hourly run retries)"
 	# Tolerant: an LDAP outage at boot must not stop the database; cron retries hourly.
 	RECONCILE_SOURCE=boot flock -w 60 /var/lock/reconcile_permissions.lock ./psql_reconcile_permissions.sh || true
 fi

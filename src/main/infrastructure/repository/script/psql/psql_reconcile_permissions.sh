@@ -162,14 +162,25 @@ fi
 # The function must be the admin's, in the admin's schema: anything else is not run.
 # And it must be this image's: psql_configure.sh records the checksum of the SQL it installed,
 # so a failed install does not leave an older function running under this wrapper.
-SQL_CHECKSUM=$(md5sum "$(cd "$(dirname "$0")" && pwd)/sql/reconcile_permissions.sql" | cut -d' ' -f1)
-FUNCTION_INSTALLED=$(psql_admin -tA -v checksum="$SQL_CHECKSUM" <<'SQL'
+# A mismatch (a failed or older install) is repaired here, once, before giving up.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SQL_CHECKSUM=$(md5sum "${SCRIPT_DIR}/sql/reconcile_permissions.sql" | cut -d' ' -f1)
+function_installed() {
+	psql_admin -tA -v checksum="$SQL_CHECKSUM" <<'SQL'
 SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
  WHERE n.nspname = 'ldap_reconcile' AND p.proname = 'reconcile_permissions' AND p.pronargs = 6
    AND p.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AND n.nspowner = p.proowner
    AND obj_description(p.oid, 'pg_proc') = 'sql md5 ' || :'checksum';
 SQL
-) || fail 2 "cannot query the database"
+}
+FUNCTION_INSTALLED=$(function_installed) || fail 2 "cannot query the database"
+if [ "$FUNCTION_INSTALLED" != 1 ]; then
+	log "the installed function does not match this image's SQL; installing it"
+	POSTGRES_ADMIN_USER="$POSTGRES_ADMIN_USER" POSTGRES_ADMIN_PASSWORD="$POSTGRES_ADMIN_PASSWORD" \
+		POSTGRES_DEFAULT_DATABASE="$POSTGRES_DEFAULT_DATABASE" "${SCRIPT_DIR}/psql_install_reconcile.sh" >> "$LOG_FILE" 2>&1 \
+		|| fail 2 "installing the reconcile failed (see ${LOG_FILE})"
+	FUNCTION_INSTALLED=$(function_installed) || fail 2 "cannot query the database"
+fi
 [ "$FUNCTION_INSTALLED" = 1 ] || fail 2 "ldap_reconcile.reconcile_permissions() is not installed from this image's SQL, or not owned by ${POSTGRES_ADMIN_USER} (psql_configure.sh installs it)"
 
 # The bind password goes through a private file, not argv (visible to every process).

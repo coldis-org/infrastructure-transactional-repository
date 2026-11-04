@@ -179,7 +179,10 @@ BEGIN
                                    OR privileged.rolreplication OR privileged.rolbypassrls OR privileged.rolname LIKE 'pg\_%')
                               AND pg_has_role(a.oid, privileged.oid, 'MEMBER')))
     LOOP
-        RAISE EXCEPTION 'reconcile_permissions: group role % is privileged or a login role; refusing to manage its membership', group_row.role_name;
+        -- Reported, and its membership left alone; everything else is still reconciled.
+        INSERT INTO _out(action, username, detail)
+        VALUES ('ERROR', NULL, 'group role ' || group_row.role_name || ' is privileged or a login role; its membership is not managed');
+        DELETE FROM _config c WHERE c.kind = 'member' AND c.object = group_row.role_name;
     END LOOP;
 
     -- Adoption: login roles in LDAP that are not managed yet; on the first run
@@ -233,6 +236,11 @@ BEGIN
            AND a.rolname NOT IN (SELECT tg.username FROM _target tg)
          ORDER BY a.rolname
     LOOP
+        -- Drops can wait on locks: past the ceiling the rest wait for the next run.
+        IF hard_ceiling IS NOT NULL AND clock_timestamp() - run_started > hard_ceiling THEN
+            deferred_count := deferred_count + 1;
+            CONTINUE;
+        END IF;
         IF drops_allowed THEN
             BEGIN
                 -- Objects go to the default (application) user; never to a superuser.
@@ -431,6 +439,10 @@ BEGIN
                  WHERE p.prokind = 'f'
                  ORDER BY 2
             LOOP
+                IF (time_budget IS NOT NULL AND processed_count > 1 AND clock_timestamp() - run_started > time_budget)
+                   OR (hard_ceiling IS NOT NULL AND clock_timestamp() - run_started > hard_ceiling) THEN
+                    RAISE EXCEPTION USING ERRCODE = 'P0B01', MESSAGE = 'time budget reached';
+                END IF;
                 SELECT COALESCE(w.level, 'none') INTO access_level
                   FROM (SELECT 1) one LEFT JOIN _wanted w ON w.username = role_row.rolname AND w.schema_name = function_row.schema_name;
                 desired_privileges := CASE WHEN access_level IN ('read', 'write') THEN ARRAY['EXECUTE'] ELSE ARRAY[]::TEXT[] END;

@@ -173,13 +173,11 @@ APP_DROP=$(docker exec "$DB" sh -c "PGPASSWORD=app psql -X -tA -h 127.0.0.1 -U a
 APP_CREATE=$(docker exec "$DB" sh -c "PGPASSWORD=app psql -X -tA -h 127.0.0.1 -U app -d appdb -c 'CREATE TABLE ldap_reconcile.x(i int)'" 2>&1)
 if [ "$(sql "SELECT count(*) FROM pg_proc WHERE proname = 'reconcile_permissions'")" = 1 ] && grep -qiE "denied|negad" <<<"$APP_DROP" && grep -qiE "denied|negad" <<<"$APP_CREATE"; then ok "the application user can neither drop the function nor create in its schema"; else bad "the application user can neither drop the function nor create in its schema"; fi
 
-# A function that is not this image's (a failed install left an older one) is not run.
+# A function that is not this image's (a failed install left an older one) is reinstalled.
 INSTALLED_COMMENT=$(sql "SELECT obj_description('ldap_reconcile.reconcile_permissions(text, text, text, text, boolean, text[])'::regprocedure, 'pg_proc')")
 sql "COMMENT ON FUNCTION ldap_reconcile.reconcile_permissions(text, text, text, text, boolean, text[]) IS 'sql md5 older'" >/dev/null
-BEFORE=$(snapshot)
 reconcile
-if [ $RC = 2 ] && grep -q "not installed from this image" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] && [ -n "$INSTALLED_COMMENT" ]; then ok "a function from other SQL than the image's is not run"; else bad "a function from other SQL than the image's is not run"; fi
-sql "COMMENT ON FUNCTION ldap_reconcile.reconcile_permissions(text, text, text, text, boolean, text[]) IS '$INSTALLED_COMMENT'" >/dev/null
+if [ $RC = 0 ] && grep -q "installing it" <<<"$OUT" && [ -n "$INSTALLED_COMMENT" ] && [ "$(sql "SELECT obj_description('ldap_reconcile.reconcile_permissions(text, text, text, text, boolean, text[])'::regprocedure, 'pg_proc')")" = "$INSTALLED_COMMENT" ]; then ok "a function from other SQL than the image's is reinstalled before the run"; else bad "a function from other SQL than the image's is reinstalled before the run"; fi
 
 # After the first run, a role granted access by other means is never taken over.
 sql "CREATE ROLE svc2 LOGIN; GRANT USAGE ON SCHEMA s1 TO svc2; GRANT SELECT ON s1.t_a TO svc2;" >/dev/null
@@ -297,14 +295,17 @@ if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "a system schema cannot
 sql "CREATE ROLE danger NOLOGIN; GRANT pg_write_server_files TO danger; CREATE ROLE ownergrp NOLOGIN; GRANT app TO ownergrp;" >/dev/null
 BEFORE=$(snapshot)
 for target in POSTGRES DANGER APP OWNERGRP; do
+	target_role=$(tr '[:upper:]' '[:lower:]' <<<"$target")
+	MEMBERSHIP_BEFORE=$(sql "SELECT string_agg(member::regrole::text, ',' ORDER BY 1) FROM pg_auth_members WHERE roleid = '$target_role'::regrole")
 	config "$BASE_CONFIG
 PSQL_ALTER_GROUP_$target=readers
 SKIP_ALTER_GROUP=false"
 	reconcile
-	if [ $RC = 2 ] && grep -q "privileged or a login role" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a privileged or login group role ($target) is refused, nothing changes"; else bad "a privileged or login group role ($target) is refused, nothing changes"; fi
+	if [ $RC = 3 ] && grep -q "privileged or a login role" <<<"$OUT" && [ "$(sql "SELECT string_agg(member::regrole::text, ',' ORDER BY 1) FROM pg_auth_members WHERE roleid = '$target_role'::regrole")" = "$MEMBERSHIP_BEFORE" ]; then ok "a privileged or login group role ($target) is refused (ERROR), its membership untouched"; else bad "a privileged or login group role ($target) is refused (ERROR), its membership untouched"; fi
 done
 
 config "$BASE_CONFIG"
+BEFORE=$(snapshot)
 members readers alice erin carol "Bad User"
 reconcile
 if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "an untrusted username stops the run, nothing changes"; else bad "an untrusted username stops the run, nothing changes"; fi

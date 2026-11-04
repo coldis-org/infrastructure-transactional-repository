@@ -12,10 +12,15 @@
 #                                                  (only when SKIP_ALTER_GROUP=false)
 #   SKIP_DELETE=true                               never drop users (their configured access
 #                                                  is revoked; the role is kept)
+#   RECONCILE_ALLOW_EMPTY=true                     accept an answer where no read/write
+#                                                  group has any member (otherwise refused
+#                                                  while managed users exist)
 #   RECONCILE_STATEMENT_TIMEOUT=300s               upper bound for one run's database side
 #
-# The managed population follows the configuration: a user who is in none of the configured
-# LDAP groups is dropped, also when a PSQL_* mapping is removed and the user was only in it.
+# The managed population follows the configuration: a user with no read or write permission
+# is dropped, also when a PSQL_* mapping is removed and the user was only in it. A
+# PSQL_ALTER_GROUP mapping only manages group membership: it never creates a user, and a user
+# who is only in an alter-group LDAP group is not kept.
 #   LDAP_HOST (or LDAP_URI + LDAP_PORT), LDAP_USER, LDAP_PASSWORD, LDAP_GROUPS (base DN)
 #
 # Fails closed: LDAP unreachable, a failed bind, an incomplete search, a configured group
@@ -210,6 +215,19 @@ INVALID=$(printf '%s\n' "$MEMBERS" | awk -F'\t' '$2 != "" && $2 !~ /^[a-z_][a-z0
 
 USER_COUNT=$(printf '%s\n' "$MEMBERS" | cut -f2 | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
 log "LDAP: ${GROUP_COUNT} group(s), ${USER_COUNT} user(s)"
+
+# No member in any read/write group would drop (or revoke) every managed user. Single empty
+# groups are normal (temporary permissions); all of them empty at once is more likely a
+# directory that stopped answering memberUid, so it needs RECONCILE_ALLOW_EMPTY=true.
+PERMISSION_GROUPS=$(printf '%s\n' "$CONFIG_SPEC" | awk -F'\t' '$1 == "read" || $1 == "write" { print $4 }' | sort -u | tr '\n' ' ')
+PERMISSION_USER_COUNT=$(printf '%s\n' "$MEMBERS" | awk -F'\t' -v groups=" ${PERMISSION_GROUPS}" '$2 != "" && index(groups, " " $1 " ") { print $2 }' \
+	| sort -u | wc -l | tr -d ' ')
+if [ "$PERMISSION_USER_COUNT" = 0 ] && [ "${RECONCILE_ALLOW_EMPTY:-false}" != true ]; then
+	MANAGED_COUNT=$(psql_admin -tA -c "SELECT count(*) FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.roleid WHERE r.rolname = 'ldap_managed'") \
+		|| fail 2 "cannot query the database"
+	[ "$MANAGED_COUNT" = 0 ] \
+		|| fail 1 "no configured read/write LDAP group has any member, and ${MANAGED_COUNT} managed user(s) exist; refusing (set RECONCILE_ALLOW_EMPTY=true if this is intended)"
+fi
 
 ALLOW_DROPS=true
 [ "$SKIP_DELETE" = true ] && ALLOW_DROPS=false

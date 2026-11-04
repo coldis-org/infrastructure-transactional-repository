@@ -92,6 +92,13 @@ objectClass: posixGroup
 cn: temp
 gidNumber: 5003
 
+dn: cn=staff,$GROUPS_DN
+objectClass: posixGroup
+cn: staff
+gidNumber: 5004
+memberUid: alice
+memberUid: henry
+
 dn: cn=gon,$GROUPS_DN
 objectClass: groupOfNames
 cn: gon
@@ -189,6 +196,11 @@ PSQL_ALTER_GROUP_GRP=writers
 SKIP_ALTER_GROUP=false"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = f ]; then ok "a user leaving the mapped LDAP group leaves grp"; else bad "a user leaving the mapped LDAP group leaves grp"; fi
+config "$BASE_CONFIG
+PSQL_ALTER_GROUP_GRP=staff
+SKIP_ALTER_GROUP=false"
+reconcile
+if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = t ] && ! exists henry; then ok "an alter-group mapping adds users who have a permission, and creates no one (henry is only in it)"; else bad "an alter-group mapping adds users who have a permission, and creates no one (henry is only in it)"; fi
 config "$BASE_CONFIG"
 
 # The cron line itself, as the image installs it.
@@ -290,11 +302,16 @@ config "unset PSQL_READ_SCHEMA_S1 PSQL_READ_SCHEMA_S2_TABLE_T1 PSQL_WRITE_SCHEMA
 reconcile
 if [ $RC = 0 ] && grep -q "nothing to reconcile" <<<"$OUT" && exists erin; then ok "with the PSQL_* configuration removed the run does nothing"; else bad "with the PSQL_* configuration removed the run does nothing"; fi
 
-# Every group empty: a valid answer, every managed user goes.
+# Every group empty: refused unless RECONCILE_ALLOW_EMPTY=true, then every managed user goes.
 config "$BASE_CONFIG"
 members readers; members writers; members temp
+BEFORE=$(snapshot)
 reconcile
-if [ $RC = 0 ] && ! exists alice && ! exists erin && ! exists george && ! exists frank; then ok "every group empty drops every managed user"; else bad "every group empty drops every managed user"; fi
+if [ $RC = 1 ] && grep -q "RECONCILE_ALLOW_EMPTY" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "every group empty at once is refused by default, nothing changes"; else bad "every group empty at once is refused by default, nothing changes"; fi
+config "$BASE_CONFIG
+RECONCILE_ALLOW_EMPTY=true"
+reconcile
+if [ $RC = 0 ] && ! exists alice && ! exists erin && ! exists george && ! exists frank; then ok "with RECONCILE_ALLOW_EMPTY=true, every group empty drops every managed user"; else bad "with RECONCILE_ALLOW_EMPTY=true, every group empty drops every managed user"; fi
 if exists svc && exists handmade && exists app && exists postgres && exists ldap_managed; then ok "and leaves every unmanaged role"; else bad "and leaves every unmanaged role"; fi
 
 echo "$pass passed, $fail failed"

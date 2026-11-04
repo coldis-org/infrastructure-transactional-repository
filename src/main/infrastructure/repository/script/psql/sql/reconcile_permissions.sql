@@ -111,7 +111,6 @@ BEGIN
 
     -- Desired state: per user and configured schema, the level (write > read)
     -- and, for read, the tables (NULL = every table).
-    CREATE TEMP TABLE _target ON COMMIT DROP AS SELECT DISTINCT m.username FROM _members m;
     CREATE TEMP TABLE _wanted ON COMMIT DROP AS
         SELECT m.username, c.object AS schema_name,
                CASE WHEN bool_or(c.kind = 'write') THEN 'write' ELSE 'read' END AS level,
@@ -120,6 +119,9 @@ BEGIN
           FROM _config c JOIN _members m ON m.ldap_group = c.ldap_group
          WHERE c.kind IN ('read', 'write')
          GROUP BY m.username, c.object;
+    -- The managed population: users with at least one read or write permission. A
+    -- group role mapping (member) neither creates nor keeps a user on its own.
+    CREATE TEMP TABLE _target ON COMMIT DROP AS SELECT DISTINCT w.username FROM _wanted w;
     CREATE TEMP TABLE _schemas ON COMMIT DROP AS
         SELECT DISTINCT c.object AS schema_name, n.oid AS schema_oid
           FROM _config c JOIN pg_namespace n ON n.nspname = c.object WHERE c.kind IN ('read', 'write');
@@ -359,6 +361,7 @@ BEGIN
              WHERE EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole) AND a.oid NOT IN (SELECT oid FROM _protected)
                AND a.rolname IN (SELECT m.username FROM _members m JOIN _config c ON c.ldap_group = m.ldap_group
                                   WHERE c.kind = 'member' AND c.object = group_row.role_name)
+               AND a.rolname IN (SELECT tg.username FROM _target tg)
                AND NOT EXISTS (SELECT 1 FROM pg_auth_members am JOIN pg_roles gr ON gr.oid = am.roleid
                                 WHERE am.member = a.oid AND gr.rolname = group_row.role_name)
              ORDER BY 1
@@ -379,6 +382,7 @@ BEGIN
               JOIN pg_auth_members am ON am.member = a.oid JOIN pg_roles gr ON gr.oid = am.roleid AND gr.rolname = group_row.role_name
              WHERE EXISTS (SELECT 1 FROM pg_auth_members managed_by WHERE managed_by.member = a.oid AND managed_by.roleid = 'ldap_managed'::regrole) AND a.oid NOT IN (SELECT oid FROM _protected)
                AND a.rolname NOT IN (SELECT m.username FROM _members m JOIN _config c ON c.ldap_group = m.ldap_group
+                                      JOIN _target tg ON tg.username = m.username
                                       WHERE c.kind = 'member' AND c.object = group_row.role_name)
              ORDER BY 1
         LOOP

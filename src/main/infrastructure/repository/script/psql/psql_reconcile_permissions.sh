@@ -13,6 +13,8 @@
 #                                                  (only when SKIP_ALTER_GROUP=false)
 #   SKIP_DELETE=true                               never drop users (their configured access
 #                                                  is revoked; the role is kept)
+#   RECONCILE_PROTECTED_ROLES=svc1,svc2           roles never managed (service accounts),
+#                                                  besides the admin, default and replicator
 #   RECONCILE_ALLOW_EMPTY=true                     accept an answer where no read/write
 #                                                  group has any member (otherwise refused
 #                                                  while managed users exist)
@@ -186,6 +188,7 @@ fi
 # The bind password goes through a private file, not argv (visible to every process).
 LDAP_PASSWORD_FILE=$(mktemp) || fail 1 "cannot create a temporary file"
 trap 'rm -f "$LDAP_PASSWORD_FILE"' EXIT
+trap 'exit 1' INT TERM HUP
 chmod 600 "$LDAP_PASSWORD_FILE"
 printf '%s' "$LDAP_PASSWORD" > "$LDAP_PASSWORD_FILE"
 ldap_search() { # base scope filter attributes...
@@ -274,7 +277,7 @@ fi
 
 ALLOW_DROPS=true
 [ "$SKIP_DELETE" = true ] && ALLOW_DROPS=false
-PROTECTED="${POSTGRES_ADMIN_USER},${POSTGRES_DEFAULT_USER:-},${POSTGRES_REPLICATOR_USER:-}"
+PROTECTED="${POSTGRES_ADMIN_USER},${POSTGRES_DEFAULT_USER:-},${POSTGRES_REPLICATOR_USER:-},${RECONCILE_PROTECTED_ROLES:-}"
 
 RESULT=$(psql_admin -tA -F ' ' \
 	-v config="$CONFIG_SPEC" -v members="$MEMBERS" -v source="$RECONCILE_SOURCE" \

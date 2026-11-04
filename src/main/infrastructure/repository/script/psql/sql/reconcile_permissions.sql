@@ -29,7 +29,7 @@
 --          sequences, functions.
 --   write on listed tables (PSQL_WRITE_SCHEMA_<s>_TABLE_<t>): read on the schema
 --          as above, without SELECT on the other tables unless a read mapping
---          gives it; ALL on the listed tables; USAGE, SELECT, UPDATE on sequences.
+--          gives it; ALL on the listed tables and on their own sequences.
 --   none   everything held directly on that schema's objects is revoked.
 --
 -- Errors: bad input raises and rolls the whole run back. A database error on
@@ -393,7 +393,13 @@ BEGIN
                     IF relation_row.relkind = 'S' THEN
                         desired_privileges := CASE
                             WHEN access_level = 'write' THEN all_sequence_privileges
-                            WHEN access_level = 'read' AND cardinality(write_tables) > 0 THEN all_sequence_privileges
+                            -- A single-table writer gets the sequences of its tables only.
+                            WHEN access_level = 'read' AND EXISTS (
+                                SELECT 1 FROM pg_depend d JOIN pg_class owning ON owning.oid = d.refobjid
+                                 WHERE d.classid = 'pg_class'::regclass AND d.objid = relation_row.rel_oid
+                                   AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')
+                                   AND owning.relnamespace = schema_row.schema_oid AND owning.relname = ANY(write_tables))
+                                THEN all_sequence_privileges
                             WHEN access_level = 'read' THEN ARRAY['SELECT']
                             ELSE ARRAY[]::TEXT[] END;
                     ELSE

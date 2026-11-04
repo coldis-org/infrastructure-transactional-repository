@@ -206,14 +206,27 @@ if [ $RC = 0 ] && can alice s1.t_a SELECT && can henry s1.t_a SELECT && exists c
 config "$BASE_CONFIG"
 reconcile
 
-# Write on one table: ALL on it, USAGE on the schema, nothing on the other tables.
+# Write on one table: ALL on it and its sequences, USAGE on the schema, nothing on the other tables.
+sql "ALTER TABLE s2.t2 ADD COLUMN id serial; CREATE SEQUENCE s2.other_q;" >/dev/null
 config "$BASE_CONFIG
 PSQL_WRITE_SCHEMA_S2_TABLE_T2=readers"
 reconcile
-if [ $RC = 0 ] && can alice s2.t2 INSERT && can alice s2.t2 SELECT && ! can alice s2.t1 SELECT && [ "$(sql "SELECT has_schema_privilege('alice', 's2', 'USAGE') AND NOT has_schema_privilege('alice', 's2', 'CREATE')")" = t ]; then ok "a single-table write mapping grants ALL on that table and USAGE on the schema only"; else bad "a single-table write mapping grants ALL on that table and USAGE on the schema only"; fi
+if [ $RC = 0 ] && can alice s2.t2 INSERT && can alice s2.t2 SELECT && ! can alice s2.t1 SELECT && [ "$(sql "SELECT has_schema_privilege('alice', 's2', 'USAGE') AND NOT has_schema_privilege('alice', 's2', 'CREATE')
+     AND has_sequence_privilege('alice', 's2.t2_id_seq', 'UPDATE') AND NOT has_sequence_privilege('alice', 's2.other_q', 'UPDATE')")" = t ]; then ok "a single-table write mapping grants ALL on that table and its sequence, USAGE on the schema only"; else bad "a single-table write mapping grants ALL on that table and its sequence, USAGE on the schema only"; fi
 config "$BASE_CONFIG"
 reconcile
 if [ $RC = 0 ] && ! can alice s2.t2 INSERT && ! can alice s2.t2 SELECT; then ok "and removing the mapping revokes it"; else bad "and removing the mapping revokes it"; fi
+
+# RECONCILE_PROTECTED_ROLES: a listed role in LDAP is never adopted.
+sql "CREATE ROLE svcmon LOGIN;" >/dev/null
+members readers alice erin carol svcmon
+config "$BASE_CONFIG
+RECONCILE_PROTECTED_ROLES=svcmon"
+reconcile
+if [ $RC = 0 ] && exists svcmon && ! managed svcmon && ! can svcmon s1.t_a SELECT; then ok "a role in RECONCILE_PROTECTED_ROLES is not adopted although LDAP lists it"; else bad "a role in RECONCILE_PROTECTED_ROLES is not adopted although LDAP lists it"; fi
+members readers alice erin carol
+config "$BASE_CONFIG"
+reconcile
 
 # A time budget commits part of the work; the users left go first next run.
 sql "REVOKE SELECT ON s1.t_a FROM alice; REVOKE SELECT ON s1.t_a FROM erin;" >/dev/null

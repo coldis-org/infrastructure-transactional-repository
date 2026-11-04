@@ -158,9 +158,10 @@ if [ $RC = 0 ] && ! can carol s3.w1 INSERT && ! can carol s3.w1 SELECT && can ca
 
 # A user's objects survive the user.
 sql "CREATE TABLE s1.bob_t(i int); INSERT INTO s1.bob_t SELECT generate_series(1, 42); ALTER TABLE s1.bob_t OWNER TO bob;
-     CREATE FUNCTION s1.bob_f() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION s1.bob_f() OWNER TO bob;" >/dev/null
+     CREATE FUNCTION s1.bob_f() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION s1.bob_f() OWNER TO bob;
+     CREATE VIEW s1.bob_v AS SELECT * FROM s1.t_a; ALTER VIEW s1.bob_v OWNER TO bob; GRANT SELECT ON s1.bob_v TO PUBLIC;" >/dev/null
 members readers alice erin carol; reconcile
-if [ "$(sql "SELECT prosecdef FROM pg_proc WHERE proname = 'bob_f'")" = f ] && grep -q "SECURITY_INVOKER bob s1.bob_f()" <<<"$OUT"; then ok "a dropped user's SECURITY DEFINER function is made SECURITY INVOKER before it is reassigned"; else bad "a dropped user's SECURITY DEFINER function is made SECURITY INVOKER before it is reassigned"; fi
+if [ "$(sql "SELECT prosecdef FROM pg_proc WHERE proname = 'bob_f'")" = f ] && grep -q "SECURITY_INVOKER bob s1.bob_f()" <<<"$OUT" && [ "$(sql "SELECT has_table_privilege('public', 's1.bob_v', 'SELECT')")" = f ] && grep -q "REVOKE_VIEW_GRANTS bob s1.bob_v" <<<"$OUT"; then ok "a dropped user's SECURITY DEFINER function becomes SECURITY INVOKER and their view loses its grants before the reassign"; else bad "a dropped user's SECURITY DEFINER function becomes SECURITY INVOKER and their view loses its grants before the reassign"; fi
 if [ $RC = 0 ] && ! exists bob; then ok "a user removed from LDAP is dropped"; else bad "a user removed from LDAP is dropped"; fi
 if [ "$(sql "SELECT count(*) || ' '|| tableowner FROM s1.bob_t, pg_tables WHERE tablename = 'bob_t' GROUP BY tableowner")" = "42 app" ]; then ok "their table survives, with its data, owned by the application user"; else bad "their table survives, with its data, owned by the application user"; fi
 
@@ -197,6 +198,15 @@ reconcile
 if [ $RC = 0 ] && can alice s1.t_a SELECT && can henry s1.t_a SELECT && exists carol; then ok "group names match without case, and a second cn value names the group"; else bad "group names match without case, and a second cn value names the group"; fi
 config "$BASE_CONFIG"
 reconcile
+
+# Write on one table: ALL on it, USAGE on the schema, nothing on the other tables.
+config "$BASE_CONFIG
+PSQL_WRITE_SCHEMA_S2_TABLE_T2=readers"
+reconcile
+if [ $RC = 0 ] && can alice s2.t2 INSERT && can alice s2.t2 SELECT && ! can alice s2.t1 SELECT && [ "$(sql "SELECT has_schema_privilege('alice', 's2', 'USAGE') AND NOT has_schema_privilege('alice', 's2', 'CREATE')")" = t ]; then ok "a single-table write mapping grants ALL on that table and USAGE on the schema only"; else bad "a single-table write mapping grants ALL on that table and USAGE on the schema only"; fi
+config "$BASE_CONFIG"
+reconcile
+if [ $RC = 0 ] && ! can alice s2.t2 INSERT && ! can alice s2.t2 SELECT; then ok "and removing the mapping revokes it"; else bad "and removing the mapping revokes it"; fi
 
 # A time budget commits part of the work; the users left go first next run.
 sql "REVOKE SELECT ON s1.t_a FROM alice; REVOKE SELECT ON s1.t_a FROM erin;" >/dev/null

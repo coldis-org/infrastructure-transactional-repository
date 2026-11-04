@@ -27,6 +27,9 @@
 --          (or the listed ones); SELECT on sequences; EXECUTE on functions.
 --   write  database CONNECT, TEMPORARY, CREATE; ALL on schema, tables,
 --          sequences, functions.
+--   write on listed tables (PSQL_WRITE_SCHEMA_<s>_TABLE_<t>): read on the schema
+--          as above, without SELECT on the other tables unless a read mapping
+--          gives it; ALL on the listed tables; USAGE, SELECT, UPDATE on sequences.
 --   none   everything held directly on that schema's objects is revoked.
 --
 -- Errors: bad input raises and rolls the whole run back. A database error on
@@ -69,6 +72,7 @@ DECLARE
     grant_row     RECORD;
     access_level       TEXT;
     read_tables      TEXT[];
+    write_tables     TEXT[];
     is_first_run   BOOLEAN;
     is_in_ldap   BOOLEAN;
     run_started      TIMESTAMPTZ := clock_timestamp();
@@ -106,7 +110,7 @@ BEGIN
     FOR config_row IN SELECT * FROM _config LOOP
         IF config_row.kind NOT IN ('read', 'write', 'member') OR config_row.object !~ valid_identifier_pattern
            OR (config_row.tbl IS NOT NULL AND config_row.tbl !~ valid_identifier_pattern) OR config_row.ldap_group = ''
-           OR (config_row.kind <> 'read' AND config_row.tbl IS NOT NULL)
+           OR (config_row.kind = 'member' AND config_row.tbl IS NOT NULL)
            OR (config_row.kind IN ('read', 'write') AND (config_row.object IN ('ldap_reconcile', 'information_schema')
                                                        OR config_row.object LIKE 'pg\_%')) THEN
             RAISE EXCEPTION 'reconcile_permissions: invalid configuration row (%, %, %, %)', config_row.kind, config_row.object, config_row.tbl, config_row.ldap_group;
@@ -122,9 +126,11 @@ BEGIN
     -- and, for read, the tables (NULL = every table).
     CREATE TEMP TABLE _wanted ON COMMIT DROP AS
         SELECT m.username, c.object AS schema_name,
-               CASE WHEN bool_or(c.kind = 'write') THEN 'write' ELSE 'read' END AS level,
-               CASE WHEN bool_or(c.kind = 'write') OR bool_or(c.tbl IS NULL) THEN NULL
-                    ELSE array_agg(DISTINCT c.tbl) END AS tables
+               CASE WHEN bool_or(c.kind = 'write' AND c.tbl IS NULL) THEN 'write' ELSE 'read' END AS level,
+               -- read: NULL = every table; otherwise the listed ones (maybe none).
+               CASE WHEN bool_or(c.kind = 'write' AND c.tbl IS NULL) OR bool_or(c.kind = 'read' AND c.tbl IS NULL) THEN NULL
+                    ELSE COALESCE(array_agg(DISTINCT c.tbl) FILTER (WHERE c.kind = 'read'), ARRAY[]::TEXT[]) END AS tables,
+               COALESCE(array_agg(DISTINCT c.tbl) FILTER (WHERE c.kind = 'write' AND c.tbl IS NOT NULL), ARRAY[]::TEXT[]) AS write_tables
           FROM _config c JOIN _members m ON m.ldap_group = c.ldap_group
          WHERE c.kind IN ('read', 'write')
          GROUP BY m.username, c.object;
@@ -232,6 +238,20 @@ BEGIN
                     VALUES ('permanent_sync', 'SECURITY_INVOKER', run_source, role_row.rolname, function_row.signature);
                     INSERT INTO _out(action, username, detail) VALUES ('SECURITY_INVOKER', role_row.rolname, function_row.signature);
                 END LOOP;
+                -- A view reads its tables with its owner's rights: after the reassign, a
+                -- view the user granted to others would expose the application user's
+                -- access. Its grants to other roles are revoked first.
+                FOR relation_row IN SELECT c.oid::regclass::TEXT AS relation_name, x.grantee
+                                      FROM pg_class c, aclexplode(c.relacl) x
+                                     WHERE c.relowner = (SELECT oid FROM pg_roles WHERE rolname = role_row.rolname)
+                                       AND c.relkind IN ('v', 'm') AND x.grantee <> c.relowner ORDER BY 1 LOOP
+                    EXECUTE format('REVOKE ALL ON TABLE %s FROM %s', relation_row.relation_name,
+                                   CASE WHEN relation_row.grantee = 0 THEN 'PUBLIC' ELSE relation_row.grantee::regrole::TEXT END);
+                    INSERT INTO ldap_reconcile.permissions_audit(flow, action, source, grantee, table_name, detail)
+                    VALUES ('permanent_sync', 'REVOKE_VIEW_GRANTS', run_source, role_row.rolname, relation_row.relation_name,
+                            jsonb_build_object('from', CASE WHEN relation_row.grantee = 0 THEN 'PUBLIC' ELSE relation_row.grantee::regrole::TEXT END));
+                    INSERT INTO _out(action, username, detail) VALUES ('REVOKE_VIEW_GRANTS', role_row.rolname, relation_row.relation_name);
+                END LOOP;
                 EXECUTE format('REASSIGN OWNED BY %I TO %I', role_row.rolname, owner_role);
                 EXECUTE format('DROP OWNED BY %I', role_row.rolname);
                 EXECUTE format('DROP ROLE %I', role_row.rolname);
@@ -301,7 +321,7 @@ BEGIN
 
             -- Each configured schema that exists.
             FOR schema_row IN SELECT sc.schema_name, sc.schema_oid FROM _schemas sc ORDER BY 1 LOOP
-                SELECT w.level, w.tables INTO access_level, read_tables
+                SELECT w.level, w.tables, w.write_tables INTO access_level, read_tables, write_tables
                   FROM _wanted w WHERE w.username = role_row.rolname AND w.schema_name = schema_row.schema_name;
                 access_level := COALESCE(access_level, 'none');
 
@@ -339,10 +359,15 @@ BEGIN
                      ORDER BY c.relname
                 LOOP
                     IF relation_row.relkind = 'S' THEN
-                        desired_privileges := CASE access_level WHEN 'write' THEN all_sequence_privileges WHEN 'read' THEN ARRAY['SELECT'] ELSE ARRAY[]::TEXT[] END;
+                        desired_privileges := CASE
+                            WHEN access_level = 'write' THEN all_sequence_privileges
+                            WHEN access_level = 'read' AND cardinality(write_tables) > 0 THEN all_sequence_privileges
+                            WHEN access_level = 'read' THEN ARRAY['SELECT']
+                            ELSE ARRAY[]::TEXT[] END;
                     ELSE
                         desired_privileges := CASE
                             WHEN access_level = 'write' THEN all_table_privileges
+                            WHEN access_level = 'read' AND relation_row.relname = ANY(write_tables) THEN all_table_privileges
                             WHEN access_level = 'read' AND (read_tables IS NULL OR relation_row.relname = ANY(read_tables)) THEN ARRAY['SELECT']
                             ELSE ARRAY[]::TEXT[] END;
                     END IF;

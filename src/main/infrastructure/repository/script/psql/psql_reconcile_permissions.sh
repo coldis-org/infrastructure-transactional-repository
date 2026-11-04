@@ -8,6 +8,7 @@
 #   PSQL_READ_SCHEMA_<SCHEMA>=g1,g2               read on a whole schema
 #   PSQL_READ_SCHEMA_<SCHEMA>_TABLE_<TABLE>=g1     read on one table
 #   PSQL_WRITE_SCHEMA_<SCHEMA>=g1                  write on a whole schema
+#   PSQL_WRITE_SCHEMA_<SCHEMA>_TABLE_<TABLE>=g1    write on one table (schema USAGE only)
 #   PSQL_ALTER_GROUP_<ROLE>=g1                     membership of a group role
 #                                                  (only when SKIP_ALTER_GROUP=false)
 #   SKIP_DELETE=true                               never drop users (their configured access
@@ -36,17 +37,18 @@
 # 2 database error (nothing changed), 3 applied except for the users reported as ERROR, or
 # with users DEFERRED to the next run by the time budget.
 
-set -u
-
 ENV_FILE="${RECONCILE_ENV_FILE:-/local/application.env}"
 if [ -f "$ENV_FILE" ]; then
 	# Rendered at runtime by the scheduler; nothing to follow. Exported, so the PSQL_* lines in
-	# it count: the configuration below is read from the environment.
+	# it count: the configuration below is read from the environment. Sourced before nounset:
+	# a rendered value with a stray $ must not abort the run before it can report.
 	set -a
 	# shellcheck source=/dev/null
 	. "$ENV_FILE"
 	set +a
 fi
+
+set -u
 
 DEBUG=${DEBUG:-false}
 RECONCILE_SOURCE="${RECONCILE_SOURCE:-cron}"   # boot | cron | manual
@@ -140,7 +142,7 @@ BAD=$(printf '%s\n' "$CONFIG_SPEC" | awk -F'\t' '
 	$1 == "empty" { print "a PSQL_* variable for " $2 ($3 != "" ? "." $3 : "") " names no LDAP group"; next }
 	($1 == "read" || $1 == "write") && ($2 ~ /^pg_/ || $2 == "information_schema" || $2 == "ldap_reconcile") { print "system schema " $2 " cannot be configured"; next }
 	$2 !~ /^[a-z_][a-z0-9_]*$/ || ($3 != "" && $3 !~ /^[a-z_][a-z0-9_]*$/) || $4 !~ /^[A-Za-z0-9._-]+$/ { print }
-	$1 == "write" && $3 != "" { print "write on a single table is not supported: " $0 }')
+	')
 [ -z "$BAD" ] || fail 1 "invalid PSQL_* configuration: $(printf '%s' "$BAD" | tr '\n\t' '; ')"
 LDAP_GROUP_NAMES=$(printf '%s\n' "$CONFIG_SPEC" | cut -f4 | sort -u)
 GROUP_COUNT=$(printf '%s\n' "$LDAP_GROUP_NAMES" | wc -l | tr -d ' ')

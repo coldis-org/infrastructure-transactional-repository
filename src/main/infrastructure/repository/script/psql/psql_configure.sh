@@ -61,7 +61,8 @@ fi
 SQL_DIR="$(cd "$(dirname "$0")" && pwd)/sql"
 if [ "$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -tA -c 'SELECT pg_is_in_recovery()' -U ${POSTGRES_ADMIN_USER:=postgres} -d "${POSTGRES_DEFAULT_DATABASE}")" = f ]
 then
-	PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -q -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres} -d "${POSTGRES_DEFAULT_DATABASE}" \
+	# search_path pinned: public belongs to the database owner on 15+.
+	PGOPTIONS="-c search_path=pg_catalog" PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -q -v ON_ERROR_STOP=1 -U ${POSTGRES_ADMIN_USER:=postgres} -d "${POSTGRES_DEFAULT_DATABASE}" \
 		-f "${SQL_DIR}/permissions_audit.sql" -f "${SQL_DIR}/reconcile_permissions.sql" \
 		|| echo "ERROR: could not install the permissions reconcile"
 	# Tolerant: an LDAP outage at boot must not stop the database; cron retries hourly.

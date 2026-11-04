@@ -277,7 +277,8 @@ fi
 
 ALLOW_DROPS=true
 [ "$SKIP_DELETE" = true ] && ALLOW_DROPS=false
-PROTECTED="${POSTGRES_ADMIN_USER},${POSTGRES_DEFAULT_USER:-},${POSTGRES_REPLICATOR_USER:-},${RECONCILE_PROTECTED_ROLES:-}"
+# Spaces around the commas are not part of the names.
+PROTECTED="${POSTGRES_ADMIN_USER},${POSTGRES_DEFAULT_USER:-},${POSTGRES_REPLICATOR_USER:-},$(printf '%s' "${RECONCILE_PROTECTED_ROLES:-}" | tr -d ' \t')"
 
 RESULT=$(psql_admin -tA -F ' ' \
 	-v config="$CONFIG_SPEC" -v members="$MEMBERS" -v source="$RECONCILE_SOURCE" \

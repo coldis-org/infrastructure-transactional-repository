@@ -34,7 +34,8 @@ else
 fi
 
 # To use cron
-env > /etc/env_vars
+# Quoted, so values with spaces or ; survive being sourced by cron.
+export -p > /etc/env_vars
 chmod +x /etc/env_vars
 service cron start
 

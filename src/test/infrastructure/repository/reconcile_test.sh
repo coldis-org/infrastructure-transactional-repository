@@ -107,7 +107,7 @@ member: cn=admin,$BASE
 EOF
 
 # Database, with LDAP but no PSQL_* configuration in its environment.
-docker run -d --name "$DB" --network "$NET" -v "$PREFIX-vol:/var/lib/postgresql" \
+docker run -d --name "$DB" --network "$NET" -v "$PREFIX-vol:/var/lib/postgresql" -e "RECONCILE_TEST_SPACED=readers, temp; x" \
 	-e POSTGRES_DEFAULT_USER=app -e POSTGRES_DEFAULT_PASSWORD=app -e POSTGRES_DEFAULT_DATABASE=appdb \
 	-e LDAP_HOST="$LDAP:389" -e LDAP_USER="$ADMIN_DN" -e LDAP_PASSWORD=admin -e LDAP_GROUPS="$GROUPS_DN" \
 	"$IMAGE" >/dev/null || exit 2
@@ -217,11 +217,16 @@ config "$BASE_CONFIG"
 reconcile
 if [ $RC = 0 ] && ! can alice s2.t2 INSERT && ! can alice s2.t2 SELECT; then ok "and removing the mapping revokes it"; else bad "and removing the mapping revokes it"; fi
 
+# An owner's rights on its own relation are not reconciled away.
+sql "CREATE TABLE s1.alice_t(i int); ALTER TABLE s1.alice_t OWNER TO alice; GRANT SELECT ON s1.alice_t TO svc;" >/dev/null
+reconcile
+if [ $RC = 0 ] && can alice s1.alice_t INSERT && ! grep -q "REVOKE alice .* ON s1.alice_t" <<<"$OUT"; then ok "a reader who owns a table keeps the owner's rights on it"; else bad "a reader who owns a table keeps the owner's rights on it"; fi
+
 # RECONCILE_PROTECTED_ROLES: a listed role in LDAP is never adopted.
 sql "CREATE ROLE svcmon LOGIN;" >/dev/null
 members readers alice erin carol svcmon
 config "$BASE_CONFIG
-RECONCILE_PROTECTED_ROLES=svcmon"
+RECONCILE_PROTECTED_ROLES='other, svcmon'"
 reconcile
 if [ $RC = 0 ] && exists svcmon && ! managed svcmon && ! can svcmon s1.t_a SELECT; then ok "a role in RECONCILE_PROTECTED_ROLES is not adopted although LDAP lists it"; else bad "a role in RECONCILE_PROTECTED_ROLES is not adopted although LDAP lists it"; fi
 members readers alice erin carol
@@ -274,6 +279,8 @@ config "$BASE_CONFIG"
 CRON_LINE=$(docker exec "$DB" sh -c "crontab -l | grep psql_reconcile_permissions" | sed 's/^[^a-z]*\* \* \* \* //')
 docker exec "$DB" sh -c "$CRON_LINE"; RC=$?
 if [ $RC = 0 ] && docker exec "$DB" crontab -l | grep -q "^0 \* \* \* \* .*psql_reconcile_permissions" && docker exec "$DB" grep -q "done:" /var/log/reconcile_permissions.log; then ok "the installed cron line runs the reconcile (hourly)"; else bad "the installed cron line runs the reconcile (hourly)"; fi
+CRON_VALUE=$(docker exec "$DB" sh -c 'set -a; . /etc/env_vars; set +a; printf "%s" "$RECONCILE_TEST_SPACED"')
+if [ "$CRON_VALUE" = "readers, temp; x" ]; then ok "the cron environment keeps values with spaces and ;"; else bad "the cron environment keeps values with spaces and ; (got: $CRON_VALUE)"; fi
 
 # Failures: nothing may change.
 members readers alice erin carol

@@ -380,8 +380,10 @@ BEGIN
 
                 -- Tables, views, materialized views, foreign and partitioned tables; sequences.
                 FOR relation_row IN
+                    -- Not the user's own relations: an owner's rights are not reconciled.
                     SELECT c.oid AS rel_oid, c.relname, c.relkind, schema_row.schema_name AS schema_name
                       FROM pg_class c WHERE c.relnamespace = schema_row.schema_oid AND c.relkind IN ('r','p','v','m','f','S')
+                       AND c.relowner <> role_row.oid
                      ORDER BY c.relname
                 LOOP
                     -- The budget also stops a long step midway (not the first user's): that
@@ -442,7 +444,7 @@ BEGIN
             FOR function_row IN
                 SELECT p.oid AS fn_oid, p.oid::regprocedure::TEXT AS signature, sc.schema_name
                   FROM pg_proc p JOIN _schemas sc ON sc.schema_oid = p.pronamespace
-                 WHERE p.prokind = 'f'
+                 WHERE p.prokind = 'f' AND p.proowner <> role_row.oid
                  ORDER BY 2
             LOOP
                 IF (time_budget IS NOT NULL AND processed_count > 1 AND clock_timestamp() - run_started > time_budget)

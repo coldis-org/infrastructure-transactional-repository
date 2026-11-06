@@ -6,10 +6,8 @@ not triaged. Credentials are named by location only. Remove an entry once it is 
 tracked elsewhere, or found not to be a bug.
 
 - `repository-replica/Dockerfile6` builds `FROM ...:5.0.11`, older than `Dockerfile5`'s 5.0.12.
-- `repository-replica/conf/` is not copied by any replica Dockerfile.
 - `repository/service.json` still mounts `/var/lib/postgresql/data`, which `repository-upgrade/README.md` says blocks `pg_upgrade --link`.
-- `psql_init.sh` echoes the full `exec` line, including the admin password, to stdout.
-- `repository-replica/script/psql_replica_init.sh:106` runs `. ./psql_update_conn.sh --skip-reload`; the dot command takes no arguments in dash, so the flag never arrives and the replica reloads a server that has not started (fixed the same way in `psql_init.sh` on 2026-11-03).
+- `psql_init.sh` and `psql_replica_init.sh` echo the full `exec` line, including the admin password, to stdout. Collected logs keep it, so stopping the echo calls for a rotation: `POSTGRES_ADMIN_PASSWORD` only applies at initdb, so rotating means `ALTER ROLE` on the primary, after its replicas run a fixed image, and checking that the old value is refused (observed by the review gate, 2026-11-06).
 - `conf/pg_hba.conf` (rewritten into PGDATA on every boot) allows `host all all 0.0.0.0/0 md5` and `host replication replicator 0.0.0.0/0 md5`; PostgreSQL 18 deprecates md5 in favour of scram-sha-256.
 - `Dockerfile3` (PostgreSQL 14) does not boot: `psql_tune_cmd.sh` passes `wal_decode_buffer_size`, which exists only from 15 (observed 2026-11-04).
 

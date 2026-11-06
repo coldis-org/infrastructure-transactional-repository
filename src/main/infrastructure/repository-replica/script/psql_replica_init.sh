@@ -4,8 +4,6 @@
 set -o errexit
 
 # Default parameters.
-DEBUG=true
-DEBUG_OPT=
 REPLICATION_LOCK_FILE=${PGDATA}/replication_configured.lock
 
 # Enables interruption signal handling.
@@ -49,7 +47,7 @@ if [ ! -f ${REPLICATION_LOCK_FILE} ]
 then
 
 	# Cleans data.
-	rm -rf ${PGDATA}/*
+	rm -rf "${PGDATA:?}"/*
 
 	# Sets the slot.
 	SLOT_PARAM=
@@ -98,12 +96,65 @@ then
 	chown postgres ${PGDATA_PARENT}
 fi
 
+# A standby refuses to start when any of the settings below is lower than on its primary, and
+# both sides tune them from their own CPU and memory, so a replica smaller than its primary would
+# not come up. They are raised here to the primary's. pg_control holds the values the primary last
+# recorded, which are the ones the standby is checked against: reading it needs neither the
+# primary up nor a credential, and pg_basebackup has always written it by now. pg_controldata
+# speaks the image's pt_BR, hence the C locale. Only while this is a standby: once promoted,
+# pg_control holds the server's own settings, and reading them back would only ever raise them.
+primary_setting() {
+	[ -f "${PGDATA}/standby.signal" ] || return 0
+	LC_ALL=C pg_controldata "${PGDATA}" | awk -v key="$1 setting:" 'index($0, key) == 1 { print $NF }'
+}
+
+# The two that size memory go in before the tuner budgets it. MAX_LOCKS_PER_TRANSACTION_MIN is
+# its last clamp, so the floor wins over a lower maximum. Only tuners from the 7.1.0 base size the
+# lock table; older ones fix it at 16384 on both sides, and that floor does nothing there.
+PRIMARY_MAX_CONNECTIONS=$(primary_setting max_connections)
+PRIMARY_MAX_LOCKS_PER_TRANSACTION=$(primary_setting max_locks_per_xact)
+echo "Primary recorded max_connections=${PRIMARY_MAX_CONNECTIONS} max_locks_per_transaction=${PRIMARY_MAX_LOCKS_PER_TRANSACTION}"
+MAX_CONNECTIONS=$(( MAX_CONNECTIONS < PRIMARY_MAX_CONNECTIONS ? PRIMARY_MAX_CONNECTIONS : MAX_CONNECTIONS ))
+MAX_LOCKS_PER_TRANSACTION_MIN=$(( MAX_LOCKS_PER_TRANSACTION_MIN < PRIMARY_MAX_LOCKS_PER_TRANSACTION ? PRIMARY_MAX_LOCKS_PER_TRANSACTION : MAX_LOCKS_PER_TRANSACTION_MIN ))
+
 # Tune command.
 . ./psql_tune_cmd.sh
 psql_tune_cmd "$@"
 
-# Check if master address and LDAP has changed
-. ./psql_update_conn.sh --skip-reload
+# max_worker_processes comes from the CPU and goes on top of what the tuner chose, when that is
+# lower. Each worker it adds is one more row of max_locks_per_transaction in the lock table, which
+# the tuner sized for the connections alone.
+# max_wal_senders follows max_connections, and max_prepared_transactions comes from the primary in
+# postgresql.conf; each needs a floor here only if a deployment sets it apart.
+EXTRA_WORKERS=$(( $(primary_setting max_worker_processes) - MAX_WORKER_PROCESSES ))
+EXTRA_WORKERS=$(( EXTRA_WORKERS < 0 ? 0 : EXTRA_WORKERS ))
+if [ ${EXTRA_WORKERS} -gt 0 ]
+then
+	echo "Raising max_worker_processes from ${MAX_WORKER_PROCESSES} to the primary's $(( MAX_WORKER_PROCESSES + EXTRA_WORKERS ))"
+	POSTGRES_TUNED_CMD="${POSTGRES_TUNED_CMD} -c max_worker_processes=$(( MAX_WORKER_PROCESSES + EXTRA_WORKERS ))"
+fi
+
+# A lock table larger than the memory leaves the tuner nothing for the rest, and it goes on below
+# zero rather than failing, so Postgres would stop at whichever value broke its minimum first. The
+# workers raised above come out of the reserve instead, and a server that outgrows it is killed by
+# the kernel before it can log anything. On bases before 7.1.0 the tuner does not size the lock
+# table, and Postgres is left to stop on its own.
+if [ -n "${MAX_LOCKS_PER_TRANSACTION}" ]
+then
+	EXTRA_LOCKS_MEMORY=$(( EXTRA_WORKERS * MAX_LOCKS_PER_TRANSACTION * 3 / 4 ))
+	if [ ${SHARED_BUFFERS} -lt 128 ] || [ ${WORK_MEM} -lt 64 ] || [ ${MAINTENANCE_WORK_MEM} -lt 1024 ] \
+		|| [ ${ACTUAL_RESERVED_MEMORY} -lt ${EXTRA_LOCKS_MEMORY} ]
+	then
+		echo "Not enough memory: max_locks_per_transaction=${MAX_LOCKS_PER_TRANSACTION} over $(( MAX_CONNECTIONS + EXTRA_WORKERS )) slots takes $(( (TOTAL_LOCKS_MEMORY + EXTRA_LOCKS_MEMORY) / 1024 )) MB of lock table, out of $(( MAX_MEMORY / 1024 )) MB. Give the replica more memory, or the primary a lower max_locks_per_transaction."
+		exit 1
+	fi
+fi
+
+# Check if master address and LDAP has changed. The dot command takes no arguments in sh/dash, so
+# --skip-reload goes in as positional parameters (the exec below uses POSTGRES_TUNED_CMD, not
+# "$@"); without it the script reloads a server that is not running yet.
+set -- --skip-reload
+. ./psql_update_conn.sh
 
 
 # Executes the init command.

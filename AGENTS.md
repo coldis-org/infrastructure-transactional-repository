@@ -20,7 +20,7 @@ All under `src/main/infrastructure/`.
 | `repository/conf/` | `postgresql.conf`, `pg_hba.conf` (copied to `/tmp`, put into `PGDATA` at boot) |
 | `repository/script/psql/` | `psql_init` (entrypoint), `psql_configure`, `psql_tune_cmd`, `psql_relocate`, `psql_update_conn`, `psql_reconcile_permissions` (+ `sql/`, `psql_install_reconcile`, `psql_users_add` entry point) |
 | `repository/cron/cron_job` | Hourly LDAP permissions reconcile (`psql_reconcile_permissions.sh`, under flock) |
-| `repository-replica/` | `Dockerfile5`..`7`, `psql_replica_init.sh` (`pg_basebackup` replica); its `conf/` is not copied by any of its Dockerfiles |
+| `repository-replica/` | `Dockerfile5`..`7`, `psql_replica_init.sh` (`pg_basebackup` replica); no `conf/` of its own: `postgresql.conf` and `pg_hba.conf` come from the primary with the base backup |
 | `repository-upgrade/` | Major-version migration image (`pg_upgrade`), pre-flight check; read its `README.md` |
 | `repository-tuner/` | `FROM jfcoz/postgresqltuner`, nothing else |
 | `*/service.json` | Marathon-style app definitions |

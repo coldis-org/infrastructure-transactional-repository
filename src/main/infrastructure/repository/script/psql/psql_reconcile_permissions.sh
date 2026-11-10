@@ -4,7 +4,9 @@
 # Replaces psql_users_add, psql_users_remove and psql_users_alter_group. Run at boot by
 # psql_configure.sh and hourly by cron.
 #
-# Configuration, from the environment (and /local/application.env, re-read every run):
+# Configuration, from the environment and /local/application.env, all re-read every run. When
+# the permissions file exists (/local/permissions.env, or RECONCILE_PERMISSIONS_FILE), the PSQL_*
+# mappings come from it alone:
 #   PSQL_READ_SCHEMA_<SCHEMA>=g1,g2               read on a whole schema
 #   PSQL_READ_SCHEMA_<SCHEMA>_TABLE_<TABLE>=g1     read on one table
 #   PSQL_WRITE_SCHEMA_<SCHEMA>=g1                  write on a whole schema
@@ -39,11 +41,12 @@
 # 2 database error (nothing changed), 3 applied except for the users reported as ERROR, or
 # with users DEFERRED to the next run by the time budget.
 
-ENV_FILE="${RECONCILE_ENV_FILE:-/local/application.env}"
+ENV_FILE=/local/application.env
 if [ -f "$ENV_FILE" ]; then
-	# Rendered at runtime by the scheduler; nothing to follow. Exported, so the PSQL_* lines in
-	# it count: the configuration below is read from the environment. Sourced before nounset:
-	# a rendered value with a stray $ must not abort the run before it can report.
+	# Rendered at runtime by the job itself (an LDAP_HOST some jobs discover through Consul);
+	# nothing to follow. Exported, so what it sets counts: the configuration below is read from
+	# the environment. Sourced before nounset: a rendered value with a stray $ must not abort the
+	# run before it can report. The permissions file is not sourced: see below.
 	set -a
 	# shellcheck source=/dev/null
 	. "$ENV_FILE"
@@ -106,6 +109,42 @@ esac
 
 log "start (source=${RECONCILE_SOURCE})"
 RUN_STARTED=$(date +%s)
+
+# The permissions file is data, not shell: the job renders it from its Nomad Variable
+# (infrastructure-database-permissions), which changes without a deploy. Only PSQL_* mappings
+# to group names are taken from it; any other line (another setting, a space, a quote, a $)
+# stops the run before anything changes. Once it exists it is the only source of mappings: a
+# PSQL_* left in the environment or /local/application.env would never be revoked from here.
+PERMISSIONS_FILE="${RECONCILE_PERMISSIONS_FILE:-/local/permissions.env}"
+if [ -f "$PERMISSIONS_FILE" ]; then
+	# One read: the accepted lines, or only the number of the first other line.
+	if ! PERMISSIONS=$(awk '
+		/^[ \t]*(#|$)/ { next }
+		/^PSQL_((READ|WRITE)_SCHEMA|ALTER_GROUP)_[A-Za-z0-9_]+=[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$/ { accepted[++count] = $0; next }
+		{ bad = FNR; exit }
+		END { if (bad) { print bad; exit 1 } for (line = 1; line <= count; line++) print accepted[line] }' "$PERMISSIONS_FILE"); then
+		fail 1 "${PERMISSIONS_FILE}: line ${PERMISSIONS:-?} is not a PSQL_* mapping to group names; nothing changed"
+	fi
+	# Named, so the first run after a migration shows what the file replaced; a file with no
+	# mapping next to an environment that has some is reported, not only logged.
+	# Mapping keys only: psql's own PSQL_HISTORY, PSQL_PAGER... are not configuration.
+	IGNORED=$(env | sed -nE 's/^(PSQL_((READ|WRITE)_SCHEMA|ALTER_GROUP)_[A-Za-z0-9_]+)=.*/\1/p' | LC_ALL=C sort -u | tr '\n' ' ')
+	if [ -n "$IGNORED" ] && [ -z "$PERMISSIONS" ]; then
+		report "${PERMISSIONS_FILE} has no mapping; ignoring PSQL_* from the environment: ${IGNORED% }"
+	elif [ -n "$IGNORED" ]; then
+		log "ignoring PSQL_* from the environment, ${PERMISSIONS_FILE} is the only source: ${IGNORED% }"
+	fi
+	for name in $IGNORED; do
+		unset "$name"
+	done
+	while IFS= read -r mapping; do
+		# NAME=value, both checked above.
+		# shellcheck disable=SC2163
+		[ -z "$mapping" ] || export "$mapping"
+	done <<EOF
+$PERMISSIONS
+EOF
+fi
 
 # The desired configuration. A key splits at its first _TABLE_.
 CONFIG_SPEC=$(env | awk -F= -v alter="$SKIP_ALTER_GROUP" '

@@ -4,9 +4,9 @@
 # Replaces psql_users_add, psql_users_remove and psql_users_alter_group. Run at boot by
 # psql_configure.sh and hourly by cron.
 #
-# Configuration, from the environment and /local/application.env, all re-read every run. When
-# the permissions file exists (/local/permissions.env, or RECONCILE_PERMISSIONS_FILE), the PSQL_*
-# mappings come from it alone:
+# Configuration, from the environment and /local/application.env (or APPLICATION_ENV_FILE),
+# all re-read every run. When the permissions file exists (/local/permissions.env, or
+# RECONCILE_PERMISSIONS_FILE), the PSQL_* mappings come from it alone:
 #   PSQL_READ_SCHEMA_<SCHEMA>=g1,g2               read on a whole schema
 #   PSQL_READ_SCHEMA_<SCHEMA>_TABLE_<TABLE>=g1     read on one table
 #   PSQL_WRITE_SCHEMA_<SCHEMA>=g1                  write on a whole schema
@@ -41,12 +41,13 @@
 # 2 database error (nothing changed), 3 applied except for the users reported as ERROR, or
 # with users DEFERRED to the next run by the time budget.
 
-ENV_FILE=/local/application.env
+ENV_FILE="${APPLICATION_ENV_FILE:-/local/application.env}"
 if [ -f "$ENV_FILE" ]; then
 	# Rendered at runtime by the job itself (an LDAP_HOST some jobs discover through Consul);
 	# nothing to follow. Exported, so what it sets counts: the configuration below is read from
 	# the environment. Sourced before nounset: a rendered value with a stray $ must not abort the
-	# run before it can report. The permissions file is not sourced: see below.
+	# run before it can report. The permissions file is not sourced (see below): never point
+	# APPLICATION_ENV_FILE at it.
 	set -a
 	# shellcheck source=/dev/null
 	. "$ENV_FILE"

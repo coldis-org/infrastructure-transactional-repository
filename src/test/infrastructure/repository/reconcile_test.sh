@@ -215,6 +215,11 @@ appenv "LDAP_HOST=nowhere.invalid:389"
 BEFORE=$(snapshot)
 reconcile
 if [ $RC = 1 ] && grep -q "nowhere.invalid" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "an LDAP_HOST in /local/application.env is used"; else bad "an LDAP_HOST in /local/application.env is used"; fi
+# The same file elsewhere, named by APPLICATION_ENV_FILE.
+docker exec "$DB" mv /local/application.env /local/other.env
+OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && RECONCILE_SOURCE=manual APPLICATION_ENV_FILE=/local/other.env ./psql_reconcile_permissions.sh' 2>&1); RC=$?
+docker exec "$DB" rm -f /local/other.env
+if [ $RC = 1 ] && grep -q "nowhere.invalid" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "APPLICATION_ENV_FILE names the file sourced instead"; else bad "APPLICATION_ENV_FILE names the file sourced instead"; fi
 appenv "PSQL_READ_SCHEMA_S1=temp
 PSQL_READ_SCHEMA_S2=readers
 PSQL_HISTORY=/dev/null"

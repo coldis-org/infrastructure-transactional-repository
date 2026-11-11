@@ -226,6 +226,10 @@ PSQL_HISTORY=/dev/null"
 reconcile
 if [ $RC = 0 ] && can alice s1.t_a SELECT && can erin s1.t_a SELECT && ! can alice s2.t2 SELECT \
 	&& grep -q "ignoring PSQL_\* from the environment, .*: PSQL_READ_SCHEMA_S1 PSQL_READ_SCHEMA_S2$" <<<"$OUT"; then ok "with a permissions file, PSQL_* mappings from elsewhere are ignored and named (not psql's PSQL_HISTORY)"; else bad "with a permissions file, PSQL_* mappings from elsewhere are ignored and named (not psql's PSQL_HISTORY)"; fi
+appenv "NOTE='x
+PSQL_READ_SCHEMA_S2=readers'"
+reconcile
+if [ $RC = 0 ] && can alice s1.t_a SELECT && ! can alice s2.t2 SELECT; then ok "a mapping inside another variable's value is not read"; else bad "a mapping inside another variable's value is not read"; fi
 docker exec "$DB" rm -f /local/application.env
 
 # Without the permissions file (a job not migrated yet), the mappings come from the environment
@@ -360,6 +364,17 @@ $bad_line"
 	if [ $RC = 1 ] && grep -q "/local/permissions.env: line 4 is not a PSQL_\* mapping" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] \
 		&& ! docker exec "$DB" test -e /tmp/pwned; then ok "permissions file line refused, nothing runs or changes: $bad_line"; else bad "permissions file line refused, nothing runs or changes: $bad_line"; fi
 done
+# Nor as the sourced settings file: APPLICATION_ENV_FILE naming it, even through a link, stops
+# the run before either file is read.
+# shellcheck disable=SC2016  # the payload, written literally
+config "$BASE_CONFIG
+"'X=$(touch /tmp/pwned)'
+docker exec "$DB" ln -sf /local/permissions.env /local/link.env
+OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && RECONCILE_SOURCE=manual APPLICATION_ENV_FILE=/local/link.env ./psql_reconcile_permissions.sh' 2>&1); RC=$?
+docker exec "$DB" rm -f /local/link.env
+if [ $RC = 1 ] && grep -q "APPLICATION_ENV_FILE names the permissions file" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] \
+	&& ! docker exec "$DB" test -e /tmp/pwned; then ok "APPLICATION_ENV_FILE naming the permissions file is refused, nothing runs or changes"; else bad "APPLICATION_ENV_FILE naming the permissions file is refused, nothing runs or changes"; fi
+docker exec "$DB" rm -f /tmp/pwned
 
 sql "CREATE ROLE danger NOLOGIN; GRANT pg_write_server_files TO danger; CREATE ROLE ownergrp NOLOGIN; GRANT app TO ownergrp;" >/dev/null
 BEFORE=$(snapshot)

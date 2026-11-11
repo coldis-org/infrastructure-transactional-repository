@@ -45,20 +45,22 @@
 
 ENV_FILE="${APPLICATION_ENV_FILE:-/local/application.env}"
 PERMISSIONS_FILE="${RECONCILE_PERMISSIONS_FILE:-/local/permissions.env}"
+ENV_FILE_REFUSED=false
 if [ -f "$ENV_FILE" ]; then
-	# The permissions file is read as data (see below), never run, also through a link.
+	# The permissions file is read as data (see below), never run, also through a link: not
+	# sourced here, and the run fails once it can report.
 	if [ "$(readlink -f "$ENV_FILE")" = "$(readlink -f "$PERMISSIONS_FILE")" ]; then
-		echo "[psql_reconcile_permissions] ERROR: APPLICATION_ENV_FILE names the permissions file ${PERMISSIONS_FILE}; nothing changed" >&2
-		exit 1
+		ENV_FILE_REFUSED=true
+	else
+		# Rendered at runtime by the job itself (an LDAP_HOST some jobs discover through
+		# Consul); nothing to follow. Exported, so what it sets counts: the configuration below
+		# is read from the environment. Sourced before nounset: a rendered value with a stray $
+		# must not abort the run before it can report.
+		set -a
+		# shellcheck source=/dev/null
+		. "$ENV_FILE"
+		set +a
 	fi
-	# Rendered at runtime by the job itself (an LDAP_HOST some jobs discover through Consul);
-	# nothing to follow. Exported, so what it sets counts: the configuration below is read from
-	# the environment. Sourced before nounset: a rendered value with a stray $ must not abort the
-	# run before it can report.
-	set -a
-	# shellcheck source=/dev/null
-	. "$ENV_FILE"
-	set +a
 fi
 
 set -u
@@ -97,6 +99,7 @@ fail() { # status message
 	report "$2"
 	exit "$1"
 }
+[ "$ENV_FILE_REFUSED" = false ] || fail 1 "APPLICATION_ENV_FILE names the permissions file ${PERMISSIONS_FILE}; nothing changed"
 # Superuser sessions resolve nothing from schemas other roles own (public belongs to the
 # database owner on 15+).
 export PGOPTIONS="${PGOPTIONS:-} -c search_path=pg_catalog"

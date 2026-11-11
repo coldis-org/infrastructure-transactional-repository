@@ -365,7 +365,7 @@ $bad_line"
 		&& ! docker exec "$DB" test -e /tmp/pwned; then ok "permissions file line refused, nothing runs or changes: $bad_line"; else bad "permissions file line refused, nothing runs or changes: $bad_line"; fi
 done
 # Nor as the sourced settings file: APPLICATION_ENV_FILE naming it, even through a link, stops
-# the run before either file is read.
+# the run before either file is read, reported like any other refusal (the run's log).
 # shellcheck disable=SC2016  # the payload, written literally
 config "$BASE_CONFIG
 "'X=$(touch /tmp/pwned)'
@@ -373,6 +373,7 @@ docker exec "$DB" ln -sf /local/permissions.env /local/link.env
 OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && RECONCILE_SOURCE=manual APPLICATION_ENV_FILE=/local/link.env ./psql_reconcile_permissions.sh' 2>&1); RC=$?
 docker exec "$DB" rm -f /local/link.env
 if [ $RC = 1 ] && grep -q "APPLICATION_ENV_FILE names the permissions file" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] \
+	&& docker exec "$DB" grep -q "ERROR: APPLICATION_ENV_FILE names" /var/log/reconcile_permissions.log \
 	&& ! docker exec "$DB" test -e /tmp/pwned; then ok "APPLICATION_ENV_FILE naming the permissions file is refused, nothing runs or changes"; else bad "APPLICATION_ENV_FILE naming the permissions file is refused, nothing runs or changes"; fi
 docker exec "$DB" rm -f /tmp/pwned
 

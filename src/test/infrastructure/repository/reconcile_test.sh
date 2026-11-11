@@ -38,7 +38,10 @@ members() { # group user... : replaces the group's members (none = empty group)
 	local group=$1; shift
 	{ printf 'dn: cn=%s,%s\nchangetype: modify\nreplace: memberUid\n' "$group" "$GROUPS_DN"; for member_name in "$@"; do printf 'memberUid: %s\n' "$member_name"; done; } | ldap
 }
-config() { # lines for /local/application.env (sourced by the wrapper every run)
+config() { # lines for /local/permissions.env, the file a job renders from its Nomad Variable
+	docker exec -i "$DB" sh -c 'mkdir -p /local && cat > /local/permissions.env' <<<"$1"
+}
+appenv() { # lines for /local/application.env, which some jobs render with what they discover
 	docker exec -i "$DB" sh -c 'mkdir -p /local && cat > /local/application.env' <<<"$1"
 }
 reconcile() { OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && RECONCILE_SOURCE=manual ./psql_reconcile_permissions.sh' 2>&1); RC=$?; }
@@ -206,6 +209,38 @@ if [ $RC = 0 ] && can alice s1.t_a SELECT && can henry s1.t_a SELECT && exists c
 config "$BASE_CONFIG"
 reconcile
 
+# /local/application.env is still read: an LDAP_HOST a job discovers there replaces the
+# environment's. Its PSQL_* lines, like the environment's, give way to the permissions file.
+appenv "LDAP_HOST=nowhere.invalid:389"
+BEFORE=$(snapshot)
+reconcile
+if [ $RC = 1 ] && grep -q "nowhere.invalid" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "an LDAP_HOST in /local/application.env is used"; else bad "an LDAP_HOST in /local/application.env is used"; fi
+# The same file elsewhere, named by APPLICATION_ENV_FILE.
+docker exec "$DB" mv /local/application.env /local/other.env
+OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && RECONCILE_SOURCE=manual APPLICATION_ENV_FILE=/local/other.env ./psql_reconcile_permissions.sh' 2>&1); RC=$?
+docker exec "$DB" rm -f /local/other.env
+if [ $RC = 1 ] && grep -q "nowhere.invalid" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "APPLICATION_ENV_FILE names the file sourced instead"; else bad "APPLICATION_ENV_FILE names the file sourced instead"; fi
+appenv "PSQL_READ_SCHEMA_S1=temp
+PSQL_READ_SCHEMA_S2=readers
+PSQL_HISTORY=/dev/null"
+reconcile
+if [ $RC = 0 ] && can alice s1.t_a SELECT && can erin s1.t_a SELECT && ! can alice s2.t2 SELECT \
+	&& grep -q "ignoring PSQL_\* from the environment, .*: PSQL_READ_SCHEMA_S1 PSQL_READ_SCHEMA_S2$" <<<"$OUT"; then ok "with a permissions file, PSQL_* mappings from elsewhere are ignored and named (not psql's PSQL_HISTORY)"; else bad "with a permissions file, PSQL_* mappings from elsewhere are ignored and named (not psql's PSQL_HISTORY)"; fi
+appenv "NOTE='x
+PSQL_READ_SCHEMA_S2=readers'"
+reconcile
+if [ $RC = 0 ] && can alice s1.t_a SELECT && ! can alice s2.t2 SELECT; then ok "a mapping inside another variable's value is not read"; else bad "a mapping inside another variable's value is not read"; fi
+docker exec "$DB" rm -f /local/application.env
+
+# Without the permissions file (a job not migrated yet), the mappings come from the environment
+# and /local/application.env, as before.
+docker exec "$DB" rm -f /local/permissions.env
+appenv "$BASE_CONFIG"
+reconcile
+if [ $RC = 0 ] && grep -q "no changes" <<<"$OUT" && ! grep -q "ignoring PSQL_" <<<"$OUT"; then ok "without a permissions file, the mappings in /local/application.env apply"; else bad "without a permissions file, the mappings in /local/application.env apply"; fi
+appenv ""
+config "$BASE_CONFIG"
+
 # Write on one table: ALL on it and its sequences, USAGE on the schema, nothing on the other tables.
 sql "ALTER TABLE s2.t2 ADD COLUMN id serial; CREATE SEQUENCE s2.other_q;" >/dev/null
 config "$BASE_CONFIG
@@ -225,46 +260,46 @@ if [ $RC = 0 ] && can alice s1.alice_t INSERT && ! grep -q "REVOKE alice .* ON s
 # RECONCILE_PROTECTED_ROLES: a listed role in LDAP is never adopted.
 sql "CREATE ROLE svcmon LOGIN;" >/dev/null
 members readers alice erin carol svcmon
-config "$BASE_CONFIG
-RECONCILE_PROTECTED_ROLES='other, svcmon'"
+appenv "RECONCILE_PROTECTED_ROLES='other, svcmon'"
 reconcile
 if [ $RC = 0 ] && exists svcmon && ! managed svcmon && ! can svcmon s1.t_a SELECT; then ok "a role in RECONCILE_PROTECTED_ROLES is not adopted although LDAP lists it"; else bad "a role in RECONCILE_PROTECTED_ROLES is not adopted although LDAP lists it"; fi
 members readers alice erin carol
-config "$BASE_CONFIG"
+appenv ""
 reconcile
 
 # A time budget commits part of the work; the users left go first next run.
 sql "REVOKE SELECT ON s1.t_a FROM alice; REVOKE SELECT ON s1.t_a FROM erin;" >/dev/null
-config "$BASE_CONFIG
-RECONCILE_TIME_BUDGET=0"
+appenv "RECONCILE_TIME_BUDGET=0"
 reconcile
 if [ $RC = 3 ] && grep -q "DEFERRED" <<<"$OUT" && [ "$(grep -cE "GRANT (alice|erin) SELECT ON s1.t_a" <<<"$OUT")" -le 1 ]; then ok "with the time budget spent, one user is done and the rest deferred (exit 3)"; else bad "with the time budget spent, one user is done and the rest deferred (exit 3)"; fi
 # shellcheck disable=SC2034  # iteration only counts the runs
 for iteration in 1 2 3 4 5 6 7 8 9 10; do reconcile; done
 if can alice s1.t_a SELECT && can erin s1.t_a SELECT; then ok "successive budgeted runs reach every user (least recently reconciled first)"; else bad "successive budgeted runs reach every user (least recently reconciled first)"; fi
-config "$BASE_CONFIG"
+appenv ""
 reconcile
 if [ $RC = 0 ] && ! grep -q "DEFERRED" <<<"$OUT" && grep -qE "done: .* in [0-9]+s" <<<"$OUT"; then ok "without the budget reached the run completes, and logs its duration"; else bad "without the budget reached the run completes, and logs its duration"; fi
 
 # Sequences and functions follow the schema level.
 if [ "$(sql "SELECT has_sequence_privilege('alice', 's1.q', 'SELECT') AND NOT has_sequence_privilege('alice', 's1.q', 'UPDATE') AND has_function_privilege('alice', 's1.f()', 'EXECUTE')")" = t ]; then ok "readers get SELECT on the schema's sequences and EXECUTE on its functions"; else bad "readers get SELECT on the schema's sequences and EXECUTE on its functions"; fi
 
-# Group roles (PSQL_ALTER_GROUP_*), when enabled.
+# Group roles (PSQL_ALTER_GROUP_*), when enabled: from the environment, for a job without the
+# permissions file, which takes read and write mappings only.
 sql "CREATE ROLE grp NOLOGIN" >/dev/null
-config "$BASE_CONFIG
+docker exec "$DB" rm -f /local/permissions.env
+appenv "$BASE_CONFIG
 PSQL_ALTER_GROUP_GRP=readers
 SKIP_ALTER_GROUP=false"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = t ]; then ok "PSQL_ALTER_GROUP_GRP makes the group's managed users members of grp"; else bad "PSQL_ALTER_GROUP_GRP makes the group's managed users members of grp"; fi
-config "$BASE_CONFIG"
+appenv "$BASE_CONFIG"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = t ]; then ok "with the mapping removed and SKIP_ALTER_GROUP back on, membership is left alone"; else bad "with the mapping removed and SKIP_ALTER_GROUP back on, membership is left alone"; fi
-config "$BASE_CONFIG
+appenv "$BASE_CONFIG
 PSQL_ALTER_GROUP_GRP=writers
 SKIP_ALTER_GROUP=false"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = f ]; then ok "a user leaving the mapped LDAP group leaves grp"; else bad "a user leaving the mapped LDAP group leaves grp"; fi
-config "$BASE_CONFIG
+appenv "$BASE_CONFIG
 PSQL_ALTER_GROUP_GRP=staff
 SKIP_ALTER_GROUP=false"
 reconcile
@@ -274,6 +309,7 @@ sql "CREATE ROLE grpadmin NOLOGIN; GRANT grp TO grpadmin WITH ADMIN OPTION; SET 
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT count(*) FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.member WHERE r.rolname IN ('erin', 'jane.doe') AND am.roleid = 'grp'::regrole")" = 0 ]; then ok "a membership granted by another role is revoked when the user is not in the mapped group (also for a dotted name)"; else bad "a membership granted by another role is revoked when the user is not in the mapped group (also for a dotted name)"; fi
 config "$BASE_CONFIG"
+appenv ""
 
 # The cron line itself, as the image installs it.
 CRON_LINE=$(docker exec "$DB" sh -c "crontab -l | grep psql_reconcile_permissions" | sed 's/^[^a-z]*\* \* \* \* //')
@@ -295,7 +331,19 @@ if docker logs "$DB" 2>&1 | grep -qE "(WARNING|AVISO): +psql_reconcile_permissio
 config "$BASE_CONFIG
 PSQL_READ_SCHEMA_S2="
 reconcile
-if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "a PSQL_* variable naming no group stops the run, nothing changes"; else bad "a PSQL_* variable naming no group stops the run, nothing changes"; fi
+if [ $RC = 1 ] && grep -q "line 4 is not a PSQL_READ_SCHEMA_\* or PSQL_WRITE_SCHEMA_\* mapping" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a mapping naming no group in the permissions file stops the run, nothing changes"; else bad "a mapping naming no group in the permissions file stops the run, nothing changes"; fi
+# The same from the environment (a job without the file) stops at the configuration check.
+docker exec "$DB" rm -f /local/permissions.env
+appenv "$BASE_CONFIG
+PSQL_READ_SCHEMA_S2="
+reconcile
+if [ $RC = 1 ] && grep -q "names no LDAP group" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a PSQL_* variable naming no group in the environment stops the run, nothing changes"; else bad "a PSQL_* variable naming no group in the environment stops the run, nothing changes"; fi
+appenv ""
+# A _TABLE_ key with no table name is refused, not read as the whole schema.
+config "$BASE_CONFIG
+PSQL_WRITE_SCHEMA_S1_TABLE_=readers"
+reconcile
+if [ $RC = 1 ] && grep -q "s1 names no table" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a _TABLE_ key naming no table stops the run, nothing changes"; else bad "a _TABLE_ key naming no table stops the run, nothing changes"; fi
 
 config "$BASE_CONFIG
 PSQL_READ_SCHEMA_S2=gon"
@@ -312,12 +360,38 @@ PSQL_READ_SCHEMA_PG_CATALOG=readers"
 reconcile
 if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "a system schema cannot be configured, nothing changes"; else bad "a system schema cannot be configured, nothing changes"; fi
 
+# The permissions file is data, not shell: another setting, a command or a space in it stops
+# the run, nothing in it runs, and nothing changes.
+# shellcheck disable=SC2016  # the $(...) are the payload, written literally
+for bad_line in 'LDAP_HOST=nowhere.invalid:389' 'X=$(touch /tmp/pwned)' 'PSQL_READ_SCHEMA_S1=readers$(touch /tmp/pwned)' \
+	'PSQL_READ_SCHEMA_S1=readers;touch /tmp/pwned' 'PSQL_READ_SCHEMA_S1=readers, temp' 'export PSQL_READ_SCHEMA_S1=readers' \
+	'PSQL_ALTER_GROUP_GRP=readers'; do
+	config "$BASE_CONFIG
+$bad_line"
+	reconcile
+	if [ $RC = 1 ] && grep -q "/local/permissions.env: line 4 is not a PSQL_READ_SCHEMA_\* or PSQL_WRITE_SCHEMA_\* mapping" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] \
+		&& ! docker exec "$DB" test -e /tmp/pwned; then ok "permissions file line refused, nothing runs or changes: $bad_line"; else bad "permissions file line refused, nothing runs or changes: $bad_line"; fi
+done
+# Nor as the sourced settings file: APPLICATION_ENV_FILE naming it, even through a link, stops
+# the run before either file is read, reported like any other refusal (the run's log).
+# shellcheck disable=SC2016  # the payload, written literally
+config "$BASE_CONFIG
+"'X=$(touch /tmp/pwned)'
+docker exec "$DB" ln -sf /local/permissions.env /local/link.env
+OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && RECONCILE_SOURCE=manual APPLICATION_ENV_FILE=/local/link.env ./psql_reconcile_permissions.sh' 2>&1); RC=$?
+docker exec "$DB" rm -f /local/link.env
+if [ $RC = 1 ] && grep -q "APPLICATION_ENV_FILE names the permissions file" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] \
+	&& docker exec "$DB" grep -q "ERROR: APPLICATION_ENV_FILE names" /var/log/reconcile_permissions.log \
+	&& ! docker exec "$DB" test -e /tmp/pwned; then ok "APPLICATION_ENV_FILE naming the permissions file is refused, nothing runs or changes"; else bad "APPLICATION_ENV_FILE naming the permissions file is refused, nothing runs or changes"; fi
+docker exec "$DB" rm -f /tmp/pwned
+
 sql "CREATE ROLE danger NOLOGIN; GRANT pg_write_server_files TO danger; CREATE ROLE ownergrp NOLOGIN; GRANT app TO ownergrp;" >/dev/null
 BEFORE=$(snapshot)
 for target in POSTGRES DANGER APP OWNERGRP; do
 	target_role=$(tr '[:upper:]' '[:lower:]' <<<"$target")
 	MEMBERSHIP_BEFORE=$(sql "SELECT string_agg(member::regrole::text, ',' ORDER BY 1) FROM pg_auth_members WHERE roleid = '$target_role'::regrole")
-	config "$BASE_CONFIG
+	docker exec "$DB" rm -f /local/permissions.env
+	appenv "$BASE_CONFIG
 PSQL_ALTER_GROUP_$target=readers
 SKIP_ALTER_GROUP=false"
 	reconcile
@@ -325,6 +399,7 @@ SKIP_ALTER_GROUP=false"
 done
 
 config "$BASE_CONFIG"
+appenv ""
 BEFORE=$(snapshot)
 members readers alice erin carol "Bad User"
 reconcile
@@ -334,22 +409,21 @@ reconcile
 if [ $RC = 0 ] && exists Jo.Mixed && exists 9lives && can Jo.Mixed s1.t_a SELECT; then ok "mixed-case names and a leading digit are valid usernames (as the old scripts allowed)"; else bad "mixed-case names and a leading digit are valid usernames (as the old scripts allowed)"; fi
 LEGACY_OUT=$(docker exec "$DB" sh -c 'cd /opt/psql-script && ./psql_users_add.sh' 2>&1); LEGACY_RC=$?
 if [ $LEGACY_RC = 0 ] && grep -q "done:" <<<"$LEGACY_OUT"; then ok "psql_users_add.sh (still called by the on-demand pipeline) runs the reconcile"; else bad "psql_users_add.sh (still called by the on-demand pipeline) runs the reconcile"; fi
-config "$BASE_CONFIG
-POSTGRES_DEFAULT_USER="
+config "$BASE_CONFIG"
+appenv "POSTGRES_DEFAULT_USER="
 members readers alice erin carol
 reconcile
 if [ $RC = 3 ] && exists Jo.Mixed && grep -q "no non-superuser owner" <<<"$OUT"; then ok "with no default user, a drop is refused rather than handing objects to the superuser"; else bad "with no default user, a drop is refused rather than handing objects to the superuser"; fi
-config "$BASE_CONFIG"
+appenv ""
 reconcile
 BEFORE=$(snapshot)
 
 members readers alice erin carol george
-config "$BASE_CONFIG
-LDAP_PASSWORD=wrong"
+appenv "LDAP_PASSWORD=FAKE_wrong_password"
 reconcile
-if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "a failed bind stops the run, nothing changes"; else bad "a failed bind stops the run, nothing changes"; fi
+if [ $RC = 1 ] && grep -qiE "bind|credentials" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a failed bind stops the run, nothing changes"; else bad "a failed bind stops the run, nothing changes"; fi
 
-config "$BASE_CONFIG"
+appenv ""
 docker stop "$LDAP" >/dev/null
 reconcile
 if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "LDAP down stops the run, nothing changes"; else bad "LDAP down stops the run, nothing changes"; fi
@@ -380,15 +454,21 @@ if [ $RC = 0 ] && exists dbcreator && ! managed dbcreator; then ok "a CREATEDB r
 members readers alice erin george
 
 # Drops disabled.
-config "$BASE_CONFIG
-SKIP_DELETE=true"
+config "$BASE_CONFIG"
+appenv "SKIP_DELETE=true"
 members readers erin george
 reconcile
 if [ $RC = 0 ] && exists alice && grep -q "KEEP_USER alice" <<<"$OUT"; then ok "SKIP_DELETE=true keeps users that left LDAP"; else bad "SKIP_DELETE=true keeps users that left LDAP"; fi
 if ! can alice s1.t_a SELECT && [ "$(sql "SELECT count(*) FROM pg_database d, aclexplode(d.datacl) x WHERE d.datname = 'appdb' AND x.grantee = 'alice'::regrole")" = 0 ]; then ok "a kept user loses the configured access (tables, direct database grants)"; else bad "a kept user loses the configured access (tables, direct database grants)"; fi
 
-# Configuration removed: nothing is reconciled (no mass drop from a missing variable).
-config "unset PSQL_READ_SCHEMA_S1 PSQL_READ_SCHEMA_S2_TABLE_T1 PSQL_WRITE_SCHEMA_S3"
+# Configuration removed: nothing is reconciled (no mass drop from a missing variable), with an
+# empty permissions file (reported when the environment still has mappings) or with none.
+config ""
+appenv "PSQL_READ_SCHEMA_S1=readers"
+reconcile
+if [ $RC = 0 ] && grep -q "nothing to reconcile" <<<"$OUT" && grep -q "ERROR: /local/permissions.env has no mapping; ignoring PSQL_\* from the environment: PSQL_READ_SCHEMA_S1" <<<"$OUT" && exists erin; then ok "an empty permissions file reconciles nothing and reports the mappings it set aside"; else bad "an empty permissions file reconciles nothing and reports the mappings it set aside"; fi
+docker exec "$DB" rm -f /local/permissions.env
+appenv ""
 reconcile
 if [ $RC = 0 ] && grep -q "nothing to reconcile" <<<"$OUT" && exists erin; then ok "with the PSQL_* configuration removed the run does nothing"; else bad "with the PSQL_* configuration removed the run does nothing"; fi
 
@@ -398,13 +478,13 @@ members readers; members writers; members temp
 BEFORE=$(snapshot)
 reconcile
 if [ $RC = 1 ] && grep -q "RECONCILE_ALLOW_EMPTY" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "every group empty at once is refused by default, nothing changes"; else bad "every group empty at once is refused by default, nothing changes"; fi
-config "$BASE_CONFIG
-RECONCILE_ALLOW_EMPTY=true"
+appenv "RECONCILE_ALLOW_EMPTY=true"
 reconcile
 if [ $RC = 0 ] && ! exists alice && ! exists erin && ! exists george && ! exists frank; then ok "with RECONCILE_ALLOW_EMPTY=true, every group empty drops every managed user"; else bad "with RECONCILE_ALLOW_EMPTY=true, every group empty drops every managed user"; fi
 if exists svc && exists handmade && exists app && exists postgres && exists ldap_managed; then ok "and leaves every unmanaged role"; else bad "and leaves every unmanaged role"; fi
 
 # First run with every group empty: the legacy users it would adopt are not dropped.
+appenv ""
 sql "DROP ROLE ldap_managed; CREATE ROLE legacy LOGIN; GRANT USAGE ON SCHEMA s1 TO legacy; GRANT SELECT ON s1.t_a TO legacy;" >/dev/null
 config "$BASE_CONFIG"
 BEFORE=$(snapshot)

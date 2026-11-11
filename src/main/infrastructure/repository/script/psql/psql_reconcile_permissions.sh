@@ -4,7 +4,11 @@
 # Replaces psql_users_add, psql_users_remove and psql_users_alter_group. Run at boot by
 # psql_configure.sh and hourly by cron.
 #
-# Configuration, from the environment (and /local/application.env, re-read every run):
+# Configuration, from the environment and /local/application.env (or APPLICATION_ENV_FILE),
+# all re-read every run. When the permissions file exists (/local/permissions.env, or
+# RECONCILE_PERMISSIONS_FILE), the mappings come from it alone, and it holds only the
+# PSQL_READ_SCHEMA_* and PSQL_WRITE_SCHEMA_* ones: PSQL_ALTER_GROUP_* applies only to a job
+# without the file, from the environment.
 #   PSQL_READ_SCHEMA_<SCHEMA>=g1,g2               read on a whole schema
 #   PSQL_READ_SCHEMA_<SCHEMA>_TABLE_<TABLE>=g1     read on one table
 #   PSQL_WRITE_SCHEMA_<SCHEMA>=g1                  write on a whole schema
@@ -37,17 +41,28 @@
 #
 # Exit status: 0 applied (or nothing to do), 1 configuration or LDAP error (nothing changed),
 # 2 database error (nothing changed), 3 applied except for the users reported as ERROR, or
-# with users DEFERRED to the next run by the time budget.
+# with users DEFERRED to the next run by the time budget. A permissions file with no mapping
+# is nothing to do (0), as no configuration is: the mappings it sets aside from the
+# environment are reported, never revoked in bulk.
 
-ENV_FILE="${RECONCILE_ENV_FILE:-/local/application.env}"
+ENV_FILE="${APPLICATION_ENV_FILE:-/local/application.env}"
+PERMISSIONS_FILE="${RECONCILE_PERMISSIONS_FILE:-/local/permissions.env}"
+ENV_FILE_REFUSED=false
 if [ -f "$ENV_FILE" ]; then
-	# Rendered at runtime by the scheduler; nothing to follow. Exported, so the PSQL_* lines in
-	# it count: the configuration below is read from the environment. Sourced before nounset:
-	# a rendered value with a stray $ must not abort the run before it can report.
-	set -a
-	# shellcheck source=/dev/null
-	. "$ENV_FILE"
-	set +a
+	# The permissions file is read as data (see below), never run, also through a link: not
+	# sourced here, and the run fails once it can report.
+	if [ "$(readlink -f "$ENV_FILE")" = "$(readlink -f "$PERMISSIONS_FILE")" ]; then
+		ENV_FILE_REFUSED=true
+	else
+		# Rendered at runtime by the job itself (an LDAP_HOST some jobs discover through
+		# Consul); nothing to follow. Exported, so what it sets counts: the configuration below
+		# is read from the environment. Sourced before nounset: a rendered value with a stray $
+		# must not abort the run before it can report.
+		set -a
+		# shellcheck source=/dev/null
+		. "$ENV_FILE"
+		set +a
+	fi
 fi
 
 set -u
@@ -86,6 +101,7 @@ fail() { # status message
 	report "$2"
 	exit "$1"
 }
+[ "$ENV_FILE_REFUSED" = false ] || fail 1 "APPLICATION_ENV_FILE names the permissions file ${PERMISSIONS_FILE}; nothing changed"
 # Superuser sessions resolve nothing from schemas other roles own (public belongs to the
 # database owner on 15+).
 export PGOPTIONS="${PGOPTIONS:-} -c search_path=pg_catalog"
@@ -107,8 +123,36 @@ esac
 log "start (source=${RECONCILE_SOURCE})"
 RUN_STARTED=$(date +%s)
 
+# The permissions file is data, not shell: the job renders it from its Nomad Variable
+# (infrastructure-database-permissions), which changes without a deploy. Only read and write
+# mappings to group names are taken from it; any other line (another setting, a group-role
+# mapping, a space, a quote, a $) stops the run before anything changes. Once it exists it is the only source of mappings: a
+# PSQL_* left in the environment or /local/application.env would never be revoked from here.
+if [ -f "$PERMISSIONS_FILE" ]; then
+	# One read: the accepted lines, or only the number of the first other line.
+	if ! PERMISSIONS=$(awk '
+		/^[ \t]*(#|$)/ { next }
+		/^PSQL_(READ|WRITE)_SCHEMA_[A-Za-z0-9_]+=[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$/ { accepted[++count] = $0; next }
+		{ bad = FNR; exit }
+		END { if (bad) { print bad; exit 1 } for (line = 1; line <= count; line++) print accepted[line] }' "$PERMISSIONS_FILE"); then
+		fail 1 "${PERMISSIONS_FILE}: line ${PERMISSIONS:-?} is not a PSQL_READ_SCHEMA_* or PSQL_WRITE_SCHEMA_* mapping to group names; nothing changed"
+	fi
+	# Named, so the first run after a migration shows what the file replaced; a file with no
+	# mapping next to an environment that has some is reported, not only logged.
+	# Mapping keys only: psql's own PSQL_HISTORY, PSQL_PAGER... are not configuration.
+	IGNORED=$(env | sed -nE 's/^(PSQL_((READ|WRITE)_SCHEMA|ALTER_GROUP)_[A-Za-z0-9_]+)=.*/\1/p' | LC_ALL=C sort -u | tr '\n' ' ')
+	if [ -n "$IGNORED" ] && [ -z "$PERMISSIONS" ]; then
+		report "${PERMISSIONS_FILE} has no mapping; ignoring PSQL_* from the environment: ${IGNORED% }"
+	elif [ -n "$IGNORED" ]; then
+		log "ignoring PSQL_* from the environment, ${PERMISSIONS_FILE} is the only source: ${IGNORED% }"
+	fi
+	CONFIG_LINES=$PERMISSIONS
+else
+	CONFIG_LINES=$(env)
+fi
+
 # The desired configuration. A key splits at its first _TABLE_.
-CONFIG_SPEC=$(env | awk -F= -v alter="$SKIP_ALTER_GROUP" '
+CONFIG_SPEC=$(printf '%s\n' "$CONFIG_LINES" | awk -F= -v alter="$SKIP_ALTER_GROUP" '
 	function emit(kind, object, table, value,    group_count, group_names, position, group_name, emitted) {
 		emitted = 0
 		group_count = split(value, group_names, ",")
@@ -128,6 +172,8 @@ CONFIG_SPEC=$(env | awk -F= -v alter="$SKIP_ALTER_GROUP" '
 		table = ""
 		separator = index(key, "_TABLE_")
 		if (separator > 0) { table = substr(key, separator + 7); key = substr(key, 1, separator - 1) }
+		# An empty table would read as no table: the whole schema.
+		if (separator > 0 && table == "") { printf "notable\t%s\t-\t-\n", tolower(key); next }
 		emit(kind, key, table, value)
 	}
 	/^PSQL_ALTER_GROUP_/ && alter == "false" {
@@ -142,6 +188,7 @@ if [ -z "$CONFIG_SPEC" ]; then
 fi
 BAD=$(printf '%s\n' "$CONFIG_SPEC" | awk -F'\t' '
 	$1 == "empty" { print "a PSQL_* variable for " $2 ($3 != "" ? "." $3 : "") " names no LDAP group"; next }
+	$1 == "notable" { print "a PSQL_* _TABLE_ variable for " $2 " names no table"; next }
 	($1 == "read" || $1 == "write") && ($2 ~ /^pg_/ || $2 == "information_schema" || $2 == "ldap_reconcile") { print "system schema " $2 " cannot be configured"; next }
 	$2 !~ /^[a-z_][a-z0-9_]*$/ || ($3 != "" && $3 !~ /^[a-z_][a-z0-9_]*$/) || $4 !~ /^[A-Za-z0-9._-]+$/ { print }
 	')

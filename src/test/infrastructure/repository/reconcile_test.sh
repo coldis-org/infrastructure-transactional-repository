@@ -282,24 +282,26 @@ if [ $RC = 0 ] && ! grep -q "DEFERRED" <<<"$OUT" && grep -qE "done: .* in [0-9]+
 # Sequences and functions follow the schema level.
 if [ "$(sql "SELECT has_sequence_privilege('alice', 's1.q', 'SELECT') AND NOT has_sequence_privilege('alice', 's1.q', 'UPDATE') AND has_function_privilege('alice', 's1.f()', 'EXECUTE')")" = t ]; then ok "readers get SELECT on the schema's sequences and EXECUTE on its functions"; else bad "readers get SELECT on the schema's sequences and EXECUTE on its functions"; fi
 
-# Group roles (PSQL_ALTER_GROUP_*), when enabled.
+# Group roles (PSQL_ALTER_GROUP_*), when enabled: from the environment, for a job without the
+# permissions file, which takes read and write mappings only.
 sql "CREATE ROLE grp NOLOGIN" >/dev/null
-config "$BASE_CONFIG
-PSQL_ALTER_GROUP_GRP=readers"
-appenv "SKIP_ALTER_GROUP=false"
+docker exec "$DB" rm -f /local/permissions.env
+appenv "$BASE_CONFIG
+PSQL_ALTER_GROUP_GRP=readers
+SKIP_ALTER_GROUP=false"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = t ]; then ok "PSQL_ALTER_GROUP_GRP makes the group's managed users members of grp"; else bad "PSQL_ALTER_GROUP_GRP makes the group's managed users members of grp"; fi
-config "$BASE_CONFIG"
-appenv ""
+appenv "$BASE_CONFIG"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = t ]; then ok "with the mapping removed and SKIP_ALTER_GROUP back on, membership is left alone"; else bad "with the mapping removed and SKIP_ALTER_GROUP back on, membership is left alone"; fi
-config "$BASE_CONFIG
-PSQL_ALTER_GROUP_GRP=writers"
-appenv "SKIP_ALTER_GROUP=false"
+appenv "$BASE_CONFIG
+PSQL_ALTER_GROUP_GRP=writers
+SKIP_ALTER_GROUP=false"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = f ]; then ok "a user leaving the mapped LDAP group leaves grp"; else bad "a user leaving the mapped LDAP group leaves grp"; fi
-config "$BASE_CONFIG
-PSQL_ALTER_GROUP_GRP=staff"
+appenv "$BASE_CONFIG
+PSQL_ALTER_GROUP_GRP=staff
+SKIP_ALTER_GROUP=false"
 reconcile
 if [ $RC = 0 ] && [ "$(sql "SELECT pg_has_role('alice', 'grp', 'MEMBER')")" = t ] && ! exists henry; then ok "an alter-group mapping adds users who have a permission, and creates no one (henry is only in it)"; else bad "an alter-group mapping adds users who have a permission, and creates no one (henry is only in it)"; fi
 members readers alice erin carol jane.doe; reconcile
@@ -329,7 +331,7 @@ if docker logs "$DB" 2>&1 | grep -qE "(WARNING|AVISO): +psql_reconcile_permissio
 config "$BASE_CONFIG
 PSQL_READ_SCHEMA_S2="
 reconcile
-if [ $RC = 1 ] && grep -q "line 4 is not a PSQL_\* mapping" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a mapping naming no group in the permissions file stops the run, nothing changes"; else bad "a mapping naming no group in the permissions file stops the run, nothing changes"; fi
+if [ $RC = 1 ] && grep -q "line 4 is not a PSQL_READ_SCHEMA_\* or PSQL_WRITE_SCHEMA_\* mapping" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a mapping naming no group in the permissions file stops the run, nothing changes"; else bad "a mapping naming no group in the permissions file stops the run, nothing changes"; fi
 # The same from the environment (a job without the file) stops at the configuration check.
 docker exec "$DB" rm -f /local/permissions.env
 appenv "$BASE_CONFIG
@@ -337,6 +339,11 @@ PSQL_READ_SCHEMA_S2="
 reconcile
 if [ $RC = 1 ] && grep -q "names no LDAP group" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a PSQL_* variable naming no group in the environment stops the run, nothing changes"; else bad "a PSQL_* variable naming no group in the environment stops the run, nothing changes"; fi
 appenv ""
+# A _TABLE_ key with no table name is refused, not read as the whole schema.
+config "$BASE_CONFIG
+PSQL_WRITE_SCHEMA_S1_TABLE_=readers"
+reconcile
+if [ $RC = 1 ] && grep -q "s1 names no table" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ]; then ok "a _TABLE_ key naming no table stops the run, nothing changes"; else bad "a _TABLE_ key naming no table stops the run, nothing changes"; fi
 
 config "$BASE_CONFIG
 PSQL_READ_SCHEMA_S2=gon"
@@ -357,11 +364,12 @@ if [ $RC = 1 ] && [ "$(snapshot)" = "$BEFORE" ]; then ok "a system schema cannot
 # the run, nothing in it runs, and nothing changes.
 # shellcheck disable=SC2016  # the $(...) are the payload, written literally
 for bad_line in 'LDAP_HOST=nowhere.invalid:389' 'X=$(touch /tmp/pwned)' 'PSQL_READ_SCHEMA_S1=readers$(touch /tmp/pwned)' \
-	'PSQL_READ_SCHEMA_S1=readers;touch /tmp/pwned' 'PSQL_READ_SCHEMA_S1=readers, temp' 'export PSQL_READ_SCHEMA_S1=readers'; do
+	'PSQL_READ_SCHEMA_S1=readers;touch /tmp/pwned' 'PSQL_READ_SCHEMA_S1=readers, temp' 'export PSQL_READ_SCHEMA_S1=readers' \
+	'PSQL_ALTER_GROUP_GRP=readers'; do
 	config "$BASE_CONFIG
 $bad_line"
 	reconcile
-	if [ $RC = 1 ] && grep -q "/local/permissions.env: line 4 is not a PSQL_\* mapping" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] \
+	if [ $RC = 1 ] && grep -q "/local/permissions.env: line 4 is not a PSQL_READ_SCHEMA_\* or PSQL_WRITE_SCHEMA_\* mapping" <<<"$OUT" && [ "$(snapshot)" = "$BEFORE" ] \
 		&& ! docker exec "$DB" test -e /tmp/pwned; then ok "permissions file line refused, nothing runs or changes: $bad_line"; else bad "permissions file line refused, nothing runs or changes: $bad_line"; fi
 done
 # Nor as the sourced settings file: APPLICATION_ENV_FILE naming it, even through a link, stops
@@ -382,9 +390,10 @@ BEFORE=$(snapshot)
 for target in POSTGRES DANGER APP OWNERGRP; do
 	target_role=$(tr '[:upper:]' '[:lower:]' <<<"$target")
 	MEMBERSHIP_BEFORE=$(sql "SELECT string_agg(member::regrole::text, ',' ORDER BY 1) FROM pg_auth_members WHERE roleid = '$target_role'::regrole")
-	config "$BASE_CONFIG
-PSQL_ALTER_GROUP_$target=readers"
-	appenv "SKIP_ALTER_GROUP=false"
+	docker exec "$DB" rm -f /local/permissions.env
+	appenv "$BASE_CONFIG
+PSQL_ALTER_GROUP_$target=readers
+SKIP_ALTER_GROUP=false"
 	reconcile
 	if [ $RC = 3 ] && grep -q "privileged or a login role" <<<"$OUT" && [ "$(sql "SELECT string_agg(member::regrole::text, ',' ORDER BY 1) FROM pg_auth_members WHERE roleid = '$target_role'::regrole")" = "$MEMBERSHIP_BEFORE" ]; then ok "a privileged or login group role ($target) is refused (ERROR), its membership untouched"; else bad "a privileged or login group role ($target) is refused (ERROR), its membership untouched"; fi
 done

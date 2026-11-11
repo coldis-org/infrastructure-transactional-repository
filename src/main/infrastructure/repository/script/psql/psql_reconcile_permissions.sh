@@ -6,7 +6,9 @@
 #
 # Configuration, from the environment and /local/application.env (or APPLICATION_ENV_FILE),
 # all re-read every run. When the permissions file exists (/local/permissions.env, or
-# RECONCILE_PERMISSIONS_FILE), the PSQL_* mappings come from it alone:
+# RECONCILE_PERMISSIONS_FILE), the mappings come from it alone, and it holds only the
+# PSQL_READ_SCHEMA_* and PSQL_WRITE_SCHEMA_* ones: PSQL_ALTER_GROUP_* applies only to a job
+# without the file, from the environment.
 #   PSQL_READ_SCHEMA_<SCHEMA>=g1,g2               read on a whole schema
 #   PSQL_READ_SCHEMA_<SCHEMA>_TABLE_<TABLE>=g1     read on one table
 #   PSQL_WRITE_SCHEMA_<SCHEMA>=g1                  write on a whole schema
@@ -122,18 +124,18 @@ log "start (source=${RECONCILE_SOURCE})"
 RUN_STARTED=$(date +%s)
 
 # The permissions file is data, not shell: the job renders it from its Nomad Variable
-# (infrastructure-database-permissions), which changes without a deploy. Only PSQL_* mappings
-# to group names are taken from it; any other line (another setting, a space, a quote, a $)
-# stops the run before anything changes. Once it exists it is the only source of mappings: a
+# (infrastructure-database-permissions), which changes without a deploy. Only read and write
+# mappings to group names are taken from it; any other line (another setting, a group-role
+# mapping, a space, a quote, a $) stops the run before anything changes. Once it exists it is the only source of mappings: a
 # PSQL_* left in the environment or /local/application.env would never be revoked from here.
 if [ -f "$PERMISSIONS_FILE" ]; then
 	# One read: the accepted lines, or only the number of the first other line.
 	if ! PERMISSIONS=$(awk '
 		/^[ \t]*(#|$)/ { next }
-		/^PSQL_((READ|WRITE)_SCHEMA|ALTER_GROUP)_[A-Za-z0-9_]+=[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$/ { accepted[++count] = $0; next }
+		/^PSQL_(READ|WRITE)_SCHEMA_[A-Za-z0-9_]+=[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$/ { accepted[++count] = $0; next }
 		{ bad = FNR; exit }
 		END { if (bad) { print bad; exit 1 } for (line = 1; line <= count; line++) print accepted[line] }' "$PERMISSIONS_FILE"); then
-		fail 1 "${PERMISSIONS_FILE}: line ${PERMISSIONS:-?} is not a PSQL_* mapping to group names; nothing changed"
+		fail 1 "${PERMISSIONS_FILE}: line ${PERMISSIONS:-?} is not a PSQL_READ_SCHEMA_* or PSQL_WRITE_SCHEMA_* mapping to group names; nothing changed"
 	fi
 	# Named, so the first run after a migration shows what the file replaced; a file with no
 	# mapping next to an environment that has some is reported, not only logged.
@@ -170,6 +172,8 @@ CONFIG_SPEC=$(printf '%s\n' "$CONFIG_LINES" | awk -F= -v alter="$SKIP_ALTER_GROU
 		table = ""
 		separator = index(key, "_TABLE_")
 		if (separator > 0) { table = substr(key, separator + 7); key = substr(key, 1, separator - 1) }
+		# An empty table would read as no table: the whole schema.
+		if (separator > 0 && table == "") { printf "notable\t%s\t-\t-\n", tolower(key); next }
 		emit(kind, key, table, value)
 	}
 	/^PSQL_ALTER_GROUP_/ && alter == "false" {
@@ -184,6 +188,7 @@ if [ -z "$CONFIG_SPEC" ]; then
 fi
 BAD=$(printf '%s\n' "$CONFIG_SPEC" | awk -F'\t' '
 	$1 == "empty" { print "a PSQL_* variable for " $2 ($3 != "" ? "." $3 : "") " names no LDAP group"; next }
+	$1 == "notable" { print "a PSQL_* _TABLE_ variable for " $2 " names no table"; next }
 	($1 == "read" || $1 == "write") && ($2 ~ /^pg_/ || $2 == "information_schema" || $2 == "ldap_reconcile") { print "system schema " $2 " cannot be configured"; next }
 	$2 !~ /^[a-z_][a-z0-9_]*$/ || ($3 != "" && $3 !~ /^[a-z_][a-z0-9_]*$/) || $4 !~ /^[A-Za-z0-9._-]+$/ { print }
 	')

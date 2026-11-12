@@ -110,7 +110,10 @@ primary_setting() {
 
 # The two that size memory go in before the tuner budgets it. MAX_LOCKS_PER_TRANSACTION_MIN is
 # its last clamp, so the floor wins over a lower maximum. Only tuners from the 7.1.0 base size the
-# lock table; older ones fix it at 16384 on both sides, and that floor does nothing there.
+# lock table; older ones (Dockerfile5/6) fix max_locks_per_transaction at 16384 on both sides, so
+# that floor does nothing there, but the connections floor still applies and grows the 16384-row
+# lock table with them, unbudgeted: a replica too small for that fails at shared memory allocation
+# rather than with PostgreSQL's "insufficient parameter settings" (it did not start before either).
 PRIMARY_MAX_CONNECTIONS=$(primary_setting max_connections)
 PRIMARY_MAX_LOCKS_PER_TRANSACTION=$(primary_setting max_locks_per_xact)
 echo "Primary recorded max_connections=${PRIMARY_MAX_CONNECTIONS} max_locks_per_transaction=${PRIMARY_MAX_LOCKS_PER_TRANSACTION}"

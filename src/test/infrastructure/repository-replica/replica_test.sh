@@ -93,6 +93,7 @@ if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" =
 REPLICA_CONNECTIONS=$(setting "$REPLICA" max_connections)
 REPLICA_WORKERS=$(setting "$REPLICA" max_worker_processes)
 REPLICA_LOCKS=$(setting "$REPLICA" max_locks_per_transaction)
+if docker logs "$REPLICA" 2>&1 | grep -q "Reserving [0-9]* MB more for the lock rows"; then ok "the extra workers' lock rows are budgeted before tuning"; else bad "the extra workers' lock rows are budgeted before tuning"; fi
 if [ "${REPLICA_CONNECTIONS:-0}" -ge "$PRIMARY_CONNECTIONS" ] && [ "${REPLICA_WORKERS:-0}" -ge "$PRIMARY_WORKERS" ] && [ "${REPLICA_LOCKS:-0}" -ge "$PRIMARY_LOCKS" ]; then ok "its settings are raised to the primary's ($REPLICA_CONNECTIONS/$REPLICA_WORKERS/$REPLICA_LOCKS)"; else bad "its settings are raised to the primary's (got ${REPLICA_CONNECTIONS:-?}/${REPLICA_WORKERS:-?}/${REPLICA_LOCKS:-?})"; fi
 
 # 3. Data replicates.
@@ -112,7 +113,13 @@ for iteration in $(seq 15); do [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")
 docker restart -t 20 "$REPLICA" >/dev/null
 if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = f ] && [ "$(setting "$REPLICA" max_connections)" = 100 ]; then ok "a promoted replica restarts tuned from its own size"; else bad "a promoted replica restarts tuned from its own size (max_connections=$(setting "$REPLICA" max_connections))"; fi
 
-# 6. A replica whose memory cannot hold the primary's lock table stops with the sizes.
+# 6. A replica where the extra workers' lock rows would eat into the reserve the tuner keeps free
+# stops, instead of starting with no headroom and being killed by the kernel later.
+start_replica "$IMAGE" 524288 replica_tight
+wait_stopped "$REPLICA"
+if [ "$(docker inspect -f '{{.State.ExitCode}}' "$REPLICA")" = 1 ] && docker logs "$REPLICA" 2>&1 | grep -q "Not enough memory: max_locks_per_transaction=$PRIMARY_LOCKS.*kept free"; then ok "a replica whose reserve the extra workers would eat stops and says why"; else bad "a replica whose reserve the extra workers would eat stops and says why"; fi
+
+# 7. A replica whose memory cannot hold the primary's lock table stops with the sizes.
 start_replica "$IMAGE" 262144 replica_tiny
 wait_stopped "$REPLICA"
 if [ "$(docker inspect -f '{{.State.ExitCode}}' "$REPLICA")" = 1 ] && docker logs "$REPLICA" 2>&1 | grep -q "Not enough memory: max_locks_per_transaction=$PRIMARY_LOCKS"; then ok "a replica too small for the lock table stops and says why"; else bad "a replica too small for the lock table stops and says why"; fi

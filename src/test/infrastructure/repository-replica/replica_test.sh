@@ -127,11 +127,13 @@ for iteration in $(seq 15); do [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")
 docker restart -t 20 "$REPLICA" >/dev/null
 if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = f ] && [ "$(setting "$REPLICA" max_connections)" = 100 ]; then ok "a promoted replica restarts tuned from its own size"; else bad "a promoted replica restarts tuned from its own size (max_connections=$(setting "$REPLICA" max_connections))"; fi
 
-# 7. A replica where the extra slots' lock rows would eat into the reserve the tuner keeps free
-# stops, instead of starting with no headroom and being killed by the kernel later.
+# 7. A replica that fits the lock table only by taking the extra slots' rows out of the reserve the
+# tuner keeps free stops (the tuner makes room in the other settings, which then fall below their
+# minimums), instead of starting with no headroom and being killed by the kernel later. Before the
+# reservation, this size started.
 start_replica "$IMAGE" 524288 replica_tight
 wait_stopped "$REPLICA"
-if [ "$(docker inspect -f '{{.State.ExitCode}}' "$REPLICA")" = 1 ] && docker logs "$REPLICA" 2>&1 | grep -q "Not enough memory: max_locks_per_transaction=$PRIMARY_LOCKS.*kept free"; then ok "a replica whose reserve the extra workers would eat stops and says why"; else bad "a replica whose reserve the extra workers would eat stops and says why"; fi
+if [ "$(docker inspect -f '{{.State.ExitCode}}' "$REPLICA")" = 1 ] && docker logs "$REPLICA" 2>&1 | grep -q "Not enough memory: max_locks_per_transaction=$PRIMARY_LOCKS.*kept free"; then ok "a replica that could only start by eating its reserve stops and says why"; else bad "a replica that could only start by eating its reserve stops and says why"; fi
 
 # 8. A replica whose memory cannot hold the primary's lock table stops with the sizes.
 start_replica "$IMAGE" 262144 replica_tiny

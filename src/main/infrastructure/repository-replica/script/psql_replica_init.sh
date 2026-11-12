@@ -186,13 +186,14 @@ then
 fi
 
 # A lock table larger than the memory leaves the tuner nothing for the rest, and it goes on below
-# zero rather than failing, so Postgres would stop at whichever value broke its minimum first, or
-# the extra rows would eat into the reserve. Either way, stop here with the sizes.
+# zero rather than failing, so Postgres would stop at whichever value broke its minimum first. The
+# reserve itself needs no check: the tuner only stops once it keeps MIN_RESERVED_MEMORY, which
+# already includes the extra rows, so a replica that cannot afford them ends up here, with the other
+# settings shrunk below their minimums. Stop with the sizes.
 if [ -n "${MAX_LOCKS_PER_TRANSACTION}" ]
 then
 	EXTRA_LOCKS_MEMORY=$(( EXTRA_LOCK_SLOTS * MAX_LOCKS_PER_TRANSACTION * 3 / 4 ))
-	if [ ${SHARED_BUFFERS} -lt 128 ] || [ ${WORK_MEM} -lt 64 ] || [ ${MAINTENANCE_WORK_MEM} -lt 1024 ] \
-		|| [ $(( ACTUAL_RESERVED_MEMORY - EXTRA_LOCKS_MEMORY )) -lt ${RESERVED_MEMORY_FLOOR} ]
+	if [ ${SHARED_BUFFERS} -lt 128 ] || [ ${WORK_MEM} -lt 64 ] || [ ${MAINTENANCE_WORK_MEM} -lt 1024 ]
 	then
 		echo "Not enough memory: max_locks_per_transaction=${MAX_LOCKS_PER_TRANSACTION} over $(( MAX_CONNECTIONS + EXTRA_LOCK_SLOTS )) slots takes $(( (TOTAL_LOCKS_MEMORY + EXTRA_LOCKS_MEMORY) / 1024 )) MB of lock table, out of $(( MAX_MEMORY / 1024 )) MB with $(( RESERVED_MEMORY_FLOOR / 1024 )) MB kept free. Give the replica more memory, or the primary a lower max_locks_per_transaction."
 		exit 1

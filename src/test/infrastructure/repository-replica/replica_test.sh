@@ -60,9 +60,10 @@ cleanup
 docker network create "$NET" >/dev/null || exit 2
 echo "== $IMAGE against a primary from $PRIMARY_IMAGE"
 
-# A primary sized from 16 CPUs, 2 GB and 400 connections. Its first boot keeps PostgreSQL's own
-# pg_hba.conf, which has no replication rule for other hosts, so the test adds one.
-docker run -d --name "$PRIMARY" --network "$NET" -e MAX_CPU=16 -e MAX_MEMORY=2097152 -e MAX_CONNECTIONS=400 \
+# A primary sized from 16 CPUs, 2 GB and 400 connections, with twice the replicas' share of WAL
+# senders (10% of connections against 5%). Its first boot keeps PostgreSQL's own pg_hba.conf,
+# which has no replication rule for other hosts, so the test adds one.
+docker run -d --name "$PRIMARY" --network "$NET" -e MAX_CPU=16 -e MAX_MEMORY=2097152 -e MAX_CONNECTIONS=400 -e MAX_WAL_SENDERS_CONN_PERC=10 \
 	-e POSTGRES_REPLICATOR_USER=replicator -e POSTGRES_REPLICATOR_PASSWORD="$REPLICATOR_PASSWORD" \
 	"$PRIMARY_IMAGE" >/dev/null || exit 2
 wait_ready "$PRIMARY" || { echo "primary did not start"; docker logs "$PRIMARY" 2>&1 | tail -5; exit 2; }
@@ -77,8 +78,9 @@ sql "$PRIMARY" "CREATE TABLE replica_test_marker(v text); INSERT INTO replica_te
 PRIMARY_CONNECTIONS=$(setting "$PRIMARY" max_connections)
 PRIMARY_WORKERS=$(setting "$PRIMARY" max_worker_processes)
 PRIMARY_LOCKS=$(setting "$PRIMARY" max_locks_per_transaction)
-echo "primary: max_connections=$PRIMARY_CONNECTIONS max_worker_processes=$PRIMARY_WORKERS max_locks_per_transaction=$PRIMARY_LOCKS"
-if [ "$PRIMARY_CONNECTIONS" -gt 100 ] && [ "$PRIMARY_WORKERS" -gt 10 ]; then ok "the primary is sized larger than the replicas"; else bad "the primary is sized larger than the replicas"; fi
+PRIMARY_SENDERS=$(setting "$PRIMARY" max_wal_senders)
+echo "primary: max_connections=$PRIMARY_CONNECTIONS max_worker_processes=$PRIMARY_WORKERS max_locks_per_transaction=$PRIMARY_LOCKS max_wal_senders=$PRIMARY_SENDERS"
+if [ "$PRIMARY_CONNECTIONS" -gt 100 ] && [ "$PRIMARY_WORKERS" -gt 10 ] && [ "$PRIMARY_SENDERS" -gt 20 ]; then ok "the primary is sized larger than the replicas"; else bad "the primary is sized larger than the replicas"; fi
 
 # 1. Before this change, a small replica refuses to start.
 if [ -n "$IMAGE_BEFORE" ]; then
@@ -93,8 +95,9 @@ if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" =
 REPLICA_CONNECTIONS=$(setting "$REPLICA" max_connections)
 REPLICA_WORKERS=$(setting "$REPLICA" max_worker_processes)
 REPLICA_LOCKS=$(setting "$REPLICA" max_locks_per_transaction)
+REPLICA_SENDERS=$(setting "$REPLICA" max_wal_senders)
 if docker logs "$REPLICA" 2>&1 | grep -q "Reserving [0-9]* MB more for the lock rows"; then ok "the extra workers' lock rows are budgeted before tuning"; else bad "the extra workers' lock rows are budgeted before tuning"; fi
-if [ "${REPLICA_CONNECTIONS:-0}" -ge "$PRIMARY_CONNECTIONS" ] && [ "${REPLICA_WORKERS:-0}" -ge "$PRIMARY_WORKERS" ] && [ "${REPLICA_LOCKS:-0}" -ge "$PRIMARY_LOCKS" ]; then ok "its settings are raised to the primary's ($REPLICA_CONNECTIONS/$REPLICA_WORKERS/$REPLICA_LOCKS)"; else bad "its settings are raised to the primary's (got ${REPLICA_CONNECTIONS:-?}/${REPLICA_WORKERS:-?}/${REPLICA_LOCKS:-?})"; fi
+if [ "${REPLICA_CONNECTIONS:-0}" -ge "$PRIMARY_CONNECTIONS" ] && [ "${REPLICA_WORKERS:-0}" -ge "$PRIMARY_WORKERS" ] && [ "${REPLICA_LOCKS:-0}" -ge "$PRIMARY_LOCKS" ] && [ "${REPLICA_SENDERS:-0}" -ge "$PRIMARY_SENDERS" ]; then ok "its settings are raised to the primary's ($REPLICA_CONNECTIONS/$REPLICA_WORKERS/$REPLICA_LOCKS/$REPLICA_SENDERS)"; else bad "its settings are raised to the primary's (got ${REPLICA_CONNECTIONS:-?}/${REPLICA_WORKERS:-?}/${REPLICA_LOCKS:-?}/${REPLICA_SENDERS:-?})"; fi
 
 # 3. Data replicates.
 sql "$PRIMARY" "INSERT INTO replica_test_marker VALUES ('streamed');" >/dev/null
@@ -106,20 +109,31 @@ if [ "$(sql "$REPLICA" "SELECT string_agg(v, ',' ORDER BY v) FROM replica_test_m
 docker restart -t 20 "$REPLICA" >/dev/null
 if wait_ready "$REPLICA" && [ "$(setting "$REPLICA" max_worker_processes)" = "$REPLICA_WORKERS" ] && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = t ]; then ok "after a restart the replica is still a standby with the primary's values"; else bad "after a restart the replica is still a standby with the primary's values"; fi
 
-# 5. Once promoted, it is tuned from its own size again.
+# 5. The primary raises max_prepared_transactions while the replica runs (the replica's
+# postgresql.conf came with its base backup and still says 0). The replica replays the change into
+# its pg_control; after a restart it must take the primary's value, or it would not start.
+sql "$PRIMARY" "ALTER SYSTEM SET max_prepared_transactions = 20" >/dev/null
+docker restart -t 20 "$PRIMARY" >/dev/null
+wait_ready "$PRIMARY"
+# shellcheck disable=SC2034  # iteration only counts the retries
+for iteration in $(seq 60); do docker exec "$REPLICA" sh -c 'LC_ALL=C pg_controldata "$PGDATA"' 2>/dev/null | grep -q "max_prepared_xacts setting: *20" && break; sleep 2; done
+docker restart -t 20 "$REPLICA" >/dev/null
+if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = t ] && [ "$(setting "$REPLICA" max_prepared_transactions)" = 20 ]; then ok "a primary that raises max_prepared_transactions later is followed after a restart"; else bad "a primary that raises max_prepared_transactions later is followed after a restart"; docker logs "$REPLICA" 2>&1 | grep -E "FATAL|insufficient|Raising" | tail -3 | sed 's/^/    log: /'; fi
+
+# 6. Once promoted, it is tuned from its own size again.
 sql "$REPLICA" "SELECT pg_promote()" >/dev/null
 # shellcheck disable=SC2034  # iteration only counts the retries
 for iteration in $(seq 15); do [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = f ] && break; sleep 1; done
 docker restart -t 20 "$REPLICA" >/dev/null
 if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = f ] && [ "$(setting "$REPLICA" max_connections)" = 100 ]; then ok "a promoted replica restarts tuned from its own size"; else bad "a promoted replica restarts tuned from its own size (max_connections=$(setting "$REPLICA" max_connections))"; fi
 
-# 6. A replica where the extra workers' lock rows would eat into the reserve the tuner keeps free
+# 7. A replica where the extra slots' lock rows would eat into the reserve the tuner keeps free
 # stops, instead of starting with no headroom and being killed by the kernel later.
 start_replica "$IMAGE" 524288 replica_tight
 wait_stopped "$REPLICA"
 if [ "$(docker inspect -f '{{.State.ExitCode}}' "$REPLICA")" = 1 ] && docker logs "$REPLICA" 2>&1 | grep -q "Not enough memory: max_locks_per_transaction=$PRIMARY_LOCKS.*kept free"; then ok "a replica whose reserve the extra workers would eat stops and says why"; else bad "a replica whose reserve the extra workers would eat stops and says why"; fi
 
-# 7. A replica whose memory cannot hold the primary's lock table stops with the sizes.
+# 8. A replica whose memory cannot hold the primary's lock table stops with the sizes.
 start_replica "$IMAGE" 262144 replica_tiny
 wait_stopped "$REPLICA"
 if [ "$(docker inspect -f '{{.State.ExitCode}}' "$REPLICA")" = 1 ] && docker logs "$REPLICA" 2>&1 | grep -q "Not enough memory: max_locks_per_transaction=$PRIMARY_LOCKS"; then ok "a replica too small for the lock table stops and says why"; else bad "a replica too small for the lock table stops and says why"; fi

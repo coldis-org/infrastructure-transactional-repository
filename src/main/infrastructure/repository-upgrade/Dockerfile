@@ -29,7 +29,10 @@
 # refuses the image's own file. And before 7.0.2 the lock tables did not follow the available
 # memory, so this asks for gigabytes of shared memory on a small deployment and is killed by the
 # kernel right after migrating.
-FROM coldis/infrastructure-transactional-repository:7.1.0
+#
+# 7.2.0 is PostgreSQL 18.7, so a migration lands on the newest minor rather than on one a
+# routine deployment replaces right after.
+FROM coldis/infrastructure-transactional-repository:7.2.0
 
 # Copies the migration scripts, which the repository image does not carry: it holds no
 # migration code at all, so a database can never migrate itself by accident.

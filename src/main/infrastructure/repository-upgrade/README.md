@@ -236,7 +236,7 @@ database unavailable, and `REINDEX CONCURRENTLY` needs room for a second copy of
 leaves invalid ones behind when it fails.
 
 The plain `postgres:18` tag is trixie (glibc 2.41) while 14 to 17 are bookworm (glibc 2.36),
-which is why `repository/Dockerfile7` names `postgres:18.6-bookworm`. Keep the suffix on every
+which is why `repository/Dockerfile7` names `postgres:18.7-bookworm`. Keep the suffix on every
 version this repository builds — it has to survive each minor bump, and dropping it is invisible
 until a text index stops finding a row — and look again before adopting a major whose bookworm
 variant upstream has stopped publishing: that is the release where this stops being free, and the
@@ -245,9 +245,9 @@ reindex becomes part of the window rather than something the image avoids.
 **Every published 7.0.0 to 7.0.3 is trixie; 7.1.0 is the first bookworm build.** The suffix was
 added here, so the releases before it carry glibc 2.41. Two consequences:
 
-- Migrating from 14 to 17 needs **7.1.0 or newer**, which is what this module pins. An earlier
-  7.0.x as the destination is the glibc crossing described above, with none of the warning signs
-  an operator would notice during the window.
+- Migrating from 14 to 17 needs **7.1.0 or newer**; this module pins 7.2.0 (PostgreSQL 18.7). An
+  earlier 7.0.x as the destination is the glibc crossing described above, with none of the warning
+  signs an operator would notice during the window.
 - **PostgreSQL 12 and 13 are the exception the destination cannot fix.** Their images are older
   than bookworm, so their data was written under glibc 2.28 or 2.31 and reaches 2.36 whatever
   this module migrates to. Plan the `REINDEX` and the `ALTER DATABASE ... REFRESH COLLATION

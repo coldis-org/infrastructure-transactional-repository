@@ -16,7 +16,7 @@ All under `src/main/infrastructure/`.
 
 | Path | Holds |
 |------|-------|
-| `repository/Dockerfile3` .. `Dockerfile7` | PostgreSQL 14, 15, 16, 17, 18 (`postgres:18.6-bookworm` in `Dockerfile7`) |
+| `repository/Dockerfile3` .. `Dockerfile7` | PostgreSQL 14, 15, 16, 17, 18 (`postgres:18.7-bookworm` in `Dockerfile7`) |
 | `repository/conf/` | `postgresql.conf`, `pg_hba.conf` (copied to `/tmp`, put into `PGDATA` at boot) |
 | `repository/script/psql/` | `psql_init` (entrypoint), `psql_configure`, `psql_tune_cmd`, `psql_relocate`, `psql_update_conn`, `psql_reconcile_permissions` (+ `sql/`, `psql_install_reconcile`, `psql_users_add` entry point) |
 | `repository/cron/cron_job` | Hourly LDAP permissions reconcile (`psql_reconcile_permissions.sh`, under flock) |

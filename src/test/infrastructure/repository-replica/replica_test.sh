@@ -16,7 +16,7 @@
 
 IMAGE=${1:?usage: replica_test.sh <replica-image> [replica-image-before]}
 IMAGE_BEFORE=${2:-}
-PRIMARY_IMAGE=${PRIMARY_IMAGE:-coldis/infrastructure-transactional-repository:7.1.0}
+PRIMARY_IMAGE=${PRIMARY_IMAGE:-coldis/infrastructure-transactional-repository:7.2.0}
 PREFIX=replica-test-$$
 NET=$PREFIX-net; PRIMARY=$PREFIX-primary; REPLICA=$PREFIX-replica
 # Test-only credential for the throwaway replication user.

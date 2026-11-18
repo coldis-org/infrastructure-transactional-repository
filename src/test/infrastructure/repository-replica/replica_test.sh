@@ -1,9 +1,10 @@
 #!/bin/bash
 
-# Tests for a replica smaller than its primary (psql_replica_init.sh). A standby refuses to start
-# when max_connections, max_worker_processes or max_locks_per_transaction is lower than on its
-# primary, and each side tunes them from its own MAX_CPU / MAX_MEMORY / MAX_CONNECTIONS. They run
-# on the host and drive a "big" primary and "small" replicas on a private network:
+# Tests for a replica smaller than its primary (psql_replica_init.sh) and for its health check
+# (psql_replica_check.sh). A standby refuses to start when max_connections, max_worker_processes or
+# max_locks_per_transaction is lower than on its primary, and each side tunes them from its own
+# MAX_CPU / MAX_MEMORY / MAX_CONNECTIONS. They run on the host and drive a "big" primary and
+# "small" replicas on a private network:
 #
 #   docker build -t replica-test -f src/main/infrastructure/repository-replica/Dockerfile7 \
 #     src/main/infrastructure/repository-replica
@@ -46,6 +47,13 @@ wait_ready() {
 wait_stopped() { timeout 120 docker wait "$1" >/dev/null 2>&1; }
 sql() { docker exec "$1" psql -X -U postgres -h 127.0.0.1 -tAc "$2" 2>/dev/null; }
 setting() { sql "$1" "SELECT current_setting('$2')"; }
+# Runs the health check the way a Nomad script check does (docker exec), with any further
+# arguments as docker exec options; prints "<exit code>|<output>".
+replica_check() { # container [docker-exec-option...]
+	local output
+	output=$(docker exec "${@:2}" "$1" /opt/psql-script/psql_replica_check.sh 2>&1)
+	echo "$?|${output}"
+}
 # Starts a small replica (2 CPUs, 100 connections, the given memory in kB) of the primary.
 start_replica() { # image memory-kb slot
 	docker rm -f -v "$REPLICA" >/dev/null 2>&1
@@ -105,6 +113,22 @@ sql "$PRIMARY" "INSERT INTO replica_test_marker VALUES ('streamed');" >/dev/null
 for iteration in $(seq 15); do [ "$(sql "$REPLICA" "SELECT count(*) FROM replica_test_marker")" = 2 ] && break; sleep 1; done
 if [ "$(sql "$REPLICA" "SELECT string_agg(v, ',' ORDER BY v) FROM replica_test_marker")" = "replicated,streamed" ]; then ok "the base backup and later writes reach the replica"; else bad "the base backup and later writes reach the replica"; fi
 
+# 3a. The health check passes while replay runs, and only warns (never asks for a restart) when
+# replay is paused by hand or its state cannot be read.
+CHECK=$(replica_check "$REPLICA")
+if [ "${CHECK%%|*}" = 0 ]; then ok "check: a streaming replica passes"; else bad "check: a streaming replica passes (got $CHECK)"; fi
+sql "$REPLICA" "SELECT pg_wal_replay_pause()" >/dev/null
+CHECK=$(replica_check "$REPLICA")
+if [ "${CHECK%%|*}" = 1 ] && [[ $CHECK == *"a restart would not help"* ]]; then ok "check: replay paused by hand warns, without a restart"; else bad "check: replay paused by hand warns, without a restart (got $CHECK)"; fi
+sql "$REPLICA" "SELECT pg_wal_replay_resume()" >/dev/null
+CHECK=$(replica_check "$REPLICA")
+if [ "${CHECK%%|*}" = 0 ]; then ok "check: resumed replay passes again"; else bad "check: resumed replay passes again (got $CHECK)"; fi
+CHECK=$(replica_check "$REPLICA" -e POSTGRES_ADMIN_USER=replica_test_no_such_role)
+if [ "${CHECK%%|*}" = 1 ] && [[ $CHECK == *"cannot be read"* ]]; then ok "check: a state it cannot read while the server is up warns"; else bad "check: a state it cannot read while the server is up warns (got $CHECK)"; fi
+# With no server listening (as while a replica starts or takes its base backup) it passes.
+CHECK=$(docker run --rm --entrypoint /opt/psql-script/psql_replica_check.sh "$IMAGE" 2>&1; echo "|$?")
+if [ "${CHECK##*|}" = 0 ]; then ok "check: no server accepting connections passes"; else bad "check: no server accepting connections passes (got $CHECK)"; fi
+
 # 4. A restart keeps the raised settings (pg_control still holds the primary's values).
 docker restart -t 20 "$REPLICA" >/dev/null
 if wait_ready "$REPLICA" && [ "$(setting "$REPLICA" max_worker_processes)" = "$REPLICA_WORKERS" ] && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = t ]; then ok "after a restart the replica is still a standby with the primary's values"; else bad "after a restart the replica is still a standby with the primary's values"; fi
@@ -117,8 +141,14 @@ docker restart -t 20 "$PRIMARY" >/dev/null
 wait_ready "$PRIMARY"
 # shellcheck disable=SC2034  # iteration only counts the retries
 for iteration in $(seq 60); do docker exec "$REPLICA" sh -c 'LC_ALL=C pg_controldata "$PGDATA"' 2>/dev/null | grep -q "max_prepared_xacts setting: *20" && break; sleep 2; done
+# Replaying that change paused the running standby, which still answers queries: the health check
+# names the setting and asks for the restart that fixes it.
+CHECK=$(replica_check "$REPLICA")
+if [ "${CHECK%%|*}" = 2 ] && [[ $CHECK == *"max_prepared_transactions below the primary's"* ]]; then ok "check: replay paused by a setting below the primary's is critical and names it"; else bad "check: replay paused by a setting below the primary's is critical and names it (got $CHECK)"; fi
 docker restart -t 20 "$REPLICA" >/dev/null
 if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = t ] && [ "$(setting "$REPLICA" max_prepared_transactions)" = 20 ]; then ok "a primary that raises max_prepared_transactions later is followed after a restart"; else bad "a primary that raises max_prepared_transactions later is followed after a restart"; docker logs "$REPLICA" 2>&1 | grep -E "FATAL|insufficient|Raising" | tail -3 | sed 's/^/    log: /'; fi
+CHECK=$(replica_check "$REPLICA")
+if [ "${CHECK%%|*}" = 0 ]; then ok "check: after that restart the replica passes"; else bad "check: after that restart the replica passes (got $CHECK)"; fi
 
 # 6. Once promoted, it is tuned from its own size again.
 sql "$REPLICA" "SELECT pg_promote()" >/dev/null
@@ -126,6 +156,8 @@ sql "$REPLICA" "SELECT pg_promote()" >/dev/null
 for iteration in $(seq 15); do [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = f ] && break; sleep 1; done
 docker restart -t 20 "$REPLICA" >/dev/null
 if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = f ] && [ "$(setting "$REPLICA" max_connections)" = 100 ]; then ok "a promoted replica restarts tuned from its own size"; else bad "a promoted replica restarts tuned from its own size (max_connections=$(setting "$REPLICA" max_connections))"; fi
+CHECK=$(replica_check "$REPLICA")
+if [ "${CHECK%%|*}" = 0 ]; then ok "check: a promoted replica passes"; else bad "check: a promoted replica passes (got $CHECK)"; fi
 
 # 7. A replica that fits the lock table only by taking the extra slots' rows out of the reserve the
 # tuner keeps free stops (the tuner makes room in the other settings, which then fall below their

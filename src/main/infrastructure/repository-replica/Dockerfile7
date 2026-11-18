@@ -10,8 +10,9 @@
 # minor reads an older one's WAL more reliably than the reverse.
 FROM coldis/infrastructure-transactional-repository:7.2.0
 
-# Copies init script.
-COPY script/*.sh /opt/psql-script
+# Copies the init script and the health check. The trailing slash keeps more than one source
+# valid on every builder.
+COPY script/*.sh /opt/psql-script/
 RUN chown -R postgres:postgres /opt/psql-script && \
 	chmod -R +x /opt/psql-script
 	

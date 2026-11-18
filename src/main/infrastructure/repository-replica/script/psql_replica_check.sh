@@ -10,17 +10,27 @@
 #   2  critical: replay is paused because one of the settings a standby needs at least as high as
 #      its primary is lower than the value the primary recorded in pg_control. A primary restarted
 #      with a higher value does that to a running standby, which then keeps serving stale data.
-#      A restart fixes it: psql_replica_init.sh raises those settings to the primary's.
+#      A restart fixes it: psql_replica_init.sh raises those settings to the primary's. A replica
+#      without the memory for the primary's new values stops at that start instead ("Not enough
+#      memory"), trading stale data for a failed task that says why.
 #   1  warning, what a restart would not fix: replay paused with every setting at or above the
-#      primary's (pg_wal_replay_pause by hand), or a state that cannot be read while the server
-#      accepts connections.
+#      primary's (pg_wal_replay_pause by hand), or a state that cannot be read, or not within 5
+#      seconds, while the server accepts connections. With pg_isready's own 3 seconds, a run takes
+#      at most 13: keep the job's check timeout above that, or a slow run becomes critical.
 #
-# Connects through the local socket, which pg_hba.conf trusts, as the admin user.
+# Run it as postgres: gosu postgres /opt/psql-script/psql_replica_check.sh. The script lives in a
+# folder that account owns and can rewrite (a superuser can, with COPY ... TO PROGRAM), so a check
+# run as root would hand root whatever was written there; through gosu, root only runs gosu. Run
+# as root, it refuses with a warning, which shows in Consul and never restarts the task. As
+# postgres it has all it needs: psql connects as the admin user through the local socket (with
+# its password, should pg_hba.conf stop trusting the socket), and pg_controldata reads PGDATA,
+# which postgres owns.
 
-pg_isready -q || exit 0
+[ "$(id -u)" != 0 ] || { echo "Run this check as postgres: gosu postgres $0"; exit 1; }
+pg_isready -q -U "${POSTGRES_ADMIN_USER:-postgres}" -d postgres || exit 0
 
 # One row: pause state (a server out of recovery reads as running), then the five settings.
-ROW=$(psql -X -q -t -A -F '|' -v ON_ERROR_STOP=1 -U "${POSTGRES_ADMIN_USER:-postgres}" -d postgres -c "
+ROW=$(PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" timeout 5 psql -X -q -t -A -F '|' -v ON_ERROR_STOP=1 -U "${POSTGRES_ADMIN_USER:-postgres}" -d postgres -c "
 	SELECT CASE WHEN pg_is_in_recovery() THEN pg_get_wal_replay_pause_state() ELSE 'not paused' END,
 		current_setting('max_connections'), current_setting('max_worker_processes'),
 		current_setting('max_wal_senders'), current_setting('max_prepared_transactions'),
@@ -33,7 +43,7 @@ EOF
 
 # pg_control holds the values the primary last recorded, the ones PostgreSQL checks the standby
 # against; pg_controldata speaks the image's pt_BR, hence the C locale.
-CONTROL=$(LC_ALL=C pg_controldata "${PGDATA}") \
+CONTROL=$(LC_ALL=C timeout 5 pg_controldata "${PGDATA}") \
 	|| { echo "WAL replay ${STATE} and pg_control cannot be read"; exit 1; }
 LOWER=$(printf '%s\n' "${CONTROL}" | awk -F': *' \
 	-v connections="${CONNECTIONS}" -v workers="${WORKERS}" -v senders="${SENDERS}" \

@@ -47,12 +47,11 @@ wait_ready() {
 wait_stopped() { timeout 120 docker wait "$1" >/dev/null 2>&1; }
 sql() { docker exec "$1" psql -X -U postgres -h 127.0.0.1 -tAc "$2" 2>/dev/null; }
 setting() { sql "$1" "SELECT current_setting('$2')"; }
-# Runs the health check the way the jobs' Nomad script check does (docker exec, as root, dropping
-# to postgres through gosu), with any further arguments as docker exec options; prints
-# "<exit code>|<output>".
+# Runs the health check the way a Nomad script check does (docker exec, as the container's user),
+# with any further arguments as docker exec options; prints "<exit code>|<output>".
 replica_check() { # container [docker-exec-option...]
 	local output
-	output=$(docker exec "${@:2}" "$1" gosu postgres /opt/psql-script/psql_replica_check.sh 2>&1)
+	output=$(docker exec "${@:2}" "$1" /opt/psql-script/psql_replica_check.sh 2>&1)
 	echo "$?|${output}"
 }
 # Starts a small replica (2 CPUs, 100 connections, the given memory in kB) of the primary.
@@ -126,11 +125,10 @@ CHECK=$(replica_check "$REPLICA")
 if [ "${CHECK%%|*}" = 0 ]; then ok "check: resumed replay passes again"; else bad "check: resumed replay passes again (got $CHECK)"; fi
 CHECK=$(replica_check "$REPLICA" -e POSTGRES_ADMIN_USER=replica_test_no_such_role)
 if [ "${CHECK%%|*}" = 1 ] && [[ $CHECK == *"cannot be read"* ]]; then ok "check: a state it cannot read while the server is up warns"; else bad "check: a state it cannot read while the server is up warns (got $CHECK)"; fi
-# Run as root it refuses with a warning: root would run whatever postgres wrote into the script.
-CHECK=$(docker exec "$REPLICA" /opt/psql-script/psql_replica_check.sh 2>&1; echo "|$?")
-if [ "${CHECK##*|}" = 1 ] && [[ $CHECK == *"Run this check as postgres"* ]]; then ok "check: run as root it refuses with a warning"; else bad "check: run as root it refuses with a warning (got $CHECK)"; fi
+# Root runs the check and the entrypoint, so the database account must not be able to change them.
+if ! docker exec "$REPLICA" gosu postgres sh -c 'echo x >> /opt/psql-script/psql_replica_check.sh || touch /opt/psql-script/replica_test_planted' 2>/dev/null; then ok "check: postgres cannot rewrite the scripts root runs"; else bad "check: postgres cannot rewrite the scripts root runs"; fi
 # With no server listening (as while a replica starts or takes its base backup) it passes.
-CHECK=$(docker run --rm --entrypoint gosu "$IMAGE" postgres /opt/psql-script/psql_replica_check.sh 2>&1; echo "|$?")
+CHECK=$(docker run --rm --entrypoint /opt/psql-script/psql_replica_check.sh "$IMAGE" 2>&1; echo "|$?")
 if [ "${CHECK##*|}" = 0 ]; then ok "check: no server accepting connections passes"; else bad "check: no server accepting connections passes (got $CHECK)"; fi
 
 # 4. A restart keeps the raised settings (pg_control still holds the primary's values).

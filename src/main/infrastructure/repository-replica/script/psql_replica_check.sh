@@ -18,15 +18,12 @@
 #      seconds, while the server accepts connections. With pg_isready's own 3 seconds, a run takes
 #      at most 13: keep the job's check timeout above that, or a slow run becomes critical.
 #
-# Run it as postgres: gosu postgres /opt/psql-script/psql_replica_check.sh. The script lives in a
-# folder that account owns and can rewrite (a superuser can, with COPY ... TO PROGRAM), so a check
-# run as root would hand root whatever was written there; through gosu, root only runs gosu. Run
-# as root, it refuses with a warning, which shows in Consul and never restarts the task. As
-# postgres it has all it needs: psql connects as the admin user through the local socket (with
-# its password, should pg_hba.conf stop trusting the socket), and pg_controldata reads PGDATA,
-# which postgres owns.
+# Jobs call /opt/psql-script/psql_replica_check.sh, which Nomad runs as the container's user,
+# root. The folder is root's and postgres can only read and run it (see the Dockerfiles), so the
+# database account cannot change what root runs. psql connects as the admin user through the local
+# socket (with its password, should pg_hba.conf stop trusting the socket); pg_controldata reads
+# PGDATA.
 
-[ "$(id -u)" != 0 ] || { echo "Run this check as postgres: gosu postgres $0"; exit 1; }
 pg_isready -q -U "${POSTGRES_ADMIN_USER:-postgres}" -d postgres || exit 0
 
 # One row: pause state (a server out of recovery reads as running), then the five settings.

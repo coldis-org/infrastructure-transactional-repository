@@ -2,7 +2,7 @@
 #
 # Reconciles LDAP-managed database users with LDAP (see sql/reconcile_permissions.sql).
 # Replaces psql_users_add, psql_users_remove and psql_users_alter_group. Run at boot by
-# psql_configure.sh and hourly by cron.
+# psql_configure.sh and by cron every 30 minutes.
 #
 # Configuration, from the environment (and /local/application.env, re-read every run):
 #   PSQL_READ_SCHEMA_<SCHEMA>=g1,g2               read on a whole schema

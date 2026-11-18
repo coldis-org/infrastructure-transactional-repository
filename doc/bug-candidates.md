@@ -12,7 +12,7 @@ tracked elsewhere, or found not to be a bug.
 - `Dockerfile3` (PostgreSQL 14) does not boot: `psql_tune_cmd.sh` passes `wal_decode_buffer_size`, which exists only from 15 (observed 2026-11-04).
 
 Follow-ups from the review of the LDAP permissions reconcile (2026-11-04), accepted at merge:
-- `reconcile_permissions.sql` is installed with `CREATE OR REPLACE`; a future change to its parameter names or `RETURNS TABLE` will fail the install (and every hourly repair) until the old function is dropped. Install in one transaction with `DROP FUNCTION IF EXISTS` first.
+- `reconcile_permissions.sql` is installed with `CREATE OR REPLACE`; a future change to its parameter names or `RETURNS TABLE` will fail the install (and every scheduled repair) until the old function is dropped. Install in one transaction with `DROP FUNCTION IF EXISTS` first.
 - The 90% statement-timeout ceiling leaves one `lock_timeout` (30s) of headroom and is not checked inside a single drop or the database/schema grants.
 - The boot install in `psql_configure.sh` runs outside the reconcile flock and can race a cron repair install during boot.
 - The on-demand "update database users" pipeline (supersim-infrastructure-continuous-integration) calls `psql_users_add.sh`, which now exits 3 on ERROR/DEFERRED and 75 on a lock-wait timeout; check how the pipeline treats those.
@@ -24,6 +24,6 @@ Follow-ups from the review of the LDAP permissions reconcile (2026-11-04), accep
 - `reconcile_test.sh` uses `osixia/openldap:1.5.0` (tag, not digest; unmaintained since 2021).
 
 Follow-ups from the review of the replica health check (2026-11-18), accepted:
-- The primary images (`repository/Dockerfile3`..`7`) still give `/opt/psql-script` to `postgres`, while root runs `psql_init.sh` from it at every start and the hourly reconcile through cron: a database superuser can write files as that account (`COPY ... TO PROGRAM`) and have root run them. The replica and upgrade images own the folder as root, 0755; none of the primary's scripts write there, so the same line fits, with a new release of those images.
+- The primary images (`repository/Dockerfile3`..`7`) still give `/opt/psql-script` to `postgres`, while root runs `psql_init.sh` from it at every start and the reconcile through cron every 30 minutes: a database superuser can write files as that account (`COPY ... TO PROGRAM`) and have root run them. The replica and upgrade images own the folder as root, 0755; none of the primary's scripts write there, so the same line fits, with a new release of those images.
 - `psql_replica_check.sh` runs as root and signs in as the admin superuser, though it only reads the replay state and five settings. A role with `pg_monitor`, created on the primary, and a check run through `gosu postgres` would narrow both.
 - `psql_replica_check.sh` reads the five settings from `pg_controldata` by label; should a release rename one, it would find nothing lower and warn "a restart would not help" without having compared. Count the matched labels and warn differently when fewer than five match (the labels are the same from PostgreSQL 14 to 18).

@@ -22,3 +22,8 @@ Follow-ups from the review of the LDAP permissions reconcile (2026-11-04), accep
 - Users kept with `SKIP_DELETE=true` stay `LOGIN`.
 - A dropped user's objects go to `POSTGRES_DEFAULT_USER`; a `SECURITY DEFINER` reassignment is neutralised, but the target role then owns whatever the user built.
 - `reconcile_test.sh` uses `osixia/openldap:1.5.0` (tag, not digest; unmaintained since 2021).
+
+Follow-ups from the review of the replica health check (2026-11-18), accepted:
+- The primary images (`repository/Dockerfile3`..`7`) still give `/opt/psql-script` to `postgres`, while root runs `psql_init.sh` from it at every start and the hourly reconcile through cron: a database superuser can write files as that account (`COPY ... TO PROGRAM`) and have root run them. The replica and upgrade images own the folder as root, 0755; none of the primary's scripts write there, so the same line fits, with a new release of those images.
+- `psql_replica_check.sh` runs as root and signs in as the admin superuser, though it only reads the replay state and five settings. A role with `pg_monitor`, created on the primary, and a check run through `gosu postgres` would narrow both.
+- `psql_replica_check.sh` reads the five settings from `pg_controldata` by label; should a release rename one, it would find nothing lower and warn "a restart would not help" without having compared. Count the matched labels and warn differently when fewer than five match (the labels are the same from PostgreSQL 14 to 18).

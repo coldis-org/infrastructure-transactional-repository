@@ -116,20 +116,20 @@ if [ "$(sql "$REPLICA" "SELECT string_agg(v, ',' ORDER BY v) FROM replica_test_m
 # 3a. The health check passes while replay runs, and only warns (never asks for a restart) when
 # replay is paused by hand or its state cannot be read.
 CHECK=$(replica_check "$REPLICA")
-if [ "${CHECK%%|*}" = 0 ]; then ok "check: a streaming replica passes"; else bad "check: a streaming replica passes (got $CHECK)"; fi
+if [ "${CHECK%%|*}" = 0 ] && [[ $CHECK == *"WAL replay running"* ]]; then ok "check: a streaming replica passes"; else bad "check: a streaming replica passes (got $CHECK)"; fi
 sql "$REPLICA" "SELECT pg_wal_replay_pause()" >/dev/null
 CHECK=$(replica_check "$REPLICA")
 if [ "${CHECK%%|*}" = 1 ] && [[ $CHECK == *"a restart would not help"* ]]; then ok "check: replay paused by hand warns, without a restart"; else bad "check: replay paused by hand warns, without a restart (got $CHECK)"; fi
 sql "$REPLICA" "SELECT pg_wal_replay_resume()" >/dev/null
 CHECK=$(replica_check "$REPLICA")
-if [ "${CHECK%%|*}" = 0 ]; then ok "check: resumed replay passes again"; else bad "check: resumed replay passes again (got $CHECK)"; fi
+if [ "${CHECK%%|*}" = 0 ] && [[ $CHECK == *"WAL replay running"* ]]; then ok "check: resumed replay passes again"; else bad "check: resumed replay passes again (got $CHECK)"; fi
 CHECK=$(replica_check "$REPLICA" -e POSTGRES_ADMIN_USER=replica_test_no_such_role)
 if [ "${CHECK%%|*}" = 1 ] && [[ $CHECK == *"cannot be read"* ]]; then ok "check: a state it cannot read while the server is up warns"; else bad "check: a state it cannot read while the server is up warns (got $CHECK)"; fi
 # Root runs the check and the entrypoint, so the database account must not be able to change them.
 if ! docker exec "$REPLICA" gosu postgres sh -c 'echo x >> /opt/psql-script/psql_replica_check.sh || touch /opt/psql-script/replica_test_planted' 2>/dev/null; then ok "check: postgres cannot rewrite the scripts root runs"; else bad "check: postgres cannot rewrite the scripts root runs"; fi
 # With no server listening (as while a replica starts or takes its base backup) it passes.
 CHECK=$(docker run --rm --entrypoint /opt/psql-script/psql_replica_check.sh "$IMAGE" 2>&1; echo "|$?")
-if [ "${CHECK##*|}" = 0 ]; then ok "check: no server accepting connections passes"; else bad "check: no server accepting connections passes (got $CHECK)"; fi
+if [ "${CHECK##*|}" = 0 ] && [[ $CHECK == *"Not accepting connections yet"* ]]; then ok "check: no server accepting connections passes"; else bad "check: no server accepting connections passes (got $CHECK)"; fi
 
 # 4. A restart keeps the raised settings (pg_control still holds the primary's values).
 docker restart -t 20 "$REPLICA" >/dev/null
@@ -150,7 +150,7 @@ if [ "${CHECK%%|*}" = 2 ] && [[ $CHECK == *"max_prepared_transactions below the 
 docker restart -t 20 "$REPLICA" >/dev/null
 if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = t ] && [ "$(setting "$REPLICA" max_prepared_transactions)" = 20 ]; then ok "a primary that raises max_prepared_transactions later is followed after a restart"; else bad "a primary that raises max_prepared_transactions later is followed after a restart"; docker logs "$REPLICA" 2>&1 | grep -E "FATAL|insufficient|Raising" | tail -3 | sed 's/^/    log: /'; fi
 CHECK=$(replica_check "$REPLICA")
-if [ "${CHECK%%|*}" = 0 ]; then ok "check: after that restart the replica passes"; else bad "check: after that restart the replica passes (got $CHECK)"; fi
+if [ "${CHECK%%|*}" = 0 ] && [[ $CHECK == *"WAL replay running"* ]]; then ok "check: after that restart the replica passes"; else bad "check: after that restart the replica passes (got $CHECK)"; fi
 
 # 6. Once promoted, it is tuned from its own size again.
 sql "$REPLICA" "SELECT pg_promote()" >/dev/null
@@ -159,7 +159,7 @@ for iteration in $(seq 15); do [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")
 docker restart -t 20 "$REPLICA" >/dev/null
 if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = f ] && [ "$(setting "$REPLICA" max_connections)" = 100 ]; then ok "a promoted replica restarts tuned from its own size"; else bad "a promoted replica restarts tuned from its own size (max_connections=$(setting "$REPLICA" max_connections))"; fi
 CHECK=$(replica_check "$REPLICA")
-if [ "${CHECK%%|*}" = 0 ]; then ok "check: a promoted replica passes"; else bad "check: a promoted replica passes (got $CHECK)"; fi
+if [ "${CHECK%%|*}" = 0 ] && [[ $CHECK == *"not a standby"* ]]; then ok "check: a promoted replica passes"; else bad "check: a promoted replica passes (got $CHECK)"; fi
 
 # 7. A replica that fits the lock table only by taking the extra slots' rows out of the reserve the
 # tuner keeps free stops (the tuner makes room in the other settings, which then fall below their

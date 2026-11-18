@@ -11,8 +11,9 @@
 #      its primary is lower than the value the primary recorded in pg_control. A primary restarted
 #      with a higher value does that to a running standby, which then keeps serving stale data.
 #      A restart fixes it: psql_replica_init.sh raises those settings to the primary's. A replica
-#      without the memory for the primary's new values stops at that start instead ("Not enough
-#      memory"), trading stale data for a failed task that says why.
+#      without the memory for the primary's new values stops at that start instead, trading stale
+#      data for a failed task: with "Not enough memory" on bases from 7.1.0 on, which size the lock
+#      table, and at shared memory allocation on older ones.
 #   1  warning, what a restart would not fix: replay paused with every setting at or above the
 #      primary's (pg_wal_replay_pause by hand), or a state that cannot be read, or not within 5
 #      seconds, while the server accepts connections. With pg_isready's own 3 seconds, a run takes
@@ -24,7 +25,10 @@
 # socket (with its password, should pg_hba.conf stop trusting the socket); pg_controldata reads
 # PGDATA.
 
-pg_isready -q -U "${POSTGRES_ADMIN_USER:-postgres}" -d postgres || exit 0
+# Every outcome prints one line, which Consul shows: a pass that never reached the server must not
+# look like a replica that replays.
+pg_isready -q -U "${POSTGRES_ADMIN_USER:-postgres}" -d postgres \
+	|| { echo "Not accepting connections yet (pg_isready exit $?)"; exit 0; }
 
 # One row: pause state (a server out of recovery reads as running), then the five settings.
 ROW=$(PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" timeout 5 psql -X -q -t -A -F '|' -v ON_ERROR_STOP=1 -U "${POSTGRES_ADMIN_USER:-postgres}" -d postgres -c "
@@ -36,7 +40,7 @@ ROW=$(PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" timeout 5 psql -X -q -t -A -F '|' 
 IFS='|' read -r STATE CONNECTIONS WORKERS SENDERS PREPARED LOCKS <<EOF
 ${ROW}
 EOF
-[ "${STATE}" = "not paused" ] && exit 0
+[ "${STATE}" = "not paused" ] && { echo "WAL replay running, or not a standby"; exit 0; }
 
 # pg_control holds the values the primary last recorded, the ones PostgreSQL checks the standby
 # against; pg_controldata speaks the image's pt_BR, hence the C locale.

@@ -62,8 +62,8 @@ RECOVERY=$(PGPASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} psql -X -tA -c 'SELEC
 if [ "$RECOVERY" = f ]
 then
 	POSTGRES_ADMIN_USER="$POSTGRES_ADMIN_USER" POSTGRES_ADMIN_PASSWORD="$POSTGRES_ADMIN_PASSWORD" POSTGRES_DEFAULT_DATABASE="$POSTGRES_DEFAULT_DATABASE" \
-		./psql_install_reconcile.sh || echo "ERROR: could not install the permissions reconcile (the hourly run retries)"
-	# Tolerant: an LDAP outage at boot must not stop the database; cron retries hourly.
+		./psql_install_reconcile.sh || echo "ERROR: could not install the permissions reconcile (the next cron run retries)"
+	# Tolerant: an LDAP outage at boot must not stop the database; cron retries every 30 minutes.
 	RECONCILE_SOURCE=boot flock -w 60 /var/lock/reconcile_permissions.lock ./psql_reconcile_permissions.sh || true
 fi
 

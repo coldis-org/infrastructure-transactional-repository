@@ -2,7 +2,7 @@
 -- admin superuser) and closed to everyone else. It must not be in public: the
 -- database owner (the application user) owns public on PostgreSQL 15+, and a
 -- schema owner can drop and replace any object in it, which would make the
--- hourly superuser run execute the application's code.
+-- scheduled superuser run execute the application's code.
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'ldap_reconcile'

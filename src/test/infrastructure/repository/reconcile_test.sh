@@ -278,7 +278,7 @@ config "$BASE_CONFIG"
 # The cron line itself, as the image installs it.
 CRON_LINE=$(docker exec "$DB" sh -c "crontab -l | grep psql_reconcile_permissions" | sed 's/^[^a-z]*\* \* \* \* //')
 docker exec "$DB" sh -c "$CRON_LINE"; RC=$?
-if [ $RC = 0 ] && docker exec "$DB" crontab -l | grep -q "^0 \* \* \* \* .*psql_reconcile_permissions" && docker exec "$DB" grep -q "done:" /var/log/reconcile_permissions.log; then ok "the installed cron line runs the reconcile (hourly)"; else bad "the installed cron line runs the reconcile (hourly)"; fi
+if [ $RC = 0 ] && docker exec "$DB" crontab -l | grep -q "^\*/30 \* \* \* \* .*psql_reconcile_permissions" && docker exec "$DB" grep -q "done:" /var/log/reconcile_permissions.log; then ok "the installed cron line runs the reconcile (every 30 minutes)"; else bad "the installed cron line runs the reconcile (every 30 minutes)"; fi
 CRON_VALUE=$(docker exec "$DB" sh -c 'set -a; . /etc/env_vars; set +a; printf "%s" "$RECONCILE_TEST_SPACED"')
 if [ "$CRON_VALUE" = "readers, temp; x" ] && [ "$(docker exec "$DB" stat -c %a /etc/env_vars)" = 600 ]; then ok "the cron environment keeps values with spaces and ;, in a root-only file"; else bad "the cron environment keeps values with spaces and ; (got: $CRON_VALUE)"; fi
 

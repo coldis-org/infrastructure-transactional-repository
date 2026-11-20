@@ -205,16 +205,16 @@ wm_many=$(tunevars 262144 2500 WORK_MEM MAX_PARALLEL_WORKERS_PERC=100 MAX_WORKER
 [ "${wm_many:-0}" -lt "${wm_few:-0}" ] && ok "parallel workers take work_mem of their own (${wm_few} -> ${wm_many} kB)" \
 	|| bad "parallel workers did not lower work_mem (${wm_few} -> ${wm_many} kB)"
 
-# 10. Parallel workers per query are capped (MAX_PARALLEL_WORKERS_PER_GATHER_MAX, 4 by default):
+# 10. Parallel workers per query are capped (MAX_PARALLEL_WORKERS_PER_GATHER_MAX, 2 by default):
 # a percentage of 64 CPUs alone gives 38.
-gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64)
-[ "${gather}" = 4 ] && ok "64 CPUs get 4 parallel workers per gather" || bad "64 CPUs get ${gather} parallel workers per gather"
+gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=4)
+[ "${gather}" = 4 ] && ok "64 CPUs get 4 parallel workers per gather with a cap of 4" || bad "64 CPUs get ${gather} parallel workers per gather with a cap of 4"
 gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=)
-[ "${gather}" = 4 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX is 4 when unset" || bad "unset MAX_PARALLEL_WORKERS_PER_GATHER_MAX gave ${gather}"
+[ "${gather}" = 2 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX is 2 when unset" || bad "unset MAX_PARALLEL_WORKERS_PER_GATHER_MAX gave ${gather}"
 gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0)
 [ "${gather}" = 0 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0 turns parallel query off" || bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0 gave ${gather}"
 gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x)
-[ "${gather}" = 4 ] && warned MAX_PARALLEL_WORKERS_PER_GATHER_MAX && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x falls back to 4 with a warning" \
+[ "${gather}" = 2 ] && warned MAX_PARALLEL_WORKERS_PER_GATHER_MAX && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x falls back to 2 with a warning" \
 	|| bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x gave ${gather}"
 gather=$(tunevars 1024 300 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=2)
 [ "${gather}" = 1 ] && ok "2 CPUs keep 1 parallel worker per gather" || bad "2 CPUs get ${gather} parallel workers per gather"

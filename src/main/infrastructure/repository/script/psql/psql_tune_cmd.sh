@@ -132,7 +132,7 @@ psql_tune_cmd() {
 		# N+1 times the memory of a serial one: a percentage of the CPUs alone gives a large host
 		# tens of workers per query, which suits a warehouse and not a transactional database.
 		# 0 turns parallel query off.
-		MAX_PARALLEL_WORKERS_PER_GATHER_MAX=$(psql_tune_integer MAX_PARALLEL_WORKERS_PER_GATHER_MAX "${MAX_PARALLEL_WORKERS_PER_GATHER_MAX:-4}" 4)
+		MAX_PARALLEL_WORKERS_PER_GATHER_MAX=$(psql_tune_integer MAX_PARALLEL_WORKERS_PER_GATHER_MAX "${MAX_PARALLEL_WORKERS_PER_GATHER_MAX:-2}" 2)
 		# Sessions left idle inside a transaction hold their locks, snapshot and memory until
 		# they are ended. 0 disables. A value the server does not take would stop it from starting,
 		# so anything but a number with an optional unit falls back to the default.

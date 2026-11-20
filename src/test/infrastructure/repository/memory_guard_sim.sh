@@ -40,6 +40,10 @@
 
 set -u -o pipefail
 
+# Numbers are printed with a decimal point (sleep and awk in the containers read them), whatever
+# the host locale.
+export LC_ALL=C
+
 SIM_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Options.
@@ -139,13 +143,14 @@ CHUNK_BYTES=8388608
 # Private memory one 8 MB pad really adds to a backend (measured: about 10 MB).
 CHUNK_EFFECTIVE_MB=10
 SIG9_RE='signal 9|sinal 9'
-RECOVERY_RE='recovery mode|modo de recupera|reinitializing|reinicializando|all server processes terminated|todos os processos servidores'
+RECOVERY_RE='recovery mode|modo de recupera|reinitializing|reinicializando|all server processes terminated|todos os processos servidor'
 
 # Defaults of the guard, used when its start line does not say otherwise.
 GUARD_IDLE_PERC=85
 GUARD_ACTIVE_PERC=92
 GUARD_FAST_INTERVAL=0.5
 GUARD_MAX_INTERVAL=5
+GUARD_TICK_BUDGET_MS=200
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 die() { log "ERROR: $*"; exit 2; }
@@ -211,12 +216,14 @@ build_image() {
 	return 1
 }
 
-# Image of PostgreSQL $1 for S8, built from the worktree when not given.
+# Image of PostgreSQL $1 for S8 into IMAGE_RESULT, built from the worktree when not given. Not
+# called in a subshell: the build is recorded for cleanup and cached.
+IMAGE_RESULT=
 major_image() {
 	local major=$1 file
 	if [ -n "${MAJOR_IMAGE[${major}]:-}" ]
 	then
-		echo "${MAJOR_IMAGE[${major}]}"
+		IMAGE_RESULT=${MAJOR_IMAGE[${major}]}
 		return 0
 	fi
 	[ -n "${BUILD_PATH}" ] || return 1
@@ -225,14 +232,15 @@ major_image() {
 		"${BUILD_PATH}/src/main/infrastructure/repository/Dockerfile${file}" \
 		"${BUILD_PATH}/src/main/infrastructure/repository" || return 1
 	MAJOR_IMAGE[${major}]="mgsim-local/repository:${RUN_ID}-pg${major}"
-	echo "${MAJOR_IMAGE[${major}]}"
+	IMAGE_RESULT=${MAJOR_IMAGE[${major}]}
 }
 
-# Replica image for S6: the worktree's replica Dockerfile7 on top of the image under test.
+# Replica image for S6 into IMAGE_RESULT: the worktree's replica Dockerfile7 on top of the image
+# under test.
 replica_image() {
 	if [ -n "${REPLICA_IMAGE}" ]
 	then
-		echo "${REPLICA_IMAGE}"
+		IMAGE_RESULT=${REPLICA_IMAGE}
 		return 0
 	fi
 	[ -n "${BUILD_PATH}" ] || return 1
@@ -240,7 +248,7 @@ replica_image() {
 	sed "s|^FROM .*|FROM ${IMAGE}|" "${dir}/Dockerfile7" > "${OUT}/Dockerfile.replica"
 	build_image "mgsim-local/replica:${RUN_ID}" "${OUT}/Dockerfile.replica" "${dir}" || return 1
 	REPLICA_IMAGE="mgsim-local/replica:${RUN_ID}"
-	echo "${REPLICA_IMAGE}"
+	IMAGE_RESULT=${REPLICA_IMAGE}
 }
 
 # --- Containers --------------------------------------------------------------------------------
@@ -466,6 +474,7 @@ guard_settings() {
 	v=$(kv "${start}" active_perc); [ -n "${v}" ] && GUARD_ACTIVE_PERC=${v}
 	v=$(kv "${start}" fast_interval); [ -n "${v}" ] && GUARD_FAST_INTERVAL=${v%s}
 	v=$(kv "${start}" max_interval); [ -n "${v}" ] && GUARD_MAX_INTERVAL=${v%s}
+	v=$(kv "${start}" tick_budget_ms); [ -n "${v}" ] && GUARD_TICK_BUDGET_MS=${v}
 	return 0
 }
 
@@ -539,15 +548,32 @@ ramp() {
 	return 0
 }
 
-# One session padded as USER up to TARGET % of the limit: pad_to <user> <target> <tag>.
+# Pads as USER up to TARGET % of the limit: pad_to <user> <target> <tag>. A pad adds 8 to 10 MB
+# depending on the role and the allocator, so it estimates low and adds sessions (<tag>, <tag>2, ...)
+# until the target is reached, four at most.
 pad_to() {
-	local pct used limit chunks
-	read -r pct used limit <<< "$(mem_use "${DB}")"
-	chunks=$(( ($2 * limit / 100 - used) / CHUNK_EFFECTIVE_MB ))
-	[ "${chunks}" -ge 1 ] || chunks=1
-	log "pad_to: ${1} from ${pct}% to ${2}%: ${chunks} pads of 8 MB"
-	cxd pad "$3" "$1" "${chunks}" "${CHUNK_BYTES}" 0.3
-	wait_for $(( chunks + 30 )) client_has "$3" '^(padded|EXIT)'
+	local pct used limit chunks round tag
+	for round in 1 2 3 4
+	do
+		read -r pct used limit <<< "$(mem_use "${DB}")"
+		[ "${pct}" -lt "$2" ] || return 0
+		chunks=$(( ($2 * limit / 100 - used) / 8 ))
+		[ "${chunks}" -ge 1 ] || chunks=1
+		tag=$3
+		[ "${round}" = 1 ] || tag="$3${round}"
+		log "pad_to: ${1} from ${pct}% to ${2}%: ${chunks} pads of 8 MB (${tag})"
+		cxd pad "${tag}" "$1" "${chunks}" "${CHUNK_BYTES}" 0.3
+		wait_for $(( chunks + 30 )) client_has "${tag}" '^(padded|EXIT)' || return 1
+		client_has "${tag}" '^EXIT' && return 1
+		sleep 1
+	done
+}
+
+# The first boot runs on initdb's pg_hba.conf (the image's own is only put in place from the second
+# start on), which has no network replication line: adds the image's.
+allow_replication() {
+	docker exec "$1" sh -c 'grep -q "^host[[:space:]]*replication[[:space:]]*replicator" "${PGDATA}/pg_hba.conf" || echo "host replication replicator 0.0.0.0/0 scram-sha-256" >> "${PGDATA}/pg_hba.conf"' \
+		&& asql 'SELECT pg_reload_conf()' >/dev/null
 }
 
 # Backend pid of a client session, from its log (first pid it printed).
@@ -584,7 +610,7 @@ s0() {
 	oom1=$(oom_kills "${DB}")
 	db_log "${DB}" > "${SDIR}/db.log"
 	sig9=$(grep -E "${SIG9_RE}" "${SDIR}/db.log" | head -n 1)
-	recov=$(grep -E "${RECOVERY_RE}" "${SDIR}/db.log" "${SDIR}/reconnects.txt" | head -n 1)
+	recov=$(grep -hE "${RECOVERY_RE}" "${SDIR}/db.log" "${SDIR}/reconnects.txt" | head -n 1)
 	read -r n first last ex <<< "$(canary_state)"
 	state=$(container_state "${DB}")
 	local fails=()
@@ -754,7 +780,7 @@ s5_signal() {
 	gp=$(guard_pid)
 	[ -n "${gp}" ] || { record "${SCN}" FAIL "guard process not found"; return 0; }
 	since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-	docker exec "${DB}" kill "-${sig}" "${gp}"
+	docker exec "${DB}" sh -c "kill -${sig} ${gp}"
 	sleep 6
 	docker logs --since "${since}" "${DB}" > "${SDIR}/after-signal.log" 2>&1
 	lines=$(grep -E "PID ${gp}[^0-9]|${SIG9_RE}|${RECOVERY_RE}" "${SDIR}/after-signal.log" | head -n 5 | tr '\n' ' ')
@@ -780,6 +806,7 @@ s5_protected() {
 		"POSTGRES_REPLICATOR_USER=${REPL_USER}" "POSTGRES_REPLICATOR_PASSWORD=${REPL_PW}" || return 0
 	oom0=$(oom_kills "${DB}")
 	canary_start
+	allow_replication "${DB}"
 	cxd receivewal
 	wait_for 30 wal_sender_attached || true
 	ws=$(asql 'SELECT pid FROM pg_stat_replication LIMIT 1')
@@ -815,7 +842,7 @@ s5_restart() {
 	wait_for 15 client_has victim '^padded' || true
 	victim=$(session_pid victim)
 	since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-	[ -n "${victim}" ] && docker exec "${DB}" kill -KILL "${victim}"
+	[ -n "${victim}" ] && docker exec "${DB}" sh -c "kill -KILL ${victim}"
 	sleep 20
 	docker logs --since "${since}" "${DB}" > "${SDIR}/after-crash.log" 2>&1
 	gp_after=$(guard_pid)
@@ -833,13 +860,15 @@ s5_restart() {
 # S6: replica built on the image under test; a read hog on the standby is ended, replay goes on.
 s6() {
 	local rimage rep oom0 oom1 limit rate rows lsn caught acts
-	rimage=$(replica_image) || { record S6 SKIP "no replica image (give --replica-image or --build)"; return 0; }
+	replica_image || { record S6 SKIP "no replica image (give --replica-image or --build)"; return 0; }
+	rimage=${IMAGE_RESULT}
 	db_run "${DB}" "${IMAGE}" 2g "POSTGRES_REPLICATOR_USER=${REPL_USER}" "POSTGRES_REPLICATOR_PASSWORD=${REPL_PW}" || { record S6 FAIL "primary did not start"; return 0; }
 	client_run
 	wait_for 240 db_ready "${DB}" || { record S6 FAIL "primary not ready"; return 0; }
 	local primary_ip
 	primary_ip=$(db_ip "${DB}")
 	CX_HOST=${primary_ip}
+	allow_replication "${DB}"
 	cxd writer
 	rep="${NET}-replica"
 	db_run "${rep}" "${rimage}" "${MEMORY}" "COPY_ENDPOINT=${primary_ip}" COPY_PORT=5432 "MASTER_ENDPOINT=${primary_ip}" \
@@ -919,15 +948,24 @@ s7() {
 	awk -v c="${cores}" 'BEGIN { exit !(c < 1) }' || fails+=("guard used ${cores} cores")
 	awk -v i="${interval}" -v m="${GUARD_MAX_INTERVAL}" -v w="${work}" 'BEGIN { exit !(i <= m + w / 1000 + 0.5) }' || fails+=("ticks ${interval} s apart, above the max interval ${GUARD_MAX_INTERVAL} s")
 	[ "${nice:-0}" -gt 0 ] 2>/dev/null || fails+=("guard not reniced (nice=${nice})")
+	# Self-throttling: a tick over its budget must stretch the time between ticks beyond the fast
+	# interval (up to the max interval checked above).
+	local throttled
+	throttled=$(awk -v i="${interval}" -v f="${GUARD_FAST_INTERVAL}" -v w="${work}" 'BEGIN { print (i > f + w / 1000 + 0.1) ? "yes" : "no" }')
+	if awk -v w="${work}" -v b="${GUARD_TICK_BUDGET_MS}" 'BEGIN { exit !(w > b) }' && [ "${throttled}" = no ]
+	then
+		fails+=("tick work ${work} ms over the ${GUARD_TICK_BUDGET_MS} ms budget but ticks not spaced out")
+	fi
 	local detail
-	detail="backends=${n} ticks=${ticks}/${S7_WINDOW}s interval=${interval}s guard-session=${sess_ms}ms cpu/tick=${cpu_ms}ms slow_tick max=${slow:-none}ms work~${work}ms -> ${extrap}ms at ${S7_TARGET}; guard cores=${cores}; nice=${nice} ionice=${io}"
+	detail="backends=${n} ticks=${ticks}/${S7_WINDOW}s interval=${interval}s guard-session=${sess_ms}ms cpu/tick=${cpu_ms}ms slow_tick max=${slow:-none}ms work~${work}ms -> ${extrap}ms at ${S7_TARGET}; guard cores=${cores}; budget=${GUARD_TICK_BUDGET_MS}ms throttled=${throttled}; nice=${nice} ionice=${io}"
 	if [ ${#fails[@]} -eq 0 ]; then record S7 PASS "${detail}"; else record S7 FAIL "$(IFS=';'; echo "${fails[*]}") | ${detail}"; fi
 }
 
 # S8: one older major: start line and one stage 1 action.
 s8_major() {
 	local major=$1 image oom0 oom1 start acts
-	image=$(major_image "${major}") || { record "S8-pg${major}" SKIP "no image (give --major-image ${major}=TAG or --build)"; return 0; }
+	major_image "${major}" || { record "S8-pg${major}" SKIP "no image (give --major-image ${major}=TAG or --build)"; return 0; }
+	image=${IMAGE_RESULT}
 	sim_up "${image}" MEMORY_GUARD_ENABLED=true MEMORY_GUARD_MODE=enforce || return 0
 	oom0=$(oom_kills "${DB}")
 	canary_start
@@ -946,58 +984,95 @@ s8_major() {
 	if [ ${#fails[@]} -eq 0 ]; then record "S8-pg${major}" PASS "${detail}"; else record "S8-pg${major}" FAIL "$(IFS=';'; echo "${fails[*]}") | ${detail}"; fi
 }
 
-# S10: pgbench TPC-B-like with the guard off, in dry-run and enforcing; below the first threshold
-# (repeated, medians compared) and held just above it by a superuser pad (nothing eligible, so the
-# guard keeps scanning). Results in S10_<case>_* globals.
-s10_case() {
-	local case=$1 gp c0 c1 r out tps=() p95=() line t0 low
-	shift
-	sim_up "${IMAGE}" "$@" || return 1
-	cx bench_init "${S10_SCALE}" || { record "S10${case}" FAIL "pgbench -i failed"; return 1; }
+# S10: overhead. pgbench TPC-B-like with the guard off (a), in dry-run (b) and enforcing (c), one
+# container each, all up at once and benchmarked in turn (a b c a b c ...), so drift on the host
+# falls on every case alike. First below the first threshold (S10_REPEAT rounds, medians compared:
+# b and c within 2% of a on TPS and p95), then held just above it by a superuser pad, which the
+# guard may not end, so it keeps scanning every tick (one round, recorded, with the guard's CPU).
+declare -A S10_CTX=()
+s10_save() { S10_CTX[$1]="${NET}|${DB}|${CL}|${SDIR}|${CX_HOST}|${HOST_PID1}"; }
+s10_use() { IFS='|' read -r NET DB CL SDIR CX_HOST HOST_PID1 <<< "${S10_CTX[$1]}"; SCN="S10$1"; }
+# One pgbench run: "tps avg_ms p95_ms p99_ms count guard_cores".
+s10_bench() {
+	local gp c0 c1 out
 	gp=$(guard_pid)
-	for r in $(seq 1 "${S10_REPEAT}")
-	do
-		c0=$(guard_cpu_ms "${DB}" "${gp}")
-		out=$(cx bench "${S10_SECONDS}" "${S10_CLIENTS}") || { record "S10${case}" FAIL "pgbench failed"; return 1; }
-		c1=$(guard_cpu_ms "${DB}" "${gp}")
-		line="${out} $(awk -v c=$(( c1 - c0 )) -v w="${S10_SECONDS}" 'BEGIN { printf "%.4f", c / (w * 1000) }')"
-		echo "normal ${r} ${line}" >> "${SDIR}/bench.txt"
-		tps+=("$(echo "${line}" | cut -d' ' -f1)")
-		p95+=("$(echo "${line}" | cut -d' ' -f3)")
-	done
-	printf -v "S10_${case}_TPS" '%s' "$(printf '%s\n' "${tps[@]}" | sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] }')"
-	printf -v "S10_${case}_P95" '%s' "$(printf '%s\n' "${p95[@]}" | sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] }')"
-	record "S10${case}-normal" INFO "tps avg_ms p95_ms p99_ms n guard_cores per run: $(grep '^normal' "${SDIR}/bench.txt" | cut -d' ' -f3- | tr '\n' ';')"
-	pad_to "${ADMIN_USER}" $(( GUARD_IDLE_PERC + 2 )) su
-	sleep 3
-	t0=$(date +%s)
 	c0=$(guard_cpu_ms "${DB}" "${gp}")
-	out=$(cx bench "${S10_SECONDS}" "${S10_CLIENTS}") || { record "S10${case}" FAIL "pgbench above the threshold failed"; return 1; }
+	out=$(cx bench "${S10_SECONDS}" "${S10_CLIENTS}") || return 1
 	c1=$(guard_cpu_ms "${DB}" "${gp}")
-	low=$(sampled_low "${SDIR}/memory.tsv" "${t0}")
-	line="${out} $(awk -v c=$(( c1 - c0 )) -v w="${S10_SECONDS}" 'BEGIN { printf "%.4f", c / (w * 1000) }')"
-	echo "above ${line}" >> "${SDIR}/bench.txt"
-	printf -v "S10_${case}_ABOVE_CORES" '%s' "$(echo "${line}" | cut -d' ' -f6)"
-	record "S10${case}-above" INFO "tps avg_ms p95_ms p99_ms n guard_cores: ${line}; lowest use during the run ${low}% (threshold ${GUARD_IDLE_PERC}%)$([ "${low}" -ge "${GUARD_IDLE_PERC}" ] || echo ' - NOT held above')"
-	return 0
+	echo "${out} $(awk -v c=$(( c1 - c0 )) -v w="${S10_SECONDS}" 'BEGIN { printf "%.4f", c / (w * 1000) }')"
 }
+median() { sort -n | awk '{ v[NR] = $1 } END { if (NR % 2) print v[(NR + 1) / 2]; else printf "%.3f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2 }'; }
 
 s10() {
-	local c ok=true detail="" fails=()
-	scn_begin S10a; s10_case a MEMORY_GUARD_ENABLED=false || ok=false; scn_end
-	scn_begin S10b; s10_case b MEMORY_GUARD_ENABLED=true MEMORY_GUARD_MODE=dry-run || ok=false; scn_end
-	scn_begin S10c; s10_case c MEMORY_GUARD_ENABLED=true MEMORY_GUARD_MODE=enforce || ok=false; scn_end
+	local c r line t0 low ok=true fails=() detail="" env=()
+	for c in a b c
+	do
+		case ${c} in
+			a) env=(MEMORY_GUARD_ENABLED=false) ;;
+			b) env=(MEMORY_GUARD_ENABLED=true MEMORY_GUARD_MODE=dry-run) ;;
+			c) env=(MEMORY_GUARD_ENABLED=true MEMORY_GUARD_MODE=enforce) ;;
+		esac
+		scn_begin "S10${c}"
+		s10_save "${c}"
+		if sim_up "${IMAGE}" "${env[@]}" && cx bench_init "${S10_SCALE}"
+		then
+			s10_save "${c}"
+		else
+			ok=false
+		fi
+	done
+	if ${ok}
+	then
+		for r in $(seq 1 "${S10_REPEAT}")
+		do
+			for c in a b c
+			do
+				s10_use "${c}"
+				line=$(s10_bench) || { ok=false; continue; }
+				echo "normal ${r} ${line}" >> "${SDIR}/bench.txt"
+				log "S10${c} normal ${r}: ${line}"
+			done
+		done
+		for c in a b c
+		do
+			s10_use "${c}"
+			pad_to "${ADMIN_USER}" $(( GUARD_IDLE_PERC + 2 )) su || log "S10${c}: pad did not reach $(( GUARD_IDLE_PERC + 2 ))%"
+		done
+		for c in a b c
+		do
+			s10_use "${c}"
+			t0=$(date +%s)
+			line=$(s10_bench) || { ok=false; continue; }
+			low=$(sampled_low "${SDIR}/memory.tsv" "${t0}")
+			echo "above 1 ${line} ${low}" >> "${SDIR}/bench.txt"
+			log "S10${c} above: ${line} lowest ${low}%"
+		done
+	fi
+	for c in a b c
+	do
+		s10_use "${c}"
+		[ -f "${SDIR}/bench.txt" ] || continue
+		printf -v "S10_${c}_TPS" '%s' "$(awk '$1 == "normal" { print $3 }' "${SDIR}/bench.txt" | median)"
+		printf -v "S10_${c}_P95" '%s' "$(awk '$1 == "normal" { print $5 }' "${SDIR}/bench.txt" | median)"
+		printf -v "S10_${c}_ABOVE_CORES" '%s' "$(awk '$1 == "above" { print $8 }' "${SDIR}/bench.txt")"
+		record "S10${c}" INFO "tps avg_ms p95_ms p99_ms n guard_cores per run, below: $(awk '$1 == "normal" { $1 = $2 = ""; print }' "${SDIR}/bench.txt" | tr '\n' ';')$(awk -v t="${GUARD_IDLE_PERC}" '$1 == "above" { printf " above: %s %s %s %s %s %s (lowest use %s%%%s)", $3, $4, $5, $6, $7, $8, $9, ($9 < t ? ", NOT held above " t "%" : "") }' "${SDIR}/bench.txt")"
+	done
+	for c in a b c
+	do
+		s10_use "${c}"
+		scn_end
+	done
 	SCN=S10
-	${ok} || { record S10 FAIL "a case did not run"; return 0; }
+	${ok} || { record S10 FAIL "a case did not run (logs in ${OUT}/S10*)"; return 0; }
 	for c in b c
 	do
 		local tps_var="S10_${c}_TPS" p95_var="S10_${c}_P95" cores_var="S10_${c}_ABOVE_CORES"
 		awk -v x="${!tps_var}" -v a="${S10_a_TPS}" 'BEGIN { exit !(x >= a * 0.98) }' || fails+=("(${c}) TPS ${!tps_var} more than 2% below ${S10_a_TPS}")
 		awk -v x="${!p95_var}" -v a="${S10_a_P95}" 'BEGIN { exit !(x <= a * 1.02) }' || fails+=("(${c}) p95 ${!p95_var} ms more than 2% above ${S10_a_P95} ms")
-		awk -v x="${!cores_var}" 'BEGIN { exit !(x <= 1) }' || fails+=("(${c}) guard used ${!cores_var} cores above the threshold")
+		awk -v x="${!cores_var:-0}" 'BEGIN { exit !(x <= 1) }' || fails+=("(${c}) guard used ${!cores_var} cores above the threshold")
 		detail="${detail} ${c}: tps=${!tps_var} p95=${!p95_var}ms above-cores=${!cores_var};"
 	done
-	detail="a: tps=${S10_a_TPS} p95=${S10_a_P95}ms;${detail}"
+	detail="medians below the threshold over ${S10_REPEAT} interleaved runs of ${S10_SECONDS}s; a: tps=${S10_a_TPS} p95=${S10_a_P95}ms;${detail}"
 	if [ ${#fails[@]} -eq 0 ]; then record S10 PASS "${detail}"; else record S10 FAIL "$(IFS=';'; echo "${fails[*]}") | ${detail}"; fi
 }
 
@@ -1057,7 +1132,7 @@ do
 			if [ -n "${BUILD_PATH}" ]
 			then
 				# PostgreSQL 14 does not boot on master (a known bug candidate): build only.
-				if major_image 14 >/dev/null; then record S8-pg14 PASS "build only"; else record S8-pg14 FAIL "build failed"; fi
+				if major_image 14; then record S8-pg14 PASS "build only"; else record S8-pg14 FAIL "build failed"; fi
 			fi ;;
 		S9) record S9 SKIP "needs host root to write memory.high; run by hand (see the header)" ;;
 		S10) s10 ;;

@@ -73,6 +73,14 @@ psql_tune_cmd() {
 		CONNECTIONS_MEMORY_MAX_PERC=${CONNECTIONS_MEMORY_MAX_PERC:-35}
 		CONNECTION_SHARED_BUFFERS_MAPPED_PERC=${CONNECTION_SHARED_BUFFERS_MAPPED_PERC:-35}
 		WORK_MEM_OPERATIONS=${WORK_MEM_OPERATIONS:-2}
+		# Both divide below: a zero (or negative) value would stop the entrypoint on a shell
+		# arithmetic error, so it is raised to 1 with a warning instead.
+		if [ ${CONNECTION_MEMORY} -lt 1 ] || [ ${WORK_MEM_OPERATIONS} -lt 1 ]
+		then
+			echo "WARN: CONNECTION_MEMORY=${CONNECTION_MEMORY} and WORK_MEM_OPERATIONS=${WORK_MEM_OPERATIONS} must be at least 1; raising them." >&2
+			CONNECTION_MEMORY=$(( CONNECTION_MEMORY < 1 ? 1 : CONNECTION_MEMORY ))
+			WORK_MEM_OPERATIONS=$(( WORK_MEM_OPERATIONS < 1 ? 1 : WORK_MEM_OPERATIONS ))
+		fi
 		HUGE_PAGES=${HUGE_PAGES:-try}
 		case "${HUGE_PAGES}" in
 			on|off|try) ;;
@@ -158,7 +166,9 @@ psql_tune_cmd() {
 		MAX_PARALLEL_WORKERS_PER_GATHER=$(( MAX_PARALLEL_WORKERS_PER_GATHER < 1 ? 1 : MAX_PARALLEL_WORKERS_PER_GATHER ))
 		MAX_PARALLEL_WORKERS_PER_GATHER=$(( MAX_PARALLEL_WORKERS_PER_GATHER > MAX_WORKER_PROCESSES ? MAX_WORKER_PROCESSES : MAX_PARALLEL_WORKERS_PER_GATHER ))
 		
-		# Max memory.
+		# Max memory. POSTGRES_TUNE_FAILED tells the caller the reserve could not be kept.
+		# shellcheck disable=SC2034  # read by the script that sources this file
+		POSTGRES_TUNE_FAILED=false
 		NON_RESERVED_MAX_MEMORY=${MAX_MEMORY}
 		TOTAL_CONFIGURED_MEMORY=0
 		ACTUAL_RESERVED_MEMORY=$(( MAX_MEMORY - TOTAL_CONFIGURED_MEMORY ))
@@ -220,11 +230,13 @@ psql_tune_cmd() {
 			ACTUAL_RESERVED_MEMORY_PERC=$(( ACTUAL_RESERVED_MEMORY * 100 / MAX_MEMORY ))
 			NON_RESERVED_MAX_MEMORY=$(( NON_RESERVED_MAX_MEMORY - (MAX_MEMORY / 50 )))
 			# Guard against looping forever should the fixed costs alone not fit (memory below the
-			# reserve itself, or a lock table that takes it all). The settings are left as the last
-			# pass sized them, below Postgres' minimums, so the server, or the replica init's own
-			# check, refuses to start rather than run without its reserve.
+			# reserve itself, or a lock table that takes it all). The caller stops on
+			# POSTGRES_TUNE_FAILED rather than start a server without its reserve: the last pass's
+			# settings are not reliably below Postgres' minimums on a large container.
 			if [ ${NON_RESERVED_MAX_MEMORY} -le 0 ]
 			then
+				# shellcheck disable=SC2034  # read by the script that sources this file
+				POSTGRES_TUNE_FAILED=true
 				echo "WARN: could not keep ${MIN_RESERVED_MEMORY_PERC}% and at least ${MIN_RESERVED_MEMORY}kB of ${MAX_MEMORY}kB in reserve (${MAX_CONNECTIONS} connections take ${TOTAL_CONNECTIONS_MEMORY}kB, the lock table ${TOTAL_LOCKS_MEMORY}kB); reserve is ${ACTUAL_RESERVED_MEMORY}kB." >&2
 				break
 			fi

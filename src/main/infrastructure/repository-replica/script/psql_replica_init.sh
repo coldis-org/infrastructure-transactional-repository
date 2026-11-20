@@ -173,6 +173,12 @@ then
 	fi
 fi
 psql_tune_cmd "$@"
+# Set by tuners from this release on; older bases leave it empty.
+if [ "${POSTGRES_TUNE_FAILED}" = "true" ]
+then
+	echo "Not enough memory to keep the reserve with these settings (see the WARN above); not starting." >&2
+	exit 1
+fi
 if [ ${EXTRA_WORKERS} -gt 0 ]
 then
 	echo "Raising max_worker_processes from ${MAX_WORKER_PROCESSES} to the primary's ${PRIMARY_MAX_WORKER_PROCESSES}"

@@ -32,15 +32,15 @@ sed -n '/^ENV POSTGRES_ADMIN_USER/,/OVERWRITE_TUNED_ARGS/p' "${REPOSITORY}/Docke
 
 # Tunes with the given memory (MB) and requested connections, plus any VAR=value overrides, and
 # prints "<max_connections> <shared_buffers kB> <work_mem kB> <reserve %> <max_wal_senders>
-# <maintenance_work_mem kB> <logical_decoding_work_mem kB> <warnings>". Fails when the tuner does
-# not finish within 20 seconds.
+# <maintenance_work_mem kB> <logical_decoding_work_mem kB> <warnings> <failed>", failed being the
+# POSTGRES_TUNE_FAILED the init scripts stop on. Fails when the tuner does not finish within 20 s.
 tune() { # memory-mb connections [VAR=value...]
 	local memory=$1 connections=$2; shift 2
 	(cd "${REPOSITORY}/script/psql" && PATH="${WORK}/bin:${PATH}" TEST_CPUS=16 TEST_MEMORY_MB=${memory} \
 		PGDATA=/ timeout 20 sh -c ". '${WORK}/env.sh'; export MAX_CONNECTIONS=${connections} $*
 		. ./psql_tune_cmd.sh; psql_tune_cmd postgres >/dev/null 2>'${WORK}/stderr'
 		WARNINGS=\$(grep -c WARN '${WORK}/stderr')
-		echo \"\${MAX_CONNECTIONS} \${SHARED_BUFFERS} \${WORK_MEM} \${ACTUAL_RESERVED_MEMORY_PERC} \${MAX_WAL_SENDERS} \${MAINTENANCE_WORK_MEM} \${LOGICAL_DECODING_WORK_MEM} \${WARNINGS}\"")
+		echo \"\${MAX_CONNECTIONS} \${SHARED_BUFFERS} \${WORK_MEM} \${ACTUAL_RESERVED_MEMORY_PERC} \${MAX_WAL_SENDERS} \${MAINTENANCE_WORK_MEM} \${LOGICAL_DECODING_WORK_MEM} \${WARNINGS} \${POSTGRES_TUNE_FAILED}\"")
 }
 
 # True when every sized memory setting is at or above Postgres' minimum (kB), so the server starts.
@@ -70,7 +70,7 @@ read -r _ sb_many _ <<< "$(tune 262144 4000)"
 read -r _ sb_huge _ <<< "$(tune 262144 4000 HUGE_PAGES=on)"
 [ "${sb_huge:-0}" -gt "${sb_many:-0}" ] && ok "huge pages leave more shared buffers (${sb_many} -> ${sb_huge} kB)" \
 	|| bad "huge pages did not leave more shared buffers (${sb_many} -> ${sb_huge} kB)"
-read -r _ sb_bogus _ _ _ _ _ warnings <<< "$(tune 262144 4000 HUGE_PAGES=bogus)"
+read -r _ sb_bogus _ _ _ _ _ warnings _ <<< "$(tune 262144 4000 HUGE_PAGES=bogus)"
 [ "${sb_bogus}" = "${sb_many}" ] && [ "${warnings:-0}" -ge 1 ] && ok "an unknown HUGE_PAGES falls back to try, with a warning" \
 	|| bad "HUGE_PAGES=bogus: shared buffers ${sb_bogus} (try gives ${sb_many}), warnings ${warnings}"
 
@@ -97,10 +97,24 @@ for memory in 300 384 512 1024; do
 		|| bad "${memory} MB: connections '${conns}', shared_buffers '${sb}', work_mem '${wm}', maintenance '${mwm}', logical decoding '${ldwm}'"
 done
 for memory in 256 128; do
-	read -r conns _ _ _ _ _ _ warnings <<< "$(tune ${memory} 300)"
-	[ -n "${conns}" ] && [ "${warnings:-0}" -ge 1 ] && ok "${memory} MB finishes and warns that the reserve cannot be kept" \
-		|| bad "${memory} MB: connections '${conns}', warnings '${warnings}'"
+	read -r conns _ _ _ _ _ _ warnings failed <<< "$(tune ${memory} 300)"
+	[ -n "${conns}" ] && [ "${warnings:-0}" -ge 1 ] && [ "${failed}" = true ] \
+		&& ok "${memory} MB finishes, warns and fails closed (the reserve cannot be kept)" \
+		|| bad "${memory} MB: connections '${conns}', warnings '${warnings}', failed '${failed}'"
 done
+
+# 6b. A large standby whose primary forces a lock table that takes the reserve fails closed too:
+# the last pass's settings are valid at this size, so only the flag stops the server.
+read -r _ _ _ _ _ _ _ _ failed <<< "$(tune 32768 4874 MAX_CONNECTIONS_MIN=4874 MAX_LOCKS_PER_TRANSACTION_MIN=8000)"
+[ "${failed}" = true ] && ok "a 32 GB standby whose primary's lock table takes the reserve fails closed" \
+	|| bad "a 32 GB standby with a lock table over the reserve did not fail closed (failed '${failed}')"
+read -r _ _ _ _ _ _ _ _ failed <<< "$(tune 262144 2500)"
+[ "${failed}" = false ] && ok "a budget that fits does not fail" || bad "a budget that fits reported failed '${failed}'"
+
+# 6c. Zero divisors are raised to 1 with a warning instead of stopping on an arithmetic error.
+read -r conns _ wm _ _ _ _ warnings _ <<< "$(tune 4096 300 CONNECTION_MEMORY=0 WORK_MEM_OPERATIONS=0)"
+[ -n "${conns}" ] && [ -n "${wm}" ] && [ "${warnings:-0}" -ge 1 ] && ok "CONNECTION_MEMORY=0 and WORK_MEM_OPERATIONS=0 are raised with a warning" \
+	|| bad "zero divisors: connections '${conns}', work_mem '${wm}', warnings '${warnings}'"
 
 # 7. WAL senders follow the requested limit, not the capped one: they do not count against
 # max_connections, and replicas need them whatever the cap.

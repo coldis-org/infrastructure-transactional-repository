@@ -74,12 +74,28 @@ psql_tune_cmd() {
 		CONNECTION_SHARED_BUFFERS_MAPPED_PERC=${CONNECTION_SHARED_BUFFERS_MAPPED_PERC:-35}
 		WORK_MEM_OPERATIONS=${WORK_MEM_OPERATIONS:-2}
 		HUGE_PAGES=${HUGE_PAGES:-try}
+		case "${HUGE_PAGES}" in
+			on|off|try) ;;
+			*)
+				echo "WARN: HUGE_PAGES=${HUGE_PAGES} is not on, off or try; using try." >&2
+				HUGE_PAGES=try
+				;;
+		esac
 		MAX_CONNECTIONS_FIT=$(( MAX_MEMORY * CONNECTIONS_MEMORY_MAX_PERC / 100 / CONNECTION_MEMORY ))
 		MAX_CONNECTIONS_FIT=$(( MAX_CONNECTIONS_FIT < 10 ? 10 : MAX_CONNECTIONS_FIT ))
 		# A standby must not have fewer connections than its primary, or it refuses to start: its
-		# init sets this floor to the primary's value.
+		# init sets this floor to the primary's value. When the floor is more than the memory holds,
+		# the connections' memory is capped at their share instead (each gets less than
+		# CONNECTION_MEMORY): otherwise the budget below can never be met and every other setting
+		# would shrink below Postgres' minimums, leaving a standby that cannot start.
 		MAX_CONNECTIONS_MIN=${MAX_CONNECTIONS_MIN:-0}
-		MAX_CONNECTIONS_FIT=$(( MAX_CONNECTIONS_FIT < MAX_CONNECTIONS_MIN ? MAX_CONNECTIONS_MIN : MAX_CONNECTIONS_FIT ))
+		CONNECTIONS_MEMORY_CAP=0
+		if [ ${MAX_CONNECTIONS_MIN} -gt ${MAX_CONNECTIONS_FIT} ]
+		then
+			CONNECTIONS_MEMORY_CAP=$(( MAX_MEMORY * CONNECTIONS_MEMORY_MAX_PERC / 100 ))
+			echo "WARN: MAX_CONNECTIONS_MIN=${MAX_CONNECTIONS_MIN} (the primary's) does not fit in ${MAX_MEMORY}kB of memory at ${CONNECTION_MEMORY}kB per connection; capping their memory at ${CONNECTIONS_MEMORY_MAX_PERC}%." >&2
+			MAX_CONNECTIONS_FIT=${MAX_CONNECTIONS_MIN}
+		fi
 		if [ ${MAX_CONNECTIONS} -gt ${MAX_CONNECTIONS_FIT} ]
 		then
 			echo "WARN: MAX_CONNECTIONS=${MAX_CONNECTIONS} does not fit in ${MAX_MEMORY}kB of memory at ${CONNECTION_MEMORY}kB per connection; using ${MAX_CONNECTIONS_FIT}." >&2
@@ -185,16 +201,23 @@ psql_tune_cmd() {
 			# what lets many connections fit at all without huge pages.
 			CONNECTION_PAGE_TABLES=$(( SHARED_BUFFERS * CONNECTION_SHARED_BUFFERS_MAPPED_PERC / 100 / PAGE_TABLE_RATIO ))
 			TOTAL_CONNECTIONS_MEMORY=$(( MAX_CONNECTIONS * (CONNECTION_MEMORY + CONNECTION_PAGE_TABLES) ))
+			if [ ${CONNECTIONS_MEMORY_CAP} -gt 0 ] && [ ${TOTAL_CONNECTIONS_MEMORY} -gt ${CONNECTIONS_MEMORY_CAP} ]
+			then
+				TOTAL_CONNECTIONS_MEMORY=${CONNECTIONS_MEMORY_CAP}
+			fi
 
 			# Updates reserved memory.
 			TOTAL_CONFIGURED_MEMORY=$(( WAL_BUFFERS + WAL_WRITER_FLUSH_AFTER + WAL_DECODE_BUFFER_SIZE + TOTAL_LOGICAL_DECODING_WORK_MEM + SHARED_BUFFERS + TOTAL_WORK_MEM + TOTAL_MAINTENANCE_WORK_MEM + TOTAL_LOCKS_MEMORY + TOTAL_CONNECTIONS_MEMORY ))
 			ACTUAL_RESERVED_MEMORY=$(( MAX_MEMORY - TOTAL_CONFIGURED_MEMORY ))
 			ACTUAL_RESERVED_MEMORY_PERC=$(( ACTUAL_RESERVED_MEMORY * 100 / MAX_MEMORY ))
 			NON_RESERVED_MAX_MEMORY=$(( NON_RESERVED_MAX_MEMORY - (MAX_MEMORY / 50 )))
-			# Guard against looping forever should the fixed costs alone not fit.
+			# Guard against looping forever should the fixed costs alone not fit (memory below the
+			# reserve itself, or a lock table that takes it all). The settings are left as the last
+			# pass sized them, below Postgres' minimums, so the server, or the replica init's own
+			# check, refuses to start rather than run without its reserve.
 			if [ ${NON_RESERVED_MAX_MEMORY} -le 0 ]
 			then
-				echo "WARN: could not keep ${MIN_RESERVED_MEMORY_PERC}% and at least ${MIN_RESERVED_MEMORY}kB of ${MAX_MEMORY}kB in reserve; reserve is ${ACTUAL_RESERVED_MEMORY}kB." >&2
+				echo "WARN: could not keep ${MIN_RESERVED_MEMORY_PERC}% and at least ${MIN_RESERVED_MEMORY}kB of ${MAX_MEMORY}kB in reserve (${MAX_CONNECTIONS} connections take ${TOTAL_CONNECTIONS_MEMORY}kB, the lock table ${TOTAL_LOCKS_MEMORY}kB); reserve is ${ACTUAL_RESERVED_MEMORY}kB." >&2
 				break
 			fi
 #			echo "MAX_MEMORY=${MAX_MEMORY}"

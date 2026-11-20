@@ -858,11 +858,13 @@ s5_restart() {
 }
 
 # S6: replica built on the image under test; a read hog on the standby is ended, replay goes on.
+# The primary gets the same limit: a standby takes its primary's lock table size, and one smaller
+# than its primary does not start under the tuner's reserve.
 s6() {
 	local rimage rep oom0 oom1 limit rate rows lsn caught acts
 	replica_image || { record S6 SKIP "no replica image (give --replica-image or --build)"; return 0; }
 	rimage=${IMAGE_RESULT}
-	db_run "${DB}" "${IMAGE}" 2g "POSTGRES_REPLICATOR_USER=${REPL_USER}" "POSTGRES_REPLICATOR_PASSWORD=${REPL_PW}" || { record S6 FAIL "primary did not start"; return 0; }
+	db_run "${DB}" "${IMAGE}" "${MEMORY}" MEMORY_GUARD_ENABLED=false "POSTGRES_REPLICATOR_USER=${REPL_USER}" "POSTGRES_REPLICATOR_PASSWORD=${REPL_PW}" || { record S6 FAIL "primary did not start"; return 0; }
 	client_run
 	wait_for 240 db_ready "${DB}" || { record S6 FAIL "primary not ready"; return 0; }
 	local primary_ip
@@ -1072,7 +1074,13 @@ s10() {
 		awk -v x="${!cores_var:-0}" 'BEGIN { exit !(x <= 1) }' || fails+=("(${c}) guard used ${!cores_var} cores above the threshold")
 		detail="${detail} ${c}: tps=${!tps_var} p95=${!p95_var}ms above-cores=${!cores_var};"
 	done
-	detail="medians below the threshold over ${S10_REPEAT} interleaved runs of ${S10_SECONDS}s; a: tps=${S10_a_TPS} p95=${S10_a_P95}ms;${detail}"
+	# How far the baseline's own runs spread: beyond twice the tolerance, a 2% difference cannot be
+	# told from host noise, and the verdict says so instead of passing or failing on luck.
+	local spread
+	spread=$(s10_use a; awk '$1 == "normal" { v[++n] = $3 } END { lo = hi = v[1]; for (i = 2; i <= n; i++) { if (v[i] < lo) lo = v[i]; if (v[i] > hi) hi = v[i] }; printf "%.1f", (n && lo > 0) ? (hi - lo) * 100 / lo : 0 }' "${SDIR}/bench.txt")
+	SCN=S10
+	awk -v s="${spread}" 'BEGIN { exit !(s > 4) }' && fails=("inconclusive: the baseline's own TPS spread ${spread}% across runs, above twice the 2% tolerance; rerun on a quiet host with more --s10-repeat" "${fails[@]+"${fails[@]}"}")
+	detail="medians below the threshold over ${S10_REPEAT} interleaved runs of ${S10_SECONDS}s (baseline spread ${spread}%); a: tps=${S10_a_TPS} p95=${S10_a_P95}ms;${detail}"
 	if [ ${#fails[@]} -eq 0 ]; then record S10 PASS "${detail}"; else record S10 FAIL "$(IFS=';'; echo "${fails[*]}") | ${detail}"; fi
 }
 

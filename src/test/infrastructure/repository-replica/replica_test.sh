@@ -58,7 +58,7 @@ replica_check() { # container [docker-exec-option...]
 start_replica() { # image memory-kb slot
 	docker rm -f -v "$REPLICA" >/dev/null 2>&1
 	docker run -d --name "$REPLICA" --network "$NET" \
-		-e MAX_CPU=2 -e MAX_MEMORY="$2" -e MAX_CONNECTIONS=100 \
+		-e MAX_CPU=2 -e MAX_MEMORY="$2" -e MAX_CONNECTIONS=100 -e CONNECTION_MEMORY=1024 \
 		-e COPY_ENDPOINT="$PRIMARY" -e REPLICATION_SLOT_NAME="$3" \
 		-e POSTGRES_REPLICATOR_USER=replicator -e POSTGRES_REPLICATOR_PASSWORD="$REPLICATOR_PASSWORD" \
 		"$1" >/dev/null
@@ -71,7 +71,7 @@ echo "== $IMAGE against a primary from $PRIMARY_IMAGE"
 # A primary sized from 16 CPUs, 2 GB and 400 connections, with twice the replicas' share of WAL
 # senders (10% of connections against 5%). Its first boot keeps PostgreSQL's own pg_hba.conf,
 # which has no replication rule for other hosts, so the test adds one.
-docker run -d --name "$PRIMARY" --network "$NET" -e MAX_CPU=16 -e MAX_MEMORY=2097152 -e MAX_CONNECTIONS=400 -e MAX_WAL_SENDERS_CONN_PERC=10 \
+docker run -d --name "$PRIMARY" --network "$NET" -e MAX_CPU=16 -e MAX_MEMORY=2097152 -e MAX_CONNECTIONS=400 -e CONNECTION_MEMORY=1024 -e MAX_WAL_SENDERS_CONN_PERC=10 \
 	-e POSTGRES_REPLICATOR_USER=replicator -e POSTGRES_REPLICATOR_PASSWORD="$REPLICATOR_PASSWORD" \
 	"$PRIMARY_IMAGE" >/dev/null || exit 2
 wait_ready "$PRIMARY" || { echo "primary did not start"; docker logs "$PRIMARY" 2>&1 | tail -5; exit 2; }

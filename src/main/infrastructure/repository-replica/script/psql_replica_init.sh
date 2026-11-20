@@ -118,6 +118,10 @@ PRIMARY_MAX_CONNECTIONS=$(primary_setting max_connections)
 PRIMARY_MAX_LOCKS_PER_TRANSACTION=$(primary_setting max_locks_per_xact)
 echo "Primary recorded max_connections=${PRIMARY_MAX_CONNECTIONS} max_locks_per_transaction=${PRIMARY_MAX_LOCKS_PER_TRANSACTION}"
 MAX_CONNECTIONS=$(( MAX_CONNECTIONS < PRIMARY_MAX_CONNECTIONS ? PRIMARY_MAX_CONNECTIONS : MAX_CONNECTIONS ))
+# The tuner lowers max_connections to what its memory holds; never below the primary's, or the
+# standby would not start. The tuner then shrinks shared buffers to make room instead.
+# shellcheck disable=SC2034  # read by psql_tune_cmd.sh, sourced below
+MAX_CONNECTIONS_MIN=${PRIMARY_MAX_CONNECTIONS:-0}
 MAX_LOCKS_PER_TRANSACTION_MIN=$(( MAX_LOCKS_PER_TRANSACTION_MIN < PRIMARY_MAX_LOCKS_PER_TRANSACTION ? PRIMARY_MAX_LOCKS_PER_TRANSACTION : MAX_LOCKS_PER_TRANSACTION_MIN ))
 
 # Tune command.
@@ -169,6 +173,12 @@ then
 	fi
 fi
 psql_tune_cmd "$@"
+# Set by tuners from this release on; older bases leave it empty.
+if [ "${POSTGRES_TUNE_FAILED}" = "true" ]
+then
+	echo "Not enough memory to keep the reserve with these settings (see the WARN above); not starting." >&2
+	exit 1
+fi
 if [ ${EXTRA_WORKERS} -gt 0 ]
 then
 	echo "Raising max_worker_processes from ${MAX_WORKER_PROCESSES} to the primary's ${PRIMARY_MAX_WORKER_PROCESSES}"

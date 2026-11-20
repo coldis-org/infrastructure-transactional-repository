@@ -1,0 +1,126 @@
+#!/bin/bash
+
+# Tests for the memory budget of psql_tune_cmd.sh: connections (each one's own memory and its page
+# tables for shared buffers) count against the container's memory, max_connections is lowered to
+# what fits, and a standby's floor (the primary's max_connections) is kept. Runs on the host, with
+# no docker: it stubs os_limits with the given CPUs and memory and takes every other default from
+# the ENV block of the image's Dockerfile7.
+#
+#   bash src/test/infrastructure/repository/tune_test.sh
+#
+# Exits non-zero when any test fails.
+
+ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
+REPOSITORY=${ROOT}/src/main/infrastructure/repository
+WORK=$(mktemp -d)
+trap 'rm -rf "${WORK}"' EXIT
+pass=0; fail=0
+
+ok()  { pass=$((pass+1)); echo "PASS: $1"; }
+bad() { fail=$((fail+1)); echo "FAIL: $1"; }
+
+# os_limits stub: CPUs, memory (MB) and disk (bytes) from the environment.
+mkdir -p "${WORK}/bin"
+cat > "${WORK}/bin/os_limits" <<'EOF'
+available_cpus() { AVAILABLE_CPUS=${TEST_CPUS}; }
+available_memory() { AVAILABLE_MEMORY=${TEST_MEMORY_MB}; }
+available_disk() { AVAILABLE_DISK=1099511627776; }
+EOF
+# The image defaults, as exports.
+sed -n '/^ENV POSTGRES_ADMIN_USER/,/OVERWRITE_TUNED_ARGS/p' "${REPOSITORY}/Dockerfile7" \
+	| sed 's/^ENV //; s/\\$//; s/^[[:space:]]*//' | grep '=' | sed 's/^/export /' > "${WORK}/env.sh"
+
+# Tunes with the given memory (MB) and requested connections, plus any VAR=value overrides, and
+# prints "<max_connections> <shared_buffers kB> <work_mem kB> <reserve %> <max_wal_senders>
+# <maintenance_work_mem kB> <logical_decoding_work_mem kB> <warnings> <failed>", failed being the
+# POSTGRES_TUNE_FAILED the init scripts stop on. Fails when the tuner does not finish within 20 s.
+tune() { # memory-mb connections [VAR=value...]
+	local memory=$1 connections=$2; shift 2
+	(cd "${REPOSITORY}/script/psql" && PATH="${WORK}/bin:${PATH}" TEST_CPUS=16 TEST_MEMORY_MB=${memory} \
+		PGDATA=/ timeout 20 sh -c ". '${WORK}/env.sh'; export MAX_CONNECTIONS=${connections} $*
+		. ./psql_tune_cmd.sh; psql_tune_cmd postgres >/dev/null 2>'${WORK}/stderr'
+		WARNINGS=\$(grep -c WARN '${WORK}/stderr')
+		echo \"\${MAX_CONNECTIONS} \${SHARED_BUFFERS} \${WORK_MEM} \${ACTUAL_RESERVED_MEMORY_PERC} \${MAX_WAL_SENDERS} \${MAINTENANCE_WORK_MEM} \${LOGICAL_DECODING_WORK_MEM} \${WARNINGS} \${POSTGRES_TUNE_FAILED}\"")
+}
+
+# True when every sized memory setting is at or above Postgres' minimum (kB), so the server starts.
+valid() { # shared_buffers work_mem maintenance_work_mem logical_decoding_work_mem
+	[ "${1:-0}" -ge 128 ] && [ "${2:-0}" -ge 64 ] && [ "${3:-0}" -ge 1024 ] && [ "${4:-0}" -ge 64 ]
+}
+
+# 1. A limit that fits is kept.
+read -r conns _ _ reserve _ <<< "$(tune 262144 2500)"
+[ "${conns}" = 2500 ] && ok "a limit that fits is kept (2500 at 256 GB)" || bad "2500 at 256 GB became ${conns}"
+[ "${reserve:-0}" -ge 15 ] && ok "the reserve is kept (${reserve}%)" || bad "reserve ${reserve}% below 15%"
+
+# 2. A limit that does not fit (8000 at 256 GB, which ran a production database out of memory) is
+# lowered.
+read -r conns _ _ reserve _ <<< "$(tune 262144 8000)"
+[ -n "${conns}" ] && [ "${conns}" -lt 8000 ] && ok "8000 at 256 GB is lowered to ${conns}" || bad "8000 at 256 GB stayed ${conns}"
+[ "${reserve:-0}" -ge 15 ] && ok "the reserve is kept with the lowered limit (${reserve}%)" || bad "reserve ${reserve}% below 15%"
+
+# 3. More connections leave less shared buffers, since each one maps part of them.
+read -r _ sb_few _ <<< "$(tune 262144 500)"
+read -r _ sb_many _ <<< "$(tune 262144 4000)"
+[ "${sb_many:-0}" -lt "${sb_few:-0}" ] && ok "shared buffers shrink with connections (${sb_few} -> ${sb_many} kB)" \
+	|| bad "shared buffers did not shrink with connections (${sb_few} -> ${sb_many} kB)"
+
+# 4. Huge pages, set explicitly, remove the page tables from the budget; an unknown value falls back
+# to try.
+read -r _ sb_huge _ <<< "$(tune 262144 4000 HUGE_PAGES=on)"
+[ "${sb_huge:-0}" -gt "${sb_many:-0}" ] && ok "huge pages leave more shared buffers (${sb_many} -> ${sb_huge} kB)" \
+	|| bad "huge pages did not leave more shared buffers (${sb_many} -> ${sb_huge} kB)"
+read -r _ sb_bogus _ _ _ _ _ warnings _ <<< "$(tune 262144 4000 HUGE_PAGES=bogus)"
+[ "${sb_bogus}" = "${sb_many}" ] && [ "${warnings:-0}" -ge 1 ] && ok "an unknown HUGE_PAGES falls back to try, with a warning" \
+	|| bad "HUGE_PAGES=bogus: shared buffers ${sb_bogus} (try gives ${sb_many}), warnings ${warnings}"
+
+# 5. A standby keeps its primary's limit even when it does not fit, and still gets settings Postgres
+# accepts. The memory sizes are not multiples of 50 kB, so the budget loop cannot land on an exact
+# remainder of zero by chance.
+for case in "76800 8000" "65536 8000" "6144 700"; do
+	read -r memory floor <<< "${case}"
+	read -r conns sb wm _ _ mwm ldwm _ <<< "$(tune "${memory}" "${floor}" MAX_CONNECTIONS_MIN="${floor}")"
+	if [ "${conns}" = "${floor}" ] && valid "${sb}" "${wm}" "${mwm}" "${ldwm}"
+	then ok "the standby floor ${floor} at ${memory} MB is kept with valid settings (shared_buffers ${sb} kB)"
+	else bad "standby floor ${floor} at ${memory} MB: connections '${conns}', shared_buffers '${sb}', work_mem '${wm}', maintenance '${mwm}', logical decoding '${ldwm}'"
+	fi
+done
+
+# 6. Small memory (with 2 CPUs, as a container this small gets): from just above the fixed reserve
+# (256 MB by default) up, the settings are ones Postgres accepts, the 10-connection floor taking a
+# capped share rather than its full 16 MB each. The previous tuner gave 300 MB a work_mem of 30 kB
+# (below the 64 kB minimum) by splitting it over all 300 connections. Below the reserve the budget
+# cannot be met, and the tuner finishes and says so instead of looping.
+for memory in 300 384 512 1024; do
+	read -r conns sb wm _ _ mwm ldwm _ <<< "$(tune ${memory} 300 TEST_CPUS=2)"
+	valid "${sb}" "${wm}" "${mwm}" "${ldwm}" && ok "${memory} MB gets valid settings (connections ${conns}, shared_buffers ${sb} kB)" \
+		|| bad "${memory} MB: connections '${conns}', shared_buffers '${sb}', work_mem '${wm}', maintenance '${mwm}', logical decoding '${ldwm}'"
+done
+for memory in 256 128; do
+	read -r conns _ _ _ _ _ _ warnings failed <<< "$(tune ${memory} 300)"
+	[ -n "${conns}" ] && [ "${warnings:-0}" -ge 1 ] && [ "${failed}" = true ] \
+		&& ok "${memory} MB finishes, warns and fails closed (the reserve cannot be kept)" \
+		|| bad "${memory} MB: connections '${conns}', warnings '${warnings}', failed '${failed}'"
+done
+
+# 6b. A large standby whose primary forces a lock table that takes the reserve fails closed too:
+# the last pass's settings are valid at this size, so only the flag stops the server.
+read -r _ _ _ _ _ _ _ _ failed <<< "$(tune 32768 4874 MAX_CONNECTIONS_MIN=4874 MAX_LOCKS_PER_TRANSACTION_MIN=8000)"
+[ "${failed}" = true ] && ok "a 32 GB standby whose primary's lock table takes the reserve fails closed" \
+	|| bad "a 32 GB standby with a lock table over the reserve did not fail closed (failed '${failed}')"
+read -r _ _ _ _ _ _ _ _ failed <<< "$(tune 262144 2500)"
+[ "${failed}" = false ] && ok "a budget that fits does not fail" || bad "a budget that fits reported failed '${failed}'"
+
+# 6c. Zero divisors are raised to 1 with a warning instead of stopping on an arithmetic error.
+read -r conns _ wm _ _ _ _ warnings _ <<< "$(tune 4096 300 CONNECTION_MEMORY=0 WORK_MEM_OPERATIONS=0)"
+[ -n "${conns}" ] && [ -n "${wm}" ] && [ "${warnings:-0}" -ge 1 ] && ok "CONNECTION_MEMORY=0 and WORK_MEM_OPERATIONS=0 are raised with a warning" \
+	|| bad "zero divisors: connections '${conns}', work_mem '${wm}', warnings '${warnings}'"
+
+# 7. WAL senders follow the requested limit, not the capped one: they do not count against
+# max_connections, and replicas need them whatever the cap.
+read -r conns _ _ _ senders _ <<< "$(tune 1024 300)"
+[ "${conns}" -lt 300 ] && [ "${senders}" = 15 ] && ok "WAL senders stay at 5% of the requested 300 (${senders}) when connections are capped to ${conns}" \
+	|| bad "WAL senders ${senders} with connections ${conns} (expected 15 with fewer than 300)"
+
+echo "${pass} passed, ${fail} failed"
+[ "${fail}" -eq 0 ]

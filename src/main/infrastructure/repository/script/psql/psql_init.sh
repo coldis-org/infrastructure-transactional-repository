@@ -46,6 +46,11 @@ service cron start
 # Tune command.
 . ./psql_tune_cmd.sh
 psql_tune_cmd "$@"
+if [ "${POSTGRES_TUNE_FAILED}" = "true" ]
+then
+	echo "Not enough memory to keep the reserve with these settings (see the WARN above); not starting." >&2
+	exit 1
+fi
 
 # Check if LDAP has changed. The dot command takes no arguments in sh/dash, so
 # --skip-reload goes in as positional parameters (the exec below uses

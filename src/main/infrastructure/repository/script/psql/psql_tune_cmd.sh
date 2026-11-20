@@ -5,7 +5,7 @@
 psql_tune_cmd() {
 
 	# Original command.
-	ORIGINAL_POSTGRES_CMD="$@"
+	ORIGINAL_POSTGRES_CMD="$*"
 	POSTGRES_CMD=${ORIGINAL_POSTGRES_CMD}
 	POSTGRES_ARGS=
 	
@@ -51,9 +51,6 @@ psql_tune_cmd() {
 		available_memory
 		available_disk
 
-		# Wal senders.
-		MAX_WAL_SENDERS=$(( MAX_CONNECTIONS * MAX_WAL_SENDERS_CONN_PERC / 100 ))
-		
 		# CPU.
 		if [ -z "${MAX_CPU}" ]
 		then
@@ -66,7 +63,76 @@ psql_tune_cmd() {
 		then
 			MAX_MEMORY=$(( AVAILABLE_MEMORY * 1024 ))
 		fi
-		
+
+		# Connections. Each connection is a server process with private memory of its own
+		# (catalog and plan caches, buffers of the protocol) that none of the settings below
+		# limit, so the connection limit is bounded by the memory set aside for it rather than
+		# taken as given: refusing a connection is recoverable, the kernel killing the server is
+		# not. CONNECTION_MEMORY is in kB, like every memory value in this function.
+		CONNECTION_MEMORY=${CONNECTION_MEMORY:-16384}
+		CONNECTIONS_MEMORY_MAX_PERC=${CONNECTIONS_MEMORY_MAX_PERC:-35}
+		CONNECTION_SHARED_BUFFERS_MAPPED_PERC=${CONNECTION_SHARED_BUFFERS_MAPPED_PERC:-35}
+		WORK_MEM_OPERATIONS=${WORK_MEM_OPERATIONS:-2}
+		# Both divide below: a zero (or negative) value would stop the entrypoint on a shell
+		# arithmetic error, so it is raised to 1 with a warning instead.
+		if [ ${CONNECTION_MEMORY} -lt 1 ] || [ ${WORK_MEM_OPERATIONS} -lt 1 ]
+		then
+			echo "WARN: CONNECTION_MEMORY=${CONNECTION_MEMORY} and WORK_MEM_OPERATIONS=${WORK_MEM_OPERATIONS} must be at least 1; raising them." >&2
+			CONNECTION_MEMORY=$(( CONNECTION_MEMORY < 1 ? 1 : CONNECTION_MEMORY ))
+			WORK_MEM_OPERATIONS=$(( WORK_MEM_OPERATIONS < 1 ? 1 : WORK_MEM_OPERATIONS ))
+		fi
+		HUGE_PAGES=${HUGE_PAGES:-try}
+		case "${HUGE_PAGES}" in
+			on|off|try) ;;
+			*)
+				echo "WARN: HUGE_PAGES=${HUGE_PAGES} is not on, off or try; using try." >&2
+				HUGE_PAGES=try
+				;;
+		esac
+		# The connections' share is taken from the memory left once the reserve is kept, the same
+		# reserve the budget below keeps.
+		REQUESTED_MAX_CONNECTIONS=${MAX_CONNECTIONS}
+		RESERVE_MEMORY=$(( MAX_MEMORY * MIN_RESERVED_MEMORY_PERC / 100 ))
+		RESERVE_MEMORY=$(( RESERVE_MEMORY < MIN_RESERVED_MEMORY ? MIN_RESERVED_MEMORY : RESERVE_MEMORY ))
+		BUDGET_MEMORY=$(( MAX_MEMORY > RESERVE_MEMORY ? MAX_MEMORY - RESERVE_MEMORY : 0 ))
+		CONNECTIONS_MEMORY_SHARE=$(( BUDGET_MEMORY * CONNECTIONS_MEMORY_MAX_PERC / 100 ))
+		MAX_CONNECTIONS_FIT=$(( CONNECTIONS_MEMORY_SHARE / CONNECTION_MEMORY ))
+		# Floors: at least 10 connections, and on a standby at least its primary's, or it refuses
+		# to start (its init sets MAX_CONNECTIONS_MIN to the primary's value). When a floor is more
+		# than the share holds, the connections' memory is capped at the share instead (each gets
+		# less than CONNECTION_MEMORY): otherwise the budget below can never be met and every other
+		# setting would shrink below Postgres' minimums, leaving a server that cannot start.
+		MAX_CONNECTIONS_MIN=${MAX_CONNECTIONS_MIN:-0}
+		MAX_CONNECTIONS_FLOOR=$(( MAX_CONNECTIONS_MIN < 10 ? 10 : MAX_CONNECTIONS_MIN ))
+		CONNECTIONS_MEMORY_CAPPED=false
+		if [ ${MAX_CONNECTIONS_FLOOR} -gt ${MAX_CONNECTIONS_FIT} ]
+		then
+			CONNECTIONS_MEMORY_CAPPED=true
+			echo "WARN: ${MAX_CONNECTIONS_FLOOR} connections (the minimum, or the primary's) do not fit in ${CONNECTIONS_MEMORY_SHARE}kB at ${CONNECTION_MEMORY}kB per connection; capping their memory at that share." >&2
+			MAX_CONNECTIONS_FIT=${MAX_CONNECTIONS_FLOOR}
+		fi
+		if [ ${MAX_CONNECTIONS} -gt ${MAX_CONNECTIONS_FIT} ]
+		then
+			echo "WARN: MAX_CONNECTIONS=${MAX_CONNECTIONS} does not fit in ${MAX_MEMORY}kB of memory at ${CONNECTION_MEMORY}kB per connection; using ${MAX_CONNECTIONS_FIT}." >&2
+			MAX_CONNECTIONS=${MAX_CONNECTIONS_FIT}
+		fi
+
+		# Page tables. Every process that touches shared buffers keeps its own page table
+		# entries for them, 8 bytes for each 4 kB page (1/512 of what it maps), and they count
+		# against the container's memory as much as the buffers themselves. With huge pages,
+		# a page maps 2 MB and the cost becomes negligible. Only explicit 'on' is trusted, as
+		# 'try' silently falls back to regular pages when none are available.
+		PAGE_TABLE_RATIO=512
+		if [ "${HUGE_PAGES}" = "on" ]
+		then
+			PAGE_TABLE_RATIO=262144
+		fi
+
+		# Wal senders, from the requested connection limit: they do not count against
+		# max_connections, so lowering them with the cap would cut replication for nothing.
+		MAX_WAL_SENDERS=$(( REQUESTED_MAX_CONNECTIONS * MAX_WAL_SENDERS_CONN_PERC / 100 ))
+		MAX_WAL_SENDERS=$(( MAX_WAL_SENDERS < 2 ? 2 : MAX_WAL_SENDERS ))
+
 		# Disk size,
 		if [ -z "${DISK_SIZE}" ]
 		then
@@ -100,7 +166,9 @@ psql_tune_cmd() {
 		MAX_PARALLEL_WORKERS_PER_GATHER=$(( MAX_PARALLEL_WORKERS_PER_GATHER < 1 ? 1 : MAX_PARALLEL_WORKERS_PER_GATHER ))
 		MAX_PARALLEL_WORKERS_PER_GATHER=$(( MAX_PARALLEL_WORKERS_PER_GATHER > MAX_WORKER_PROCESSES ? MAX_WORKER_PROCESSES : MAX_PARALLEL_WORKERS_PER_GATHER ))
 		
-		# Max memory.
+		# Max memory. POSTGRES_TUNE_FAILED tells the caller the reserve could not be kept.
+		# shellcheck disable=SC2034  # read by the script that sources this file
+		POSTGRES_TUNE_FAILED=false
 		NON_RESERVED_MAX_MEMORY=${MAX_MEMORY}
 		TOTAL_CONFIGURED_MEMORY=0
 		ACTUAL_RESERVED_MEMORY=$(( MAX_MEMORY - TOTAL_CONFIGURED_MEMORY ))
@@ -127,7 +195,10 @@ psql_tune_cmd() {
 			EFFECTIVE_CACHE_SIZE=$(( NON_RESERVED_MAX_MEMORY * EFFECTIVE_CACHE_SIZE_PERC / 100 ))
 			TOTAL_WORK_MEM=$(( NON_RESERVED_MAX_MEMORY * TOTAL_WORK_MEM_PERC / 100 ))
 			MIN_DYNAMIC_SHARED_MEMORY=$(( NON_RESERVED_MAX_MEMORY * MIN_DYNAMIC_SHARED_MEMORY_PERC / 100 ))
-			WORK_MEM=$(( TOTAL_WORK_MEM / MAX_CONNECTIONS ))
+			# A query takes work_mem once per sort or hash node it runs (hashes take twice,
+			# by hash_mem_multiplier), not once per connection.
+			WORK_MEM=$(( TOTAL_WORK_MEM / MAX_CONNECTIONS / WORK_MEM_OPERATIONS ))
+			WORK_MEM=$(( WORK_MEM < 64 ? 64 : WORK_MEM ))
 			TOTAL_MAINTENANCE_WORK_MEM=$(( NON_RESERVED_MAX_MEMORY * TOTAL_MAINTENANCE_WORK_MEM_PERC / 100 ))
 			MAINTENANCE_WORK_MEM=$(( TOTAL_MAINTENANCE_WORK_MEM / (MAX_PARALLEL_MAINTENANCE_WORKERS + AUTOVACUUM_MAX_WORKERS )))
 			
@@ -143,11 +214,32 @@ psql_tune_cmd() {
 			MAX_LOCKS_PER_TRANSACTION=$(( MAX_LOCKS_PER_TRANSACTION < MAX_LOCKS_PER_TRANSACTION_MIN ? MAX_LOCKS_PER_TRANSACTION_MIN : MAX_LOCKS_PER_TRANSACTION ))
 			TOTAL_LOCKS_MEMORY=$(( MAX_LOCKS_PER_TRANSACTION * MAX_CONNECTIONS * 3 / 4 ))
 
+			# Connections: the private memory of each process plus the page tables for the part
+			# of shared buffers it maps. Shrinking shared buffers shrinks the latter, which is
+			# what lets many connections fit at all without huge pages.
+			CONNECTION_PAGE_TABLES=$(( SHARED_BUFFERS * CONNECTION_SHARED_BUFFERS_MAPPED_PERC / 100 / PAGE_TABLE_RATIO ))
+			TOTAL_CONNECTIONS_MEMORY=$(( MAX_CONNECTIONS * (CONNECTION_MEMORY + CONNECTION_PAGE_TABLES) ))
+			if [ "${CONNECTIONS_MEMORY_CAPPED}" = true ] && [ ${TOTAL_CONNECTIONS_MEMORY} -gt ${CONNECTIONS_MEMORY_SHARE} ]
+			then
+				TOTAL_CONNECTIONS_MEMORY=${CONNECTIONS_MEMORY_SHARE}
+			fi
+
 			# Updates reserved memory.
-			TOTAL_CONFIGURED_MEMORY=$(( WAL_BUFFERS + WAL_WRITER_FLUSH_AFTER + WAL_DECODE_BUFFER_SIZE + TOTAL_LOGICAL_DECODING_WORK_MEM + SHARED_BUFFERS + TOTAL_WORK_MEM + TOTAL_MAINTENANCE_WORK_MEM + TOTAL_LOCKS_MEMORY ))
+			TOTAL_CONFIGURED_MEMORY=$(( WAL_BUFFERS + WAL_WRITER_FLUSH_AFTER + WAL_DECODE_BUFFER_SIZE + TOTAL_LOGICAL_DECODING_WORK_MEM + SHARED_BUFFERS + TOTAL_WORK_MEM + TOTAL_MAINTENANCE_WORK_MEM + TOTAL_LOCKS_MEMORY + TOTAL_CONNECTIONS_MEMORY ))
 			ACTUAL_RESERVED_MEMORY=$(( MAX_MEMORY - TOTAL_CONFIGURED_MEMORY ))
 			ACTUAL_RESERVED_MEMORY_PERC=$(( ACTUAL_RESERVED_MEMORY * 100 / MAX_MEMORY ))
 			NON_RESERVED_MAX_MEMORY=$(( NON_RESERVED_MAX_MEMORY - (MAX_MEMORY / 50 )))
+			# Guard against looping forever should the fixed costs alone not fit (memory below the
+			# reserve itself, or a lock table that takes it all). The caller stops on
+			# POSTGRES_TUNE_FAILED rather than start a server without its reserve: the last pass's
+			# settings are not reliably below Postgres' minimums on a large container.
+			if [ ${NON_RESERVED_MAX_MEMORY} -le 0 ]
+			then
+				# shellcheck disable=SC2034  # read by the script that sources this file
+				POSTGRES_TUNE_FAILED=true
+				echo "WARN: could not keep ${MIN_RESERVED_MEMORY_PERC}% and at least ${MIN_RESERVED_MEMORY}kB of ${MAX_MEMORY}kB in reserve (${MAX_CONNECTIONS} connections take ${TOTAL_CONNECTIONS_MEMORY}kB, the lock table ${TOTAL_LOCKS_MEMORY}kB); reserve is ${ACTUAL_RESERVED_MEMORY}kB." >&2
+				break
+			fi
 #			echo "MAX_MEMORY=${MAX_MEMORY}"
 #			echo "TOTAL_CONFIGURED_MEMORY=${TOTAL_CONFIGURED_MEMORY}"
 #			echo "ACTUAL_RESERVED_MEMORY=${ACTUAL_RESERVED_MEMORY}"
@@ -187,6 +279,7 @@ psql_tune_cmd() {
  -c wal_decode_buffer_size=${WAL_DECODE_BUFFER_SIZE}kB \
  -c logical_decoding_work_mem=${LOGICAL_DECODING_WORK_MEM}kB \
  -c shared_buffers=${SHARED_BUFFERS}kB \
+ -c huge_pages=${HUGE_PAGES} \
  -c effective_cache_size=${EFFECTIVE_CACHE_SIZE}kB \
  -c work_mem=${WORK_MEM}kB \
  -c maintenance_work_mem=${MAINTENANCE_WORK_MEM}kB \
@@ -255,6 +348,7 @@ psql_tune_cmd() {
 	fi
 	
 	# Prints the modified command.
+	# shellcheck disable=SC2034  # the result, read by the script that sources this file
 	POSTGRES_TUNED_CMD="${POSTGRES_CMD} ${POSTGRES_ARGS}"
 	
 }

@@ -1,6 +1,21 @@
 #!/bin/sh
 
 
+# Prints the value given for a setting when it is a whole number (leading zeros dropped, so the
+# shell never reads it as octal); otherwise warns and prints the default. Keeps an arithmetic
+# error from the environment from stopping the entrypoint.
+psql_tune_integer() { # name value default
+	case "$2" in
+		''|*[!0-9]*)
+			echo "WARN: $1=$2 is not a whole number; using ${3:-none}." >&2
+			echo "$3"
+			;;
+		*)
+			echo "$2" | sed 's/^0*\([0-9]\)/\1/'
+			;;
+	esac
+}
+
 # Gets postgres tuned parameters.
 psql_tune_cmd() {
 
@@ -90,26 +105,60 @@ psql_tune_cmd() {
 				;;
 		esac
 		# Share of the connections expected to run a query at the same time, which work_mem is
-		# split over (1 to 100). At 100 every connection may sort at once; a pool that keeps most
-		# connections idle can lower it and get a larger work_mem for the same total.
-		WORK_MEM_ACTIVE_PERC=${WORK_MEM_ACTIVE_PERC:-100}
-		if [ ${WORK_MEM_ACTIVE_PERC} -lt 1 ] || [ ${WORK_MEM_ACTIVE_PERC} -gt 100 ]
+		# split over (10 to 100). At 100 every connection may sort at once; at the default 65 a
+		# query gets about half as much again, and work memory can go past its share of the budget
+		# when more than that run at once (the boot line below gives the worst case). The floor of
+		# 10 keeps that over-commit at ten times at most. ALTER ROLE ... SET work_mem is the safer
+		# way to give the few roles that need it more.
+		WORK_MEM_ACTIVE_PERC=$(psql_tune_integer WORK_MEM_ACTIVE_PERC "${WORK_MEM_ACTIVE_PERC:-65}" 65)
+		if [ "${WORK_MEM_ACTIVE_PERC}" -lt 10 ] || [ "${WORK_MEM_ACTIVE_PERC}" -gt 100 ]
 		then
-			echo "WARN: WORK_MEM_ACTIVE_PERC=${WORK_MEM_ACTIVE_PERC} is not between 1 and 100; clamping it." >&2
-			WORK_MEM_ACTIVE_PERC=$(( WORK_MEM_ACTIVE_PERC < 1 ? 1 : 100 ))
+			echo "WARN: WORK_MEM_ACTIVE_PERC=${WORK_MEM_ACTIVE_PERC} is not between 10 and 100; clamping it." >&2
+			WORK_MEM_ACTIVE_PERC=$(( WORK_MEM_ACTIVE_PERC < 10 ? 10 : 100 ))
+		fi
+		# Optional cap on work_mem, in kB; empty means none.
+		WORK_MEM_MAX=${WORK_MEM_MAX:-}
+		if [ -n "${WORK_MEM_MAX}" ]
+		then
+			WORK_MEM_MAX=$(psql_tune_integer WORK_MEM_MAX "${WORK_MEM_MAX}" "")
+			if [ -n "${WORK_MEM_MAX}" ] && [ "${WORK_MEM_MAX}" -lt 64 ]
+			then
+				echo "WARN: WORK_MEM_MAX=${WORK_MEM_MAX} is below the 64kB minimum of work_mem; using 64." >&2
+				WORK_MEM_MAX=64
+			fi
 		fi
 		# Parallel workers a single query may take for each gather. Each one is a server process
 		# with its own work_mem for every sort or hash it runs, so a query with N workers can take
 		# N+1 times the memory of a serial one: a percentage of the CPUs alone gives a large host
 		# tens of workers per query, which suits a warehouse and not a transactional database.
-		MAX_PARALLEL_WORKERS_PER_GATHER_MAX=${MAX_PARALLEL_WORKERS_PER_GATHER_MAX:-4}
+		# 0 turns parallel query off.
+		MAX_PARALLEL_WORKERS_PER_GATHER_MAX=$(psql_tune_integer MAX_PARALLEL_WORKERS_PER_GATHER_MAX "${MAX_PARALLEL_WORKERS_PER_GATHER_MAX:-2}" 2)
 		# Sessions left idle inside a transaction hold their locks, snapshot and memory until
-		# they are ended. 0 disables.
+		# they are ended. 0 disables. A value the server does not take would stop it from starting,
+		# so anything but a number with an optional unit falls back to the default.
 		IDLE_IN_TRANSACTION_SESSION_TIMEOUT=${IDLE_IN_TRANSACTION_SESSION_TIMEOUT:-30min}
+		IDLE_IN_TRANSACTION_SESSION_TIMEOUT_VALID=false
+		case "${IDLE_IN_TRANSACTION_SESSION_TIMEOUT}" in
+			*[!0-9a-z]*) ;;
+			*)
+				if echo "${IDLE_IN_TRANSACTION_SESSION_TIMEOUT}" | grep -Eqx '[0-9]+(ms|s|min|h|d)?'
+				then
+					IDLE_IN_TRANSACTION_SESSION_TIMEOUT_VALID=true
+				fi
+				;;
+		esac
+		if [ "${IDLE_IN_TRANSACTION_SESSION_TIMEOUT_VALID}" != true ]
+		then
+			echo "WARN: IDLE_IN_TRANSACTION_SESSION_TIMEOUT=${IDLE_IN_TRANSACTION_SESSION_TIMEOUT} is not a number with an optional unit (ms, s, min, h, d); using 30min." >&2
+			IDLE_IN_TRANSACTION_SESSION_TIMEOUT=30min
+		fi
 		# Floors for a standby, which refuses to start below its primary's values (its init sets
 		# them); they are budgeted like any other process.
-		MAX_WORKER_PROCESSES_MIN=${MAX_WORKER_PROCESSES_MIN:-0}
-		MAX_WAL_SENDERS_MIN=${MAX_WAL_SENDERS_MIN:-0}
+		MAX_WORKER_PROCESSES_MIN=$(psql_tune_integer MAX_WORKER_PROCESSES_MIN "${MAX_WORKER_PROCESSES_MIN:-0}" 0)
+		MAX_WAL_SENDERS_MIN=$(psql_tune_integer MAX_WAL_SENDERS_MIN "${MAX_WAL_SENDERS_MIN:-0}" 0)
+		# Share of the budget the other server processes' memory may take at most (see below).
+		SERVER_PROCESSES_MEMORY_MAX_PERC=$(psql_tune_integer SERVER_PROCESSES_MEMORY_MAX_PERC "${SERVER_PROCESSES_MEMORY_MAX_PERC:-10}" 10)
+		SERVER_PROCESSES_MEMORY_MAX_PERC=$(( SERVER_PROCESSES_MEMORY_MAX_PERC > 100 ? 100 : SERVER_PROCESSES_MEMORY_MAX_PERC ))
 		REQUESTED_MAX_CONNECTIONS=${MAX_CONNECTIONS}
 
 		# Wal senders, from the requested connection limit: they do not count against
@@ -144,21 +193,35 @@ psql_tune_cmd() {
 		# tables of its own like a connection: the background workers (parallel query, logical
 		# replication), the autovacuum workers, the WAL senders, and the fixed auxiliary ones
 		# (checkpointer, background writer, WAL writer, autovacuum launcher, archiver or WAL
-		# receiver, logical replication launcher). Lock table rows exist for each of them but the
-		# auxiliary ones, as PostgreSQL sizes it over max_connections + autovacuum_max_workers + 1
-		# + max_worker_processes + max_wal_senders.
+		# receiver, logical replication launcher; from PostgreSQL 18 also the 3 I/O workers of
+		# the default io_method). They have a budget term of their own below and do not lower
+		# max_connections. Their slots are an upper bound seldom all in use (parallel workers run
+		# only during a parallel query, WAL senders only for an attached replica), so that term is
+		# capped at SERVER_PROCESSES_MEMORY_MAX_PERC of the budget: a small container reaches the
+		# cap, a large one does not.
+		# Lock table rows exist for each of them but the auxiliary ones, as PostgreSQL sizes it
+		# over max_connections + autovacuum_max_workers + 1 + max_worker_processes +
+		# max_wal_senders. PostgreSQL 18 uses autovacuum_worker_slots (16 by default) there in
+		# place of autovacuum_max_workers, so the larger of the two is counted.
+		PG_MAJOR_VERSION=$(psql_tune_integer PG_MAJOR "${PG_MAJOR:-0}" 0)
 		AUXILIARY_PROCESSES=6
+		AUTOVACUUM_LOCK_SLOTS=${AUTOVACUUM_MAX_WORKERS}
+		if [ "${PG_MAJOR_VERSION}" -ge 18 ]
+		then
+			AUXILIARY_PROCESSES=9
+			AUTOVACUUM_LOCK_SLOTS=$(( AUTOVACUUM_MAX_WORKERS < 16 ? 16 : AUTOVACUUM_MAX_WORKERS ))
+		fi
 		SERVER_PROCESSES=$(( MAX_WORKER_PROCESSES + AUTOVACUUM_MAX_WORKERS + MAX_WAL_SENDERS + AUXILIARY_PROCESSES ))
-		SERVER_LOCK_SLOTS=$(( MAX_WORKER_PROCESSES + AUTOVACUUM_MAX_WORKERS + 1 + MAX_WAL_SENDERS ))
+		SERVER_LOCK_SLOTS=$(( MAX_WORKER_PROCESSES + AUTOVACUUM_LOCK_SLOTS + 1 + MAX_WAL_SENDERS ))
 
 		# The connections' share is taken from the memory left once the reserve is kept, the same
-		# reserve the budget below keeps. The other server processes come out of it first.
+		# reserve the budget below keeps.
 		RESERVE_MEMORY=$(( MAX_MEMORY * MIN_RESERVED_MEMORY_PERC / 100 ))
 		RESERVE_MEMORY=$(( RESERVE_MEMORY < MIN_RESERVED_MEMORY ? MIN_RESERVED_MEMORY : RESERVE_MEMORY ))
 		BUDGET_MEMORY=$(( MAX_MEMORY > RESERVE_MEMORY ? MAX_MEMORY - RESERVE_MEMORY : 0 ))
 		CONNECTIONS_MEMORY_SHARE=$(( BUDGET_MEMORY * CONNECTIONS_MEMORY_MAX_PERC / 100 ))
-		MAX_CONNECTIONS_FIT=$(( CONNECTIONS_MEMORY_SHARE / CONNECTION_MEMORY - SERVER_PROCESSES ))
-		MAX_CONNECTIONS_FIT=$(( MAX_CONNECTIONS_FIT < 0 ? 0 : MAX_CONNECTIONS_FIT ))
+		SERVER_PROCESSES_MEMORY_SHARE=$(( BUDGET_MEMORY * SERVER_PROCESSES_MEMORY_MAX_PERC / 100 ))
+		MAX_CONNECTIONS_FIT=$(( CONNECTIONS_MEMORY_SHARE / CONNECTION_MEMORY ))
 		# Floors: at least 10 connections, and on a standby at least its primary's, or it refuses
 		# to start (its init sets MAX_CONNECTIONS_MIN to the primary's value). When a floor is more
 		# than the share holds, the connections' memory is capped at the share instead (each gets
@@ -170,12 +233,12 @@ psql_tune_cmd() {
 		if [ ${MAX_CONNECTIONS_FLOOR} -gt ${MAX_CONNECTIONS_FIT} ]
 		then
 			CONNECTIONS_MEMORY_CAPPED=true
-			echo "WARN: ${MAX_CONNECTIONS_FLOOR} connections (the minimum, or the primary's) and ${SERVER_PROCESSES} other server processes do not fit in ${CONNECTIONS_MEMORY_SHARE}kB at ${CONNECTION_MEMORY}kB per process; capping their memory at that share." >&2
+			echo "WARN: ${MAX_CONNECTIONS_FLOOR} connections (the minimum, or the primary's) do not fit in ${CONNECTIONS_MEMORY_SHARE}kB at ${CONNECTION_MEMORY}kB per connection; capping their memory at that share." >&2
 			MAX_CONNECTIONS_FIT=${MAX_CONNECTIONS_FLOOR}
 		fi
 		if [ ${MAX_CONNECTIONS} -gt ${MAX_CONNECTIONS_FIT} ]
 		then
-			echo "WARN: MAX_CONNECTIONS=${MAX_CONNECTIONS} does not fit in ${MAX_MEMORY}kB of memory at ${CONNECTION_MEMORY}kB per process (with ${SERVER_PROCESSES} other server processes); using ${MAX_CONNECTIONS_FIT}." >&2
+			echo "WARN: MAX_CONNECTIONS=${MAX_CONNECTIONS} does not fit in ${MAX_MEMORY}kB of memory at ${CONNECTION_MEMORY}kB per connection; using ${MAX_CONNECTIONS_FIT}." >&2
 			MAX_CONNECTIONS=${MAX_CONNECTIONS_FIT}
 		fi
 
@@ -241,6 +304,10 @@ psql_tune_cmd() {
 			WORK_MEM_ACTIVE_CONNECTIONS=$(( WORK_MEM_ACTIVE_CONNECTIONS < 1 ? 1 : WORK_MEM_ACTIVE_CONNECTIONS ))
 			WORK_MEM=$(( TOTAL_WORK_MEM / (WORK_MEM_ACTIVE_CONNECTIONS + MAX_PARALLEL_WORKERS) / WORK_MEM_OPERATIONS ))
 			WORK_MEM=$(( WORK_MEM < 64 ? 64 : WORK_MEM ))
+			if [ -n "${WORK_MEM_MAX}" ] && [ ${WORK_MEM} -gt ${WORK_MEM_MAX} ]
+			then
+				WORK_MEM=${WORK_MEM_MAX}
+			fi
 			TOTAL_MAINTENANCE_WORK_MEM=$(( NON_RESERVED_MAX_MEMORY * TOTAL_MAINTENANCE_WORK_MEM_PERC / 100 ))
 			MAINTENANCE_WORK_MEM=$(( TOTAL_MAINTENANCE_WORK_MEM / (MAX_PARALLEL_MAINTENANCE_WORKERS + AUTOVACUUM_MAX_WORKERS )))
 			
@@ -259,19 +326,21 @@ psql_tune_cmd() {
 			# connections alone.
 			TOTAL_LOCKS_MEMORY=$(( MAX_LOCKS_PER_TRANSACTION * (MAX_CONNECTIONS + SERVER_LOCK_SLOTS) * 3 / 4 ))
 
-			# Connections and the other server processes: the private memory of each process
-			# plus the page tables for the part of shared buffers it maps. Shrinking shared
-			# buffers shrinks the latter, which is what lets many connections fit at all without
-			# huge pages.
+			# Connections, and the other server processes in a term of their own: the private
+			# memory of each process plus the page tables for the part of shared buffers it maps.
+			# Shrinking shared buffers shrinks the latter, which is what lets many connections fit
+			# at all without huge pages.
 			CONNECTION_PAGE_TABLES=$(( SHARED_BUFFERS * CONNECTION_SHARED_BUFFERS_MAPPED_PERC / 100 / PAGE_TABLE_RATIO ))
-			TOTAL_CONNECTIONS_MEMORY=$(( (MAX_CONNECTIONS + SERVER_PROCESSES) * (CONNECTION_MEMORY + CONNECTION_PAGE_TABLES) ))
+			TOTAL_CONNECTIONS_MEMORY=$(( MAX_CONNECTIONS * (CONNECTION_MEMORY + CONNECTION_PAGE_TABLES) ))
 			if [ "${CONNECTIONS_MEMORY_CAPPED}" = true ] && [ ${TOTAL_CONNECTIONS_MEMORY} -gt ${CONNECTIONS_MEMORY_SHARE} ]
 			then
 				TOTAL_CONNECTIONS_MEMORY=${CONNECTIONS_MEMORY_SHARE}
 			fi
+			TOTAL_SERVER_PROCESSES_MEMORY=$(( SERVER_PROCESSES * (CONNECTION_MEMORY + CONNECTION_PAGE_TABLES) ))
+			TOTAL_SERVER_PROCESSES_MEMORY=$(( TOTAL_SERVER_PROCESSES_MEMORY > SERVER_PROCESSES_MEMORY_SHARE ? SERVER_PROCESSES_MEMORY_SHARE : TOTAL_SERVER_PROCESSES_MEMORY ))
 
 			# Updates reserved memory.
-			TOTAL_CONFIGURED_MEMORY=$(( WAL_BUFFERS + WAL_WRITER_FLUSH_AFTER + WAL_DECODE_BUFFER_SIZE + TOTAL_LOGICAL_DECODING_WORK_MEM + SHARED_BUFFERS + TOTAL_WORK_MEM + TOTAL_MAINTENANCE_WORK_MEM + TOTAL_LOCKS_MEMORY + TOTAL_CONNECTIONS_MEMORY ))
+			TOTAL_CONFIGURED_MEMORY=$(( WAL_BUFFERS + WAL_WRITER_FLUSH_AFTER + WAL_DECODE_BUFFER_SIZE + TOTAL_LOGICAL_DECODING_WORK_MEM + SHARED_BUFFERS + TOTAL_WORK_MEM + TOTAL_MAINTENANCE_WORK_MEM + TOTAL_LOCKS_MEMORY + TOTAL_CONNECTIONS_MEMORY + TOTAL_SERVER_PROCESSES_MEMORY ))
 			ACTUAL_RESERVED_MEMORY=$(( MAX_MEMORY - TOTAL_CONFIGURED_MEMORY ))
 			ACTUAL_RESERVED_MEMORY_PERC=$(( ACTUAL_RESERVED_MEMORY * 100 / MAX_MEMORY ))
 			NON_RESERVED_MAX_MEMORY=$(( NON_RESERVED_MAX_MEMORY - (MAX_MEMORY / 50 )))
@@ -283,7 +352,7 @@ psql_tune_cmd() {
 			then
 				# shellcheck disable=SC2034  # read by the script that sources this file
 				POSTGRES_TUNE_FAILED=true
-				echo "WARN: could not keep ${MIN_RESERVED_MEMORY_PERC}% and at least ${MIN_RESERVED_MEMORY}kB of ${MAX_MEMORY}kB in reserve (${MAX_CONNECTIONS} connections take ${TOTAL_CONNECTIONS_MEMORY}kB, the lock table ${TOTAL_LOCKS_MEMORY}kB); reserve is ${ACTUAL_RESERVED_MEMORY}kB." >&2
+				echo "WARN: could not keep ${MIN_RESERVED_MEMORY_PERC}% and at least ${MIN_RESERVED_MEMORY}kB of ${MAX_MEMORY}kB in reserve (${MAX_CONNECTIONS} connections take ${TOTAL_CONNECTIONS_MEMORY}kB, ${SERVER_PROCESSES} other server processes ${TOTAL_SERVER_PROCESSES_MEMORY}kB, the lock table ${TOTAL_LOCKS_MEMORY}kB); reserve is ${ACTUAL_RESERVED_MEMORY}kB." >&2
 				break
 			fi
 #			echo "MAX_MEMORY=${MAX_MEMORY}"
@@ -291,9 +360,26 @@ psql_tune_cmd() {
 #			echo "ACTUAL_RESERVED_MEMORY=${ACTUAL_RESERVED_MEMORY}"
 #			echo "ACTUAL_RESERVED_MEMORY_RATIO=${ACTUAL_RESERVED_MEMORY_RATIO}"
 #			echo "NON_RESERVED_MAX_MEMORY=${NON_RESERVED_MAX_MEMORY}"
-			
+
 		done
-		
+
+		# work_mem sized for fewer than all connections at once is an over-commit: say how far
+		# work memory can go when every connection and parallel worker sorts at the same time.
+		if [ ${WORK_MEM_ACTIVE_PERC} -lt 100 ]
+		then
+			WORK_MEM_WORST_CASE=$(( (MAX_CONNECTIONS + MAX_PARALLEL_WORKERS) * WORK_MEM_OPERATIONS * WORK_MEM ))
+			echo "WARN: WORK_MEM_ACTIVE_PERC=${WORK_MEM_ACTIVE_PERC} sizes work_mem=${WORK_MEM}kB for ${WORK_MEM_ACTIVE_PERC}% of the connections at once; with all ${MAX_CONNECTIONS} connections and ${MAX_PARALLEL_WORKERS} parallel workers running ${WORK_MEM_OPERATIONS} operations each, work memory can reach ${WORK_MEM_WORST_CASE}kB, $(( WORK_MEM_WORST_CASE * 100 / MAX_MEMORY ))% of the ${MAX_MEMORY}kB limit (budgeted ${TOTAL_WORK_MEM}kB)." >&2
+		fi
+
+		# A few connections are kept for superusers when max_connections is exhausted, so that
+		# administration (and the memory guard) can still get in. It must stay below
+		# max_connections, or the server does not start.
+		SUPERUSER_RESERVED_CONNECTIONS=5
+		if [ ${SUPERUSER_RESERVED_CONNECTIONS} -ge ${MAX_CONNECTIONS} ]
+		then
+			SUPERUSER_RESERVED_CONNECTIONS=$(( MAX_CONNECTIONS > 1 ? MAX_CONNECTIONS - 1 : 0 ))
+		fi
+
 		# Disk config.
 		DISK_SIZE_MB=$(( DISK_SIZE / 1024 / 1024 ))
 		MIN_WAL_SIZE=$(( DISK_SIZE_MB * MIN_WAL_SIZE_DISC_PERC / 100 ))
@@ -314,6 +400,7 @@ psql_tune_cmd() {
 		# Arguments.
 		POSTGRES_TUNED_ARGS="\
  -c max_connections=${MAX_CONNECTIONS} \
+ -c superuser_reserved_connections=${SUPERUSER_RESERVED_CONNECTIONS} \
  -c max_wal_senders=${MAX_WAL_SENDERS} \
  -c max_worker_processes=${MAX_WORKER_PROCESSES} \
  -c max_parallel_workers=${MAX_PARALLEL_WORKERS} \

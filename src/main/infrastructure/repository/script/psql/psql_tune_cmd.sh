@@ -5,7 +5,7 @@
 psql_tune_cmd() {
 
 	# Original command.
-	ORIGINAL_POSTGRES_CMD="$@"
+	ORIGINAL_POSTGRES_CMD="$*"
 	POSTGRES_CMD=${ORIGINAL_POSTGRES_CMD}
 	POSTGRES_ARGS=
 	
@@ -305,6 +305,7 @@ psql_tune_cmd() {
 	fi
 	
 	# Prints the modified command.
+	# shellcheck disable=SC2034  # the result, read by the script that sources this file
 	POSTGRES_TUNED_CMD="${POSTGRES_CMD} ${POSTGRES_ARGS}"
 	
 }

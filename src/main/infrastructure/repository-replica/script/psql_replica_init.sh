@@ -120,6 +120,7 @@ echo "Primary recorded max_connections=${PRIMARY_MAX_CONNECTIONS} max_locks_per_
 MAX_CONNECTIONS=$(( MAX_CONNECTIONS < PRIMARY_MAX_CONNECTIONS ? PRIMARY_MAX_CONNECTIONS : MAX_CONNECTIONS ))
 # The tuner lowers max_connections to what its memory holds; never below the primary's, or the
 # standby would not start. The tuner then shrinks shared buffers to make room instead.
+# shellcheck disable=SC2034  # read by psql_tune_cmd.sh, sourced below
 MAX_CONNECTIONS_MIN=${PRIMARY_MAX_CONNECTIONS:-0}
 MAX_LOCKS_PER_TRANSACTION_MIN=$(( MAX_LOCKS_PER_TRANSACTION_MIN < PRIMARY_MAX_LOCKS_PER_TRANSACTION ? PRIMARY_MAX_LOCKS_PER_TRANSACTION : MAX_LOCKS_PER_TRANSACTION_MIN ))
 

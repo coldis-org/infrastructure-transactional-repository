@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# Tests for the memory budget of psql_tune_cmd.sh: connections (each one's own memory and its page
-# tables for shared buffers) count against the container's memory, max_connections is lowered to
-# what fits, and a standby's floor (the primary's max_connections) is kept. Runs on the host, with
+# Tests for the memory budget of psql_tune_cmd.sh: connections and the other server processes (each
+# one's own memory and its page tables for shared buffers) count against the container's memory,
+# max_connections is lowered to what fits, a standby's floors (the primary's values) are kept, and
+# work_mem is split over the sessions and parallel workers that can run at once. Runs on the host, with
 # no docker: it stubs os_limits with the given CPUs and memory and takes every other default from
 # the ENV block of the image's Dockerfile7.
 #
@@ -41,6 +42,17 @@ tune() { # memory-mb connections [VAR=value...]
 		. ./psql_tune_cmd.sh; psql_tune_cmd postgres >/dev/null 2>'${WORK}/stderr'
 		WARNINGS=\$(grep -c WARN '${WORK}/stderr')
 		echo \"\${MAX_CONNECTIONS} \${SHARED_BUFFERS} \${WORK_MEM} \${ACTUAL_RESERVED_MEMORY_PERC} \${MAX_WAL_SENDERS} \${MAINTENANCE_WORK_MEM} \${LOGICAL_DECODING_WORK_MEM} \${WARNINGS} \${POSTGRES_TUNE_FAILED}\"")
+}
+
+# Tunes like tune() and prints the named variables, space separated (POSTGRES_TUNED_CMD last when
+# asked for, since it holds spaces).
+tunevars() { # memory-mb connections "VAR..." [VAR=value...]
+	local memory=$1 connections=$2 vars=$3 out=""; shift 3
+	for var in ${vars}; do out="${out} \${${var}}"; done
+	(cd "${REPOSITORY}/script/psql" && PATH="${WORK}/bin:${PATH}" TEST_CPUS=16 TEST_MEMORY_MB=${memory} \
+		PGDATA=/ timeout 20 sh -c ". '${WORK}/env.sh'; export MAX_CONNECTIONS=${connections} $*
+		. ./psql_tune_cmd.sh; psql_tune_cmd postgres >/dev/null 2>'${WORK}/stderr'
+		echo \"${out# }\"")
 }
 
 # True when every sized memory setting is at or above Postgres' minimum (kB), so the server starts.
@@ -121,6 +133,64 @@ read -r conns _ wm _ _ _ _ warnings _ <<< "$(tune 4096 300 CONNECTION_MEMORY=0 W
 read -r conns _ _ _ senders _ <<< "$(tune 1024 300)"
 [ "${conns}" -lt 300 ] && [ "${senders}" = 15 ] && ok "WAL senders stay at 5% of the requested 300 (${senders}) when connections are capped to ${conns}" \
 	|| bad "WAL senders ${senders} with connections ${conns} (expected 15 with fewer than 300)"
+
+# 8. work_mem is split over the connections expected to run a query at once (WORK_MEM_ACTIVE_PERC),
+# not over all of them; out-of-range values are clamped with a warning, never divide by zero.
+read -r wm_all <<< "$(tunevars 262144 2500 WORK_MEM)"
+read -r wm_quarter <<< "$(tunevars 262144 2500 WORK_MEM WORK_MEM_ACTIVE_PERC=25)"
+[ "${wm_quarter:-0}" -gt $(( ${wm_all:-0} * 2 )) ] && ok "WORK_MEM_ACTIVE_PERC=25 gives a larger work_mem (${wm_all} -> ${wm_quarter} kB)" \
+	|| bad "WORK_MEM_ACTIVE_PERC=25: work_mem ${wm_all} -> ${wm_quarter} kB"
+for perc in 0 500; do
+	read -r wm conns <<< "$(tunevars 262144 2500 "WORK_MEM MAX_CONNECTIONS" WORK_MEM_ACTIVE_PERC=${perc})"
+	warnings=$(grep -c WORK_MEM_ACTIVE_PERC "${WORK}/stderr")
+	[ -n "${wm}" ] && [ "${wm}" -ge 64 ] && [ "${warnings}" -ge 1 ] && ok "WORK_MEM_ACTIVE_PERC=${perc} is clamped with a warning (work_mem ${wm} kB)" \
+		|| bad "WORK_MEM_ACTIVE_PERC=${perc}: work_mem '${wm}', warnings ${warnings}"
+done
+
+# 9. Every parallel worker takes its own work_mem: more of them leave each a smaller one.
+read -r wm_few <<< "$(tunevars 262144 2500 WORK_MEM MAX_PARALLEL_WORKERS_PERC=1)"
+read -r wm_many <<< "$(tunevars 262144 2500 WORK_MEM MAX_PARALLEL_WORKERS_PERC=100 MAX_WORKER_PROCESSES=1000)"
+[ "${wm_many:-0}" -lt "${wm_few:-0}" ] && ok "parallel workers take work_mem of their own (${wm_few} -> ${wm_many} kB)" \
+	|| bad "parallel workers did not lower work_mem (${wm_few} -> ${wm_many} kB)"
+
+# 10. Parallel workers per query are capped (MAX_PARALLEL_WORKERS_PER_GATHER_MAX, 4 by default):
+# a percentage of 64 CPUs alone gives 38.
+read -r gather <<< "$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64)"
+[ "${gather}" = 4 ] && ok "64 CPUs get 4 parallel workers per gather" || bad "64 CPUs get ${gather} parallel workers per gather"
+read -r gather <<< "$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0)"
+[ "${gather}" = 0 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0 turns parallel query off" || bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0 gave ${gather}"
+read -r gather <<< "$(tunevars 1024 300 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=2)"
+[ "${gather}" = 1 ] && ok "2 CPUs keep 1 parallel worker per gather" || bad "2 CPUs get ${gather} parallel workers per gather"
+
+# 11. The other server processes (background workers, autovacuum workers, WAL senders) cost memory
+# like a connection: more of them leave room for fewer connections and less shared buffers, and
+# the reserve is still kept.
+read -r conns_few <<< "$(tunevars 4096 300 MAX_CONNECTIONS MAX_WORKER_PROCESSES=8)"
+read -r conns_many <<< "$(tunevars 4096 300 MAX_CONNECTIONS MAX_WORKER_PROCESSES=40)"
+[ "${conns_many:-0}" -lt "${conns_few:-0}" ] && ok "worker processes take room from connections (${conns_few} -> ${conns_many})" \
+	|| bad "worker processes did not take room from connections (${conns_few} -> ${conns_many})"
+read -r sb_few <<< "$(tunevars 262144 2500 SHARED_BUFFERS MAX_WORKER_PROCESSES=8)"
+read -r sb_many reserve <<< "$(tunevars 262144 2500 "SHARED_BUFFERS ACTUAL_RESERVED_MEMORY_PERC" MAX_WORKER_PROCESSES=1000)"
+[ "${sb_many:-0}" -lt "${sb_few:-0}" ] && [ "${reserve:-0}" -ge 15 ] && ok "1000 worker processes are budgeted (shared buffers ${sb_few} -> ${sb_many} kB, reserve ${reserve}%)" \
+	|| bad "1000 worker processes: shared buffers ${sb_few} -> ${sb_many} kB, reserve ${reserve}%"
+read -r sb_senders <<< "$(tunevars 262144 2500 SHARED_BUFFERS MAX_WORKER_PROCESSES=8 MAX_WAL_SENDERS_CONN_PERC=40)"
+[ "${sb_senders:-0}" -lt "${sb_few:-0}" ] && ok "WAL senders are budgeted (shared buffers ${sb_few} -> ${sb_senders} kB)" \
+	|| bad "WAL senders were not budgeted (shared buffers ${sb_few} -> ${sb_senders} kB)"
+
+# 12. A standby's floors for worker processes and WAL senders (its primary's) are applied, and
+# budgeted.
+read -r workers senders failed <<< "$(tunevars 65536 300 "MAX_WORKER_PROCESSES MAX_WAL_SENDERS POSTGRES_TUNE_FAILED" MAX_WORKER_PROCESSES_MIN=200 MAX_WAL_SENDERS_MIN=40)"
+[ "${workers}" = 200 ] && [ "${senders}" = 40 ] && [ "${failed}" = false ] && ok "standby floors: 200 worker processes and 40 WAL senders" \
+	|| bad "standby floors: worker processes '${workers}', WAL senders '${senders}', failed '${failed}'"
+
+# 13. Sessions idle in a transaction are ended after IDLE_IN_TRANSACTION_SESSION_TIMEOUT (30min by
+# default).
+cmd=$(tunevars 4096 300 POSTGRES_TUNED_CMD)
+[[ "${cmd}" == *"-c idle_in_transaction_session_timeout=30min "* ]] && ok "idle_in_transaction_session_timeout is 30min by default" \
+	|| bad "idle_in_transaction_session_timeout missing from the tuned command"
+cmd=$(tunevars 4096 300 POSTGRES_TUNED_CMD IDLE_IN_TRANSACTION_SESSION_TIMEOUT=0)
+[[ "${cmd}" == *"-c idle_in_transaction_session_timeout=0 "* ]] && ok "IDLE_IN_TRANSACTION_SESSION_TIMEOUT=0 is passed through" \
+	|| bad "IDLE_IN_TRANSACTION_SESSION_TIMEOUT=0 not passed through"
 
 echo "${pass} passed, ${fail} failed"
 [ "${fail}" -eq 0 ]

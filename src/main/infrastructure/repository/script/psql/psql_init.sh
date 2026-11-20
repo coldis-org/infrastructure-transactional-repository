@@ -59,6 +59,19 @@ fi
 set -- --skip-reload
 . ./psql_update_conn.sh
 
+# Out of memory (see psql_memory.sh): the guard that ends the sessions holding the most memory
+# before the container's limit is reached, and the OOM targeting that, should the kernel kill
+# anyway, makes it kill a backend rather than the postmaster. The guard runs as postgres and
+# becomes a child of the postmaster once this script execs into it.
+. ./psql_memory.sh
+psql_oom_target
+if [ "$(id -u)" = 0 ]
+then
+	gosu postgres ./psql_memory_guard.sh &
+else
+	./psql_memory_guard.sh &
+fi
+
 # Executes the init command.
 echo "exec env POSTGRES_USER=${POSTGRES_ADMIN_USER:=postgres} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} ${POSTGRES_TUNED_CMD}"
 exec env POSTGRES_USER=${POSTGRES_ADMIN_USER:=postgres} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD:=postgres} ${POSTGRES_TUNED_CMD}

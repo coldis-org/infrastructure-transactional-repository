@@ -81,20 +81,27 @@ psql_tune_cmd() {
 				HUGE_PAGES=try
 				;;
 		esac
-		MAX_CONNECTIONS_FIT=$(( MAX_MEMORY * CONNECTIONS_MEMORY_MAX_PERC / 100 / CONNECTION_MEMORY ))
-		MAX_CONNECTIONS_FIT=$(( MAX_CONNECTIONS_FIT < 10 ? 10 : MAX_CONNECTIONS_FIT ))
-		# A standby must not have fewer connections than its primary, or it refuses to start: its
-		# init sets this floor to the primary's value. When the floor is more than the memory holds,
-		# the connections' memory is capped at their share instead (each gets less than
-		# CONNECTION_MEMORY): otherwise the budget below can never be met and every other setting
-		# would shrink below Postgres' minimums, leaving a standby that cannot start.
+		# The connections' share is taken from the memory left once the reserve is kept, the same
+		# reserve the budget below keeps.
+		REQUESTED_MAX_CONNECTIONS=${MAX_CONNECTIONS}
+		RESERVE_MEMORY=$(( MAX_MEMORY * MIN_RESERVED_MEMORY_PERC / 100 ))
+		RESERVE_MEMORY=$(( RESERVE_MEMORY < MIN_RESERVED_MEMORY ? MIN_RESERVED_MEMORY : RESERVE_MEMORY ))
+		BUDGET_MEMORY=$(( MAX_MEMORY > RESERVE_MEMORY ? MAX_MEMORY - RESERVE_MEMORY : 0 ))
+		CONNECTIONS_MEMORY_SHARE=$(( BUDGET_MEMORY * CONNECTIONS_MEMORY_MAX_PERC / 100 ))
+		MAX_CONNECTIONS_FIT=$(( CONNECTIONS_MEMORY_SHARE / CONNECTION_MEMORY ))
+		# Floors: at least 10 connections, and on a standby at least its primary's, or it refuses
+		# to start (its init sets MAX_CONNECTIONS_MIN to the primary's value). When a floor is more
+		# than the share holds, the connections' memory is capped at the share instead (each gets
+		# less than CONNECTION_MEMORY): otherwise the budget below can never be met and every other
+		# setting would shrink below Postgres' minimums, leaving a server that cannot start.
 		MAX_CONNECTIONS_MIN=${MAX_CONNECTIONS_MIN:-0}
-		CONNECTIONS_MEMORY_CAP=0
-		if [ ${MAX_CONNECTIONS_MIN} -gt ${MAX_CONNECTIONS_FIT} ]
+		MAX_CONNECTIONS_FLOOR=$(( MAX_CONNECTIONS_MIN < 10 ? 10 : MAX_CONNECTIONS_MIN ))
+		CONNECTIONS_MEMORY_CAPPED=false
+		if [ ${MAX_CONNECTIONS_FLOOR} -gt ${MAX_CONNECTIONS_FIT} ]
 		then
-			CONNECTIONS_MEMORY_CAP=$(( MAX_MEMORY * CONNECTIONS_MEMORY_MAX_PERC / 100 ))
-			echo "WARN: MAX_CONNECTIONS_MIN=${MAX_CONNECTIONS_MIN} (the primary's) does not fit in ${MAX_MEMORY}kB of memory at ${CONNECTION_MEMORY}kB per connection; capping their memory at ${CONNECTIONS_MEMORY_MAX_PERC}%." >&2
-			MAX_CONNECTIONS_FIT=${MAX_CONNECTIONS_MIN}
+			CONNECTIONS_MEMORY_CAPPED=true
+			echo "WARN: ${MAX_CONNECTIONS_FLOOR} connections (the minimum, or the primary's) do not fit in ${CONNECTIONS_MEMORY_SHARE}kB at ${CONNECTION_MEMORY}kB per connection; capping their memory at that share." >&2
+			MAX_CONNECTIONS_FIT=${MAX_CONNECTIONS_FLOOR}
 		fi
 		if [ ${MAX_CONNECTIONS} -gt ${MAX_CONNECTIONS_FIT} ]
 		then
@@ -113,8 +120,9 @@ psql_tune_cmd() {
 			PAGE_TABLE_RATIO=262144
 		fi
 
-		# Wal senders.
-		MAX_WAL_SENDERS=$(( MAX_CONNECTIONS * MAX_WAL_SENDERS_CONN_PERC / 100 ))
+		# Wal senders, from the requested connection limit: they do not count against
+		# max_connections, so lowering them with the cap would cut replication for nothing.
+		MAX_WAL_SENDERS=$(( REQUESTED_MAX_CONNECTIONS * MAX_WAL_SENDERS_CONN_PERC / 100 ))
 		MAX_WAL_SENDERS=$(( MAX_WAL_SENDERS < 2 ? 2 : MAX_WAL_SENDERS ))
 
 		# Disk size,
@@ -201,9 +209,9 @@ psql_tune_cmd() {
 			# what lets many connections fit at all without huge pages.
 			CONNECTION_PAGE_TABLES=$(( SHARED_BUFFERS * CONNECTION_SHARED_BUFFERS_MAPPED_PERC / 100 / PAGE_TABLE_RATIO ))
 			TOTAL_CONNECTIONS_MEMORY=$(( MAX_CONNECTIONS * (CONNECTION_MEMORY + CONNECTION_PAGE_TABLES) ))
-			if [ ${CONNECTIONS_MEMORY_CAP} -gt 0 ] && [ ${TOTAL_CONNECTIONS_MEMORY} -gt ${CONNECTIONS_MEMORY_CAP} ]
+			if [ "${CONNECTIONS_MEMORY_CAPPED}" = true ] && [ ${TOTAL_CONNECTIONS_MEMORY} -gt ${CONNECTIONS_MEMORY_SHARE} ]
 			then
-				TOTAL_CONNECTIONS_MEMORY=${CONNECTIONS_MEMORY_CAP}
+				TOTAL_CONNECTIONS_MEMORY=${CONNECTIONS_MEMORY_SHARE}
 			fi
 
 			# Updates reserved memory.

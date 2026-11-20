@@ -86,16 +86,27 @@ for case in "76800 8000" "65536 8000" "6144 700"; do
 	fi
 done
 
-# 6. Small memory: 1 GB gets settings Postgres accepts; below the fixed reserve (256 MB by default)
-# the budget cannot be met, and the tuner finishes and says so instead of looping.
-read -r conns sb wm _ _ mwm ldwm _ <<< "$(tune 1024 300)"
-valid "${sb}" "${wm}" "${mwm}" "${ldwm}" && ok "1024 MB gets valid settings (connections ${conns}, shared_buffers ${sb} kB)" \
-	|| bad "1024 MB: shared_buffers '${sb}', work_mem '${wm}', maintenance '${mwm}', logical decoding '${ldwm}'"
+# 6. Small memory (with 2 CPUs, as a container this small gets): from just above the fixed reserve
+# (256 MB by default) up, the settings are ones Postgres accepts, the 10-connection floor taking a
+# capped share rather than its full 16 MB each. The previous tuner gave 300 MB a work_mem of 30 kB
+# (below the 64 kB minimum) by splitting it over all 300 connections. Below the reserve the budget
+# cannot be met, and the tuner finishes and says so instead of looping.
+for memory in 300 384 512 1024; do
+	read -r conns sb wm _ _ mwm ldwm _ <<< "$(tune ${memory} 300 TEST_CPUS=2)"
+	valid "${sb}" "${wm}" "${mwm}" "${ldwm}" && ok "${memory} MB gets valid settings (connections ${conns}, shared_buffers ${sb} kB)" \
+		|| bad "${memory} MB: connections '${conns}', shared_buffers '${sb}', work_mem '${wm}', maintenance '${mwm}', logical decoding '${ldwm}'"
+done
 for memory in 256 128; do
 	read -r conns _ _ _ _ _ _ warnings <<< "$(tune ${memory} 300)"
 	[ -n "${conns}" ] && [ "${warnings:-0}" -ge 1 ] && ok "${memory} MB finishes and warns that the reserve cannot be kept" \
 		|| bad "${memory} MB: connections '${conns}', warnings '${warnings}'"
 done
+
+# 7. WAL senders follow the requested limit, not the capped one: they do not count against
+# max_connections, and replicas need them whatever the cap.
+read -r conns _ _ _ senders _ <<< "$(tune 1024 300)"
+[ "${conns}" -lt 300 ] && [ "${senders}" = 15 ] && ok "WAL senders stay at 5% of the requested 300 (${senders}) when connections are capped to ${conns}" \
+	|| bad "WAL senders ${senders} with connections ${conns} (expected 15 with fewer than 300)"
 
 echo "${pass} passed, ${fail} failed"
 [ "${fail}" -eq 0 ]

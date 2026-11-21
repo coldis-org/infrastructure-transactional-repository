@@ -383,17 +383,16 @@ guard 2 >/dev/null
 rm -f "${WORK}/between" "${WORK}/psql.slow"
 if [ "$(state mg_sleep_ms)" = 500 ] && [ "$(state mg_throttle_ms)" = 0 ] && [ "$(listed)" = 2 ]; then ok "a full pass back under the budget ends the throttling (500 ms, fresh listing)"; else bad "a full pass back under the budget ends the throttling (500 ms, fresh listing)"; fi
 
-# 17a. The query prefix carries no values: the listing masks dollar quotes, quoted identifiers
-# holding a quote, E'' and plain string literals, comments and numbers in SQL, and only then cuts
-# the text to MEMORY_GUARD_QUERY_CHARS. (A real server applies the patterns; see the simulation.)
+# 17a. The query prefix is masked before it is cut to MEMORY_GUARD_QUERY_CHARS, in one left-to-right
+# regexp_replace so that quotes pair up: quoted regions (strings, E'' strings, quoted identifiers,
+# dollar quotes), comments and numbers become ?. A real server applies the pattern (simulation S2
+# checks that the hog's literals never reach the log).
 cgroup 1000 870 0 0; standard_sessions
 guard 1 >/dev/null
-check "the listing masks before cutting the query prefix" \
-	grep -qE "regexp_replace\(left\((regexp_replace\(){7}[[:space:]]*coalesce\(a.query, ''\)" "${WORK}/psql.log"
-check "E'' strings with backslash escapes become ?" grep -qF "'[Ee]''(\\\\.|''''|[^''\\\\])*(''|\$)', '?', 'g'" "${WORK}/psql.log"
-check "string literals become ?" grep -qF "'''(''''|[^''])*(''|\$)', '?', 'g'" "${WORK}/psql.log"
-check "comments go" grep -qF "'/\*.*?(\*/|\$)', ' ', 'g'" "${WORK}/psql.log"
-check "numeric literals become ?" grep -qF "'\m[0-9]+(\.[0-9]+)?\M', '?', 'g'" "${WORK}/psql.log"
+check "the listing masks in one pass before cutting the query prefix" \
+	grep -qE "regexp_replace\(left\(regexp_replace\(coalesce\(a.query, ''\),[[:space:]]+'\\\\\\$" "${WORK}/psql.log"
+check "the pass covers quoted identifiers, E'' and plain strings, comments and numbers" \
+	grep -qF "|\"(\"\"|[^\"])*(\"|\$)|[Ee]''(\\\\.|''''|[^''\\\\])*(''|\$)|''(''''|[^''])*(''|\$)|/\*([^*]|\*+[^*/])*(\*+/|\$)|--[^\n]*|\m(0[xX]" "${WORK}/psql.log"
 
 # 17b. A slow pass spaces the next one by at least its own length (capped at the max interval),
 # not only by twice the fast interval.

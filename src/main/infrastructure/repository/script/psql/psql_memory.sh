@@ -431,20 +431,15 @@ memory_guard_settings() {
 	# backend types), not excluded, not the guard's own session; plus parallel workers, only to
 	# add their memory to the session leading them. backend_start in microseconds identifies the
 	# session against pid reuse. Text is stripped of whitespace and control characters here. The
-	# query prefix carries no values: before it is cut to MEMORY_GUARD_QUERY_CHARS, anything from a
-	# dollar quote on becomes $?$, a quoted identifier holding a quote becomes "?", string literals
-	# (E'' ones with their backslash escapes too) and numbers become ?, and comments go (query_id
-	# names the statement). Kept in a quoted here-document so the SQL is written as is.
+	# query prefix is masked before it is cut to MEMORY_GUARD_QUERY_CHARS, in one left-to-right pass
+	# so that quotes always pair up: every quoted region (strings, E'' strings with their escapes,
+	# quoted identifiers, anything from a dollar quote on), comment and number becomes ?. A
+	# best effort on free text; MEMORY_GUARD_QUERY_CHARS=0 logs none and query_id still names the
+	# statement. Kept in a quoted here-document so the SQL is written as is.
 	memory_guard_mask_sql=$(cat <<'EOSQL'
-regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace(regexp_replace(
-			coalesce(a.query, ''),
-			'\$([A-Za-z_][A-Za-z0-9_]*)?\$.*', '$?$'),
-			'"([^"]|"")*''([^"]|"")*("|$)', '"?"', 'g'),
-			'[Ee]''(\\.|''''|[^''\\])*(''|$)', '?', 'g'),
-			'''(''''|[^''])*(''|$)', '?', 'g'),
-			'/\*.*?(\*/|$)', ' ', 'g'),
-			'--[^\n]*', ' ', 'g'),
-			'\m[0-9]+(\.[0-9]+)?\M', '?', 'g')
+regexp_replace(coalesce(a.query, ''),
+			'\$([A-Za-z_][A-Za-z0-9_]*)?\$.*|"(""|[^"])*("|$)|[Ee]''(\\.|''''|[^''\\])*(''|$)|''(''''|[^''])*(''|$)|/\*([^*]|\*+[^*/])*(\*+/|$)|--[^\n]*|\m(0[xX][0-9A-Fa-f_]+|[0-9][0-9_]*(\.[0-9_]*)?([eE][-+]?[0-9]+)?)\M',
+			'?', 'g')
 EOSQL
 )
 	MEMORY_GUARD_LIST_SQL="SELECT a.pid, coalesce(a.leader_pid, a.pid), a.backend_type, coalesce(a.state, ''),

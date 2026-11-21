@@ -11,6 +11,10 @@
 #   bash src/test/infrastructure/repository-replica/replica_test.sh replica-test [replica-before]
 #
 # PRIMARY_IMAGE overrides the primary (default: the base the replica Dockerfile7 builds FROM).
+# The replica's base decides some expectations: from 7.4.0 (a base that carries psql_memory.sh) the
+# tuner budgets the primary's workers and WAL senders itself, a replica too small for the primary's
+# floors starts with a WARN instead of stopping, and the memory guard starts; on older bases the
+# init raises those values after tuning, stops when they do not fit, and starts no guard.
 # With a second image (the replica built before this change), it also checks that one refuses to
 # start, so the suite proves what it fixes. Needs docker; creates and removes its containers,
 # volumes and network. Exits non-zero when any test fails.
@@ -66,6 +70,9 @@ start_replica() { # image memory-kb slot
 
 cleanup
 docker network create "$NET" >/dev/null || exit 2
+NEW_BASE=false
+if docker run --rm --entrypoint sh "$IMAGE" -c 'test -f /opt/psql-script/psql_memory.sh' >/dev/null 2>&1; then NEW_BASE=true; fi
+echo "replica base from 7.4.0 on (memory guard, no fail-closed tuner): $NEW_BASE"
 echo "== $IMAGE against a primary from $PRIMARY_IMAGE"
 
 # A primary sized from 16 CPUs, 2 GB and 400 connections, with twice the replicas' share of WAL
@@ -104,7 +111,13 @@ REPLICA_CONNECTIONS=$(setting "$REPLICA" max_connections)
 REPLICA_WORKERS=$(setting "$REPLICA" max_worker_processes)
 REPLICA_LOCKS=$(setting "$REPLICA" max_locks_per_transaction)
 REPLICA_SENDERS=$(setting "$REPLICA" max_wal_senders)
-if docker logs "$REPLICA" 2>&1 | grep -q "Reserving [0-9]* MB more for the lock rows"; then ok "the extra workers' lock rows are budgeted before tuning"; else bad "the extra workers' lock rows are budgeted before tuning"; fi
+if [ "$NEW_BASE" = true ]; then
+	if ! docker logs "$REPLICA" 2>&1 | grep -q "Raising max_worker_processes\|Raising max_wal_senders"; then ok "the tuner budgets the primary's workers and WAL senders itself (nothing raised after tuning)"; else bad "the tuner budgets the primary's workers and WAL senders itself (nothing raised after tuning)"; fi
+	if docker logs "$REPLICA" 2>&1 | grep -q "MEMORY_GUARD: LOG: event=start "; then ok "the memory guard starts on the replica"; else bad "the memory guard starts on the replica"; fi
+else
+	if docker logs "$REPLICA" 2>&1 | grep -q "Reserving [0-9]* MB more for the lock rows"; then ok "the extra workers' lock rows are budgeted before tuning"; else bad "the extra workers' lock rows are budgeted before tuning"; fi
+	if ! docker logs "$REPLICA" 2>&1 | grep -q "MEMORY_GUARD:"; then ok "an older base starts without the memory guard"; else bad "an older base starts without the memory guard"; fi
+fi
 if [ "${REPLICA_CONNECTIONS:-0}" -ge "$PRIMARY_CONNECTIONS" ] && [ "${REPLICA_WORKERS:-0}" -ge "$PRIMARY_WORKERS" ] && [ "${REPLICA_LOCKS:-0}" -ge "$PRIMARY_LOCKS" ] && [ "${REPLICA_SENDERS:-0}" -ge "$PRIMARY_SENDERS" ]; then ok "its settings are raised to the primary's ($REPLICA_CONNECTIONS/$REPLICA_WORKERS/$REPLICA_LOCKS/$REPLICA_SENDERS)"; else bad "its settings are raised to the primary's (got ${REPLICA_CONNECTIONS:-?}/${REPLICA_WORKERS:-?}/${REPLICA_LOCKS:-?}/${REPLICA_SENDERS:-?})"; fi
 
 # 3. Data replicates.
@@ -161,18 +174,26 @@ if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" =
 CHECK=$(replica_check "$REPLICA")
 if [ "${CHECK%%|*}" = 0 ] && [[ $CHECK == *"not a standby"* ]]; then ok "check: a promoted replica passes"; else bad "check: a promoted replica passes (got $CHECK)"; fi
 
-# 7. A replica that fits the lock table only by taking the extra slots' rows out of the reserve the
-# tuner keeps free stops (the tuner makes room in the other settings, which then fall below their
-# minimums), instead of starting with no headroom and being killed by the kernel later. Before the
-# reservation, this size started.
-start_replica "$IMAGE" 524288 replica_tight
-wait_stopped "$REPLICA"
-if [ "$(docker inspect -f '{{.State.ExitCode}}' "$REPLICA")" = 1 ] && docker logs "$REPLICA" 2>&1 | grep -q "Not enough memory: max_locks_per_transaction=$PRIMARY_LOCKS.*kept free"; then ok "a replica that could only start by eating its reserve stops and says why"; else bad "a replica that could only start by eating its reserve stops and says why"; fi
-
-# 8. A replica whose memory cannot hold the primary's lock table stops with the sizes.
-start_replica "$IMAGE" 262144 replica_tiny
-wait_stopped "$REPLICA"
-if [ "$(docker inspect -f '{{.State.ExitCode}}' "$REPLICA")" = 1 ] && docker logs "$REPLICA" 2>&1 | grep -q "Not enough memory: max_locks_per_transaction=$PRIMARY_LOCKS"; then ok "a replica too small for the lock table stops and says why"; else bad "a replica too small for the lock table stops and says why"; fi
+# 7 and 8. A replica too small for the primary's lock table and other floors. Older bases stop and
+# say why. From 7.4.0 it starts as a standby with the primary's values, everything else at
+# Postgres' minimums, and a WARN that says the reserve is not kept (the memory guard is then the
+# remaining protection).
+for case in "524288 replica_tight" "262144 replica_tiny"; do
+	set -- $case
+	start_replica "$IMAGE" "$1" "$2"
+	if [ "$NEW_BASE" = true ]; then
+		if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = t ] \
+			&& [ "$(setting "$REPLICA" max_locks_per_transaction)" -ge "$PRIMARY_LOCKS" ] && [ "$(setting "$REPLICA" max_connections)" -ge "$PRIMARY_CONNECTIONS" ] \
+			&& docker logs "$REPLICA" 2>&1 | grep -q "WARN: NOT ENOUGH MEMORY: starting without the reserve"; then
+			ok "a replica of $(( $1 / 1024 )) MB, too small for the primary's floors, starts as a standby with them and a WARN"
+		else
+			bad "a replica of $(( $1 / 1024 )) MB, too small for the primary's floors, starts as a standby with them and a WARN"; docker logs "$REPLICA" 2>&1 | grep -E "WARN|FATAL|Not enough" | tail -3 | sed 's/^/    log: /'
+		fi
+	else
+		wait_stopped "$REPLICA"
+		if [ "$(docker inspect -f '{{.State.ExitCode}}' "$REPLICA")" = 1 ] && docker logs "$REPLICA" 2>&1 | grep -q "Not enough memory"; then ok "an older base: a replica of $(( $1 / 1024 )) MB too small for the primary's lock table stops and says why"; else bad "an older base: a replica of $(( $1 / 1024 )) MB too small for the primary's lock table stops and says why"; fi
+	fi
+done
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

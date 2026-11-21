@@ -102,7 +102,8 @@ refusing connections meanwhile; every client then reconnects at once. Ending one
   the other percentage settings, never out of `max_connections`. `work_mem` is split over
   `WORK_MEM_ACTIVE_PERC` (65) of the connections plus the parallel workers; below 100 it is an
   over-commit, stated at boot in a WARN with the worst case (`WORK_MEM_MAX` caps it;
-  `ALTER ROLE ... SET work_mem` is the safer way to give one role more).
+  `ALTER ROLE ... SET work_mem` is the safer way to give one role more). No guard covers it by
+  default (off below 18, dry-run on 18): a deployment close to its limit pins 100.
   `MAX_PARALLEL_WORKERS_PER_GATHER_MAX` (2) caps workers per query, since each takes its own
   `work_mem` per node. `IDLE_IN_TRANSACTION_SESSION_TIMEOUT` (30min) ends sessions left idle in a
   transaction. `superuser_reserved_connections` is 5, so administration and the guard get in when

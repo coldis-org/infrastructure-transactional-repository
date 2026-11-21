@@ -377,8 +377,6 @@ check "the slow line is throttled to once a minute" [ "$(count "${log}" event=sl
 echo "advance 5000" > "${WORK}/between"
 guard 4 >/dev/null
 if [ "$(listed)" = 4 ] && [ "$(state mg_sleep_ms)" = 5000 ]; then ok "a full scan every MEMORY_GUARD_MAX_INTERVAL; each slow one doubles up to 5 s"; else bad "a full scan every MEMORY_GUARD_MAX_INTERVAL; each slow one doubles up to 5 s"; fi
-rm -f "${WORK}/psql.slow"
-echo "advance 5000; rm -f '${WORK}/psql.slow'" > "${WORK}/between"
 echo "touch '${WORK}/psql.slow'; advance 5000; rm -f '${WORK}/psql.slow'" > "${WORK}/between"
 touch "${WORK}/psql.slow"
 guard 2 >/dev/null

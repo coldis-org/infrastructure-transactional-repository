@@ -327,14 +327,14 @@ case "${cmd}" in
 	*"-c idle_in_transaction_session_timeout=30min "*) ok "idle_in_transaction_session_timeout is 30min by default" ;;
 	*) bad "idle_in_transaction_session_timeout=30min missing from the tuned command" ;;
 esac
-for timeout in 0 250ms 2h 45; do
+for timeout in 0 250ms 2h 45 24d 2147483647; do
 	cmd=$(tunevars 4096 300 POSTGRES_TUNED_CMD IDLE_IN_TRANSACTION_SESSION_TIMEOUT=${timeout})
 	case "${cmd}" in
 		*"-c idle_in_transaction_session_timeout=${timeout} "*) ok "IDLE_IN_TRANSACTION_SESSION_TIMEOUT=${timeout} is passed through" ;;
 		*) bad "IDLE_IN_TRANSACTION_SESSION_TIMEOUT=${timeout} not passed through" ;;
 	esac
 done
-for timeout in 5parsecs -1 1.5h 30MIN; do
+for timeout in 5parsecs -1 1.5h 30MIN 25d 3000000000 99999999999h; do
 	cmd=$(tunevars 4096 300 POSTGRES_TUNED_CMD IDLE_IN_TRANSACTION_SESSION_TIMEOUT=${timeout})
 	case "${cmd}" in
 		*"-c idle_in_transaction_session_timeout=30min "*)

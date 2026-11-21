@@ -243,13 +243,31 @@ psql_tune_cmd() {
 			*)
 				if echo "${IDLE_IN_TRANSACTION_SESSION_TIMEOUT}" | grep -Eqx '[0-9]+(ms|s|min|h|d)?'
 				then
-					IDLE_IN_TRANSACTION_SESSION_TIMEOUT_VALID=true
+					# The server keeps it in milliseconds in a 32-bit integer: above 2147483647 ms
+					# (about 24.8 days) it does not start. Ten digits at most keep the product below
+					# what shell arithmetic holds.
+					IDLE_IN_TRANSACTION_NUMBER=${IDLE_IN_TRANSACTION_SESSION_TIMEOUT%%[a-z]*}
+					IDLE_IN_TRANSACTION_UNIT=${IDLE_IN_TRANSACTION_SESSION_TIMEOUT#"${IDLE_IN_TRANSACTION_NUMBER}"}
+					IDLE_IN_TRANSACTION_NUMBER=$(echo "${IDLE_IN_TRANSACTION_NUMBER}" | sed 's/^0*\([0-9]\)/\1/')
+					case "${IDLE_IN_TRANSACTION_UNIT}" in
+						ms) IDLE_IN_TRANSACTION_FACTOR=1 ;;
+						s) IDLE_IN_TRANSACTION_FACTOR=1000 ;;
+						min) IDLE_IN_TRANSACTION_FACTOR=60000 ;;
+						h) IDLE_IN_TRANSACTION_FACTOR=3600000 ;;
+						d) IDLE_IN_TRANSACTION_FACTOR=86400000 ;;
+						*) IDLE_IN_TRANSACTION_FACTOR=1 ;;
+					esac
+					if [ "${#IDLE_IN_TRANSACTION_NUMBER}" -le 10 ] \
+						&& [ $(( IDLE_IN_TRANSACTION_NUMBER * IDLE_IN_TRANSACTION_FACTOR )) -le 2147483647 ]
+					then
+						IDLE_IN_TRANSACTION_SESSION_TIMEOUT_VALID=true
+					fi
 				fi
 				;;
 		esac
 		if [ "${IDLE_IN_TRANSACTION_SESSION_TIMEOUT_VALID}" != true ]
 		then
-			echo "WARN: IDLE_IN_TRANSACTION_SESSION_TIMEOUT=${IDLE_IN_TRANSACTION_SESSION_TIMEOUT} is not a number with an optional unit (ms, s, min, h, d); using 30min." >&2
+			echo "WARN: IDLE_IN_TRANSACTION_SESSION_TIMEOUT=${IDLE_IN_TRANSACTION_SESSION_TIMEOUT} is not a number with an optional unit (ms, s, min, h, d) up to 2147483647ms; using 30min." >&2
 			IDLE_IN_TRANSACTION_SESSION_TIMEOUT=30min
 		fi
 		# Floors for a standby, which refuses to start below its primary's values (its init sets

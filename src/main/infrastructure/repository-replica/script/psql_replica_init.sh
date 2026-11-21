@@ -127,6 +127,16 @@ MAX_LOCKS_PER_TRANSACTION_MIN=$(( MAX_LOCKS_PER_TRANSACTION_MIN < PRIMARY_MAX_LO
 # Tune command.
 . ./psql_tune_cmd.sh
 
+# Tuners from 7.4.0 on budget every server process, so the two floors below let them size the
+# memory for the primary's worker processes and WAL senders up front; the dry run below then finds
+# nothing to raise. Older bases ignore them and the dry run raises the values as before.
+PRIMARY_MAX_WORKER_PROCESSES=$(primary_setting max_worker_processes)
+PRIMARY_MAX_WAL_SENDERS=$(primary_setting max_wal_senders)
+# shellcheck disable=SC2034  # read by psql_tune_cmd.sh
+MAX_WORKER_PROCESSES_MIN=${PRIMARY_MAX_WORKER_PROCESSES:-0}
+# shellcheck disable=SC2034  # read by psql_tune_cmd.sh
+MAX_WAL_SENDERS_MIN=${PRIMARY_MAX_WAL_SENDERS:-0}
+
 # The other three a standby checks are applied on top of what the tuner chose, when theirs are
 # lower: max_worker_processes (the tuner takes it from the CPU), max_wal_senders (a share of
 # max_connections, which a deployment can set apart on either side) and max_prepared_transactions
@@ -140,8 +150,6 @@ MAX_LOCKS_PER_TRANSACTION_MIN=$(( MAX_LOCKS_PER_TRANSACTION_MIN < PRIMARY_MAX_LO
 # rows eating the headroom, which would leave a replica that starts and is later killed by the
 # kernel with nothing in its log. On bases before 7.1.0 the tuner does not size the lock table
 # (MAX_LOCKS_PER_TRANSACTION stays empty), and Postgres is left to stop on its own.
-PRIMARY_MAX_WORKER_PROCESSES=$(primary_setting max_worker_processes)
-PRIMARY_MAX_WAL_SENDERS=$(primary_setting max_wal_senders)
 PRIMARY_MAX_PREPARED_TRANSACTIONS=$(primary_setting max_prepared_xacts)
 RESERVED_MEMORY_FLOOR=${MIN_RESERVED_MEMORY}
 EXTRA_WORKERS=0
@@ -173,7 +181,9 @@ then
 	fi
 fi
 psql_tune_cmd "$@"
-# Set by tuners from this release on; older bases leave it empty.
+# Only the 7.3.x tuners set this, when the reserve could not be kept, and their settings may then be
+# below Postgres' minimums. From 7.4.0 the tuner never sets it: a replica too small for its
+# primary's floors starts with a WARN and settings at Postgres' minimums. Older bases leave it empty.
 if [ "${POSTGRES_TUNE_FAILED}" = "true" ]
 then
 	echo "Not enough memory to keep the reserve with these settings (see the WARN above); not starting." >&2
@@ -195,11 +205,10 @@ then
 	POSTGRES_TUNED_CMD="${POSTGRES_TUNED_CMD} -c max_prepared_transactions=${PRIMARY_MAX_PREPARED_TRANSACTIONS}"
 fi
 
-# A lock table larger than the memory leaves the tuner nothing for the rest, and it goes on below
-# zero rather than failing, so Postgres would stop at whichever value broke its minimum first. The
-# reserve itself needs no check: the tuner only stops once it keeps MIN_RESERVED_MEMORY, which
-# already includes the extra rows, so a replica that cannot afford them ends up here, with the other
-# settings shrunk below their minimums. Stop with the sizes.
+# On the 7.1.0 to 7.2.x bases, a lock table larger than the memory leaves the tuner nothing for the
+# rest, and it goes on below zero rather than failing, so Postgres would stop at whichever value
+# broke its minimum first: stop with the sizes. From 7.4.0 the tuner keeps every setting at or
+# above Postgres' minimum and this never triggers.
 if [ -n "${MAX_LOCKS_PER_TRANSACTION}" ]
 then
 	EXTRA_LOCKS_MEMORY=$(( EXTRA_LOCK_SLOTS * MAX_LOCKS_PER_TRANSACTION * 3 / 4 ))
@@ -216,6 +225,21 @@ fi
 set -- --skip-reload
 . ./psql_update_conn.sh
 
+
+# Out of memory (see psql_memory.sh in the repository image): the memory guard and the OOM
+# targeting, as on the primary. Only bases that carry them; older ones start without.
+# Nothing here may stop a boot: this script runs under errexit.
+if [ -f ./psql_memory.sh ] && [ -f ./psql_memory_guard.sh ]
+then
+	. ./psql_memory.sh
+	psql_oom_target || true
+	if [ "$(id -u)" = 0 ]
+	then
+		gosu postgres ./psql_memory_guard.sh &
+	else
+		./psql_memory_guard.sh &
+	fi
+fi
 
 # Executes the init command.
 echo "exec env POSTGRES_USER=${POSTGRES_ADMIN_USER} POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD} ${POSTGRES_TUNED_CMD}"

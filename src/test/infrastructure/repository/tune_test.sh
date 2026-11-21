@@ -50,8 +50,8 @@ tunevars() { # memory-mb connections "VAR..." [VAR=value...]
 }
 
 # Prints "<max_connections> <shared_buffers kB> <work_mem kB> <reserve %> <max_wal_senders>
-# <maintenance_work_mem kB> <logical_decoding_work_mem kB> <warnings> <failed>", failed being the
-# POSTGRES_TUNE_FAILED the init scripts stop on.
+# <maintenance_work_mem kB> <logical_decoding_work_mem kB> <warnings> <failed>", failed being
+# POSTGRES_TUNE_FAILED, which no memory shortfall sets any longer.
 tune() { # memory-mb connections [VAR=value...]
 	t_memory=$1; t_connections=$2; shift 2
 	tunevars "${t_memory}" "${t_connections}" "MAX_CONNECTIONS SHARED_BUFFERS WORK_MEM ACTUAL_RESERVED_MEMORY_PERC MAX_WAL_SENDERS MAINTENANCE_WORK_MEM LOGICAL_DECODING_WORK_MEM WARNINGS POSTGRES_TUNE_FAILED" "$@"
@@ -117,31 +117,74 @@ done
 # (256 MB by default) up, the settings are ones Postgres accepts and the reserve is kept, the
 # 10-connection floor taking a capped share rather than its full 16 MB each, and the other server
 # processes their capped share. The 7.2 tuner gave 300 MB a work_mem of 30 kB (below the 64 kB
-# minimum) by splitting it over all 300 connections. Below the reserve the budget cannot be met,
-# and the tuner finishes and says so instead of looping.
+# minimum) by splitting it over all 300 connections.
 for memory in 300 384 512 1024; do
 	# shellcheck disable=SC2046
 	set -- $(tune ${memory} 300 TEST_CPUS=2)
 	valid "$2" "$3" "$6" "$7" && [ "$9" = false ] && ok "${memory} MB gets valid settings (connections $1, shared_buffers $2 kB)" \
 		|| bad "${memory} MB: connections '$1', shared_buffers '$2', work_mem '$3', maintenance '$6', logical decoding '$7', failed '$9'"
 done
+# Below the reserve itself the budget cannot be met: the server still starts (7.3.0 refused to),
+# with the connections at their floor of 10, settings Postgres accepts, and one WARN that says how
+# much reserve is left.
 for memory in 256 128; do
 	# shellcheck disable=SC2046
 	set -- $(tune ${memory} 300)
-	is_number "$1" && [ "${8:-0}" -ge 1 ] && [ "$9" = true ] \
-		&& ok "${memory} MB finishes, warns and fails closed (the reserve cannot be kept)" \
-		|| bad "${memory} MB: connections '$1', warnings '$8', failed '$9'"
+	if [ "$1" = 10 ] && valid "$2" "$3" "$6" "$7" && [ "$9" != true ] && warned "NOT ENOUGH MEMORY: starting without the reserve. Requested 300 connections, applied 10"
+	then ok "${memory} MB starts with 10 connections, valid settings and a WARN (the reserve cannot be kept)"
+	else bad "${memory} MB: connections '$1', shared_buffers '$2', work_mem '$3', maintenance '$6', logical decoding '$7', failed '$9'"
+	fi
 done
 
-# 6b. A large standby whose primary forces a lock table that takes the reserve fails closed too:
-# the last pass's settings are valid at this size, so only the flag stops the server.
+# 6b. A large standby whose primary forces a lock table that takes the reserve starts too: its
+# connections and locks stay at the primary's (a standby cannot go below them), everything else
+# shrinks to Postgres' minimums, and the WARN names the standby floors.
 # shellcheck disable=SC2046
 set -- $(tune 32768 4874 MAX_CONNECTIONS_MIN=4874 MAX_LOCKS_PER_TRANSACTION_MIN=8000)
-[ "$9" = true ] && ok "a 32 GB standby whose primary's lock table takes the reserve fails closed" \
-	|| bad "a 32 GB standby with a lock table over the reserve did not fail closed (failed '$9')"
+if [ "$1" = 4874 ] && valid "$2" "$3" "$6" "$7" && [ "$9" != true ] && warned "NOT ENOUGH MEMORY" && warned "As a standby it keeps its primary's"
+then ok "a 32 GB standby whose primary's lock table takes the reserve starts at the primary's 4874 connections, with a WARN"
+else bad "32 GB standby with a lock table over the reserve: connections '$1', shared_buffers '$2', work_mem '$3', failed '$9'"
+fi
+# shellcheck disable=SC2046
+set -- $(tunevars 32768 4874 "MAX_LOCKS_PER_TRANSACTION" MAX_CONNECTIONS_MIN=4874 MAX_LOCKS_PER_TRANSACTION_MIN=8000)
+[ "$1" = 8000 ] && ok "that standby keeps the primary's max_locks_per_transaction (8000)" \
+	|| bad "that standby's max_locks_per_transaction is '$1', below the primary's 8000"
 # shellcheck disable=SC2046
 set -- $(tune 262144 2500)
-[ "$9" = false ] && ok "a budget that fits does not fail" || bad "a budget that fits reported failed '$9'"
+[ "$9" = false ] && ! warned "NOT ENOUGH MEMORY" && ok "a budget that fits neither fails nor warns of a shortfall" \
+	|| bad "a budget that fits reported failed '$9' or a shortfall"
+
+# 6d. A primary whose fixed costs (here a lock table forced large) leave too little for the rest
+# lowers max_connections below what its memory would otherwise hold, rather than shrink shared
+# buffers to nothing, and keeps the reserve.
+# shellcheck disable=SC2046
+set -- $(tunevars 4096 300 "MAX_CONNECTIONS SHARED_BUFFERS ACTUAL_RESERVED_MEMORY_PERC MAX_LOCKS_PER_TRANSACTION" TEST_CPUS=4 \
+	MAX_LOCKS_PER_TRANSACTION_MIN=20000 MAX_LOCKS_PER_TRANSACTION_MAX=20000)
+if is_number "$1" && [ "$1" -lt 76 ] && [ "$1" -ge 10 ] && [ "$2" -gt 128 ] && [ "$3" -ge 15 ] && [ "$4" = 20000 ] && warned "lowered max_connections to $1 to keep the reserve"
+then ok "a lock table too large for 76 connections at 4 GB lowers them to $1 and keeps the reserve ($3%)"
+else bad "4 GB with 20000 locks per transaction: connections '$1', shared_buffers '$2', reserve '$3'%, locks '$4'"
+fi
+
+# 6e. A 1 GB standby of a 2 GB primary (both 2 CPUs) inherits the primary's max_connections,
+# max_locks_per_transaction, max_worker_processes and max_wal_senders (its init sets them as
+# floors, from pg_control) and starts with valid settings, keeping those values. Also with the
+# 8388 locks per transaction and 10 connections a 2 GB primary got from the first draft of this
+# release, which lowered its connections for the other server processes.
+# shellcheck disable=SC2046
+set -- $(tunevars 2048 300 "MAX_CONNECTIONS MAX_LOCKS_PER_TRANSACTION MAX_WORKER_PROCESSES MAX_WAL_SENDERS" TEST_CPUS=2)
+for primary in "$1 $2 $3 $4" "10 8388 $3 $4"; do
+	# shellcheck disable=SC2086
+	set -- ${primary}
+	p_connections=$1; p_locks=$2; p_workers=$3; p_senders=$4
+	# shellcheck disable=SC2046
+	set -- $(tunevars 1024 300 "MAX_CONNECTIONS MAX_LOCKS_PER_TRANSACTION MAX_WORKER_PROCESSES MAX_WAL_SENDERS SHARED_BUFFERS WORK_MEM MAINTENANCE_WORK_MEM LOGICAL_DECODING_WORK_MEM POSTGRES_TUNE_FAILED" TEST_CPUS=2 \
+		MAX_CONNECTIONS_MIN="${p_connections}" MAX_LOCKS_PER_TRANSACTION_MIN="${p_locks}" MAX_WORKER_PROCESSES_MIN="${p_workers}" MAX_WAL_SENDERS_MIN="${p_senders}")
+	if [ "$1" -ge "${p_connections}" ] && [ "$2" -ge "${p_locks}" ] && [ "$3" -ge "${p_workers}" ] && [ "$4" -ge "${p_senders}" ] 2>/dev/null \
+		&& valid "$5" "$6" "$7" "$8" && [ "$9" != true ]
+	then ok "a 1 GB standby of a 2 GB primary (${p_connections} connections, ${p_locks} locks) starts with the primary's floors and valid settings"
+	else bad "1 GB standby of a 2 GB primary (${p_connections} connections, ${p_locks} locks): got '$*'"
+	fi
+done
 
 # 6c. Zero divisors are raised to 1 with a warning instead of stopping on an arithmetic error.
 # shellcheck disable=SC2046
@@ -307,6 +350,10 @@ cmd=$(tunevars 4096 300 POSTGRES_TUNED_CMD)
 case "${cmd}" in
 	*"-c superuser_reserved_connections=5 "*) ok "superuser_reserved_connections is 5" ;;
 	*) bad "superuser_reserved_connections=5 missing from the tuned command" ;;
+esac
+case "${cmd}" in
+	*"-c compute_query_id=on "*) ok "compute_query_id is on, so the guard can log query_id" ;;
+	*) bad "compute_query_id=on missing from the tuned command" ;;
 esac
 cmd=$(tunevars 4096 4 POSTGRES_TUNED_CMD)
 case "${cmd}" in

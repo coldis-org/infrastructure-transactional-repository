@@ -45,12 +45,8 @@ service cron start
 
 # Tune command.
 . ./psql_tune_cmd.sh
+# A container too small for its budget starts anyway, with fewer connections and one WARN.
 psql_tune_cmd "$@"
-if [ "${POSTGRES_TUNE_FAILED}" = "true" ]
-then
-	echo "Not enough memory to keep the reserve with these settings (see the WARN above); not starting." >&2
-	exit 1
-fi
 
 # Check if LDAP has changed. The dot command takes no arguments in sh/dash, so
 # --skip-reload goes in as positional parameters (the exec below uses
@@ -61,10 +57,11 @@ set -- --skip-reload
 
 # Out of memory (see psql_memory.sh): the guard that ends the sessions holding the most memory
 # before the container's limit is reached, and the OOM targeting that, should the kernel kill
-# anyway, makes it kill a backend rather than the postmaster. The guard runs as postgres and
-# becomes a child of the postmaster once this script execs into it.
+# anyway, makes it kill a server process rather than the postmaster. The guard runs as postgres,
+# in the background, and becomes a child of the postmaster once this script execs into it.
+# Nothing here may stop a boot: this script runs under errexit.
 . ./psql_memory.sh
-psql_oom_target
+psql_oom_target || true
 if [ "$(id -u)" = 0 ]
 then
 	gosu postgres ./psql_memory_guard.sh &

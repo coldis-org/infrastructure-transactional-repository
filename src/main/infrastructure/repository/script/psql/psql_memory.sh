@@ -45,7 +45,7 @@
 # The cgroup is the mount's own (a private cgroup namespace), else the process's own one found
 # through /proc/self/cgroup (a container that sees the host's tree); see memory_cgroup. When it has
 # no limit (docker run without -m, or the root of a namespace) the limit is the budget the tuner
-# sized the server for, from os_limits: NOMAD_MEMORY_LIMIT, else a share of the host's memory
+# sized the server for: MAX_MEMORY, else os_limits' NOMAD_MEMORY_LIMIT, else a share of the host's memory
 # (memory_limit_source). The kernel does not enforce that budget; the guard does. The use is
 # always the cgroup's: with no cgroup use to read the guard stays off, as the host's use is every
 # tenant's.
@@ -73,8 +73,8 @@
 # OOM targeting: OOM_TARGETING_ENABLED (true), OOM_CHILD_SCORE_ADJ (100, -1000 to 1000).
 # The guard connects as POSTGRES_ADMIN_USER over the local socket (MEMORY_GUARD_SOCKET_DIR,
 # /var/run/postgresql), with PGPASSWORD only when POSTGRES_ADMIN_PASSWORD is set, never prompting.
-# The budget with no cgroup limit follows os_limits' settings: MEMORY_LIMIT_VAR (NOMAD_MEMORY_LIMIT),
-# MEMORY_LIMIT_UNIT_PERC (100) and HOST_MEM_PERC (20).
+# The budget with no cgroup limit follows the tuner's: MAX_MEMORY (kB), else os_limits' settings
+# MEMORY_LIMIT_VAR (NOMAD_MEMORY_LIMIT), MEMORY_LIMIT_UNIT_PERC (100) and HOST_MEM_PERC (20).
 # Tests point MEMORY_CGROUP_DIR, MEMORY_PROC_DIR and MEMORY_UPTIME_FILE at fakes, and MEMORY_OS_LIMITS
 # at a fake os_limits (empty: none).
 
@@ -248,9 +248,9 @@ memory_sleep() { # ms
 #   2. the process's own cgroup from /proc/self/cgroup under the mount, v2 then v1 (a container
 #      that sees the host's tree, cgroupns=host).
 # With no limit anywhere the guard still needs a cgroup whose use is the container's: its own
-# cgroup from /proc/self/cgroup when it is readable, else the mount, but never the mount when
-# /proc/self/cgroup puts the process elsewhere (that mount is the host's root, and its use is
-# every tenant's). The limit then comes from memory_limit_source.
+# cgroup from /proc/self/cgroup when it is readable, else the mount, but never the mount when the
+# process's own folder exists under it and is another one (that mount is the host's root, and its
+# use is every tenant's). The limit then comes from memory_limit_source.
 memory_cgroup() {
 	MEMORY_CGROUP_DIR=${MEMORY_CGROUP_DIR:-/sys/fs/cgroup}
 	MEMORY_CGROUP=none
@@ -260,8 +260,16 @@ memory_cgroup() {
 	memory_cgroup_probe v2 "${MEMORY_CGROUP_DIR}" && return 0
 	memory_cgroup_probe v1 "${MEMORY_CGROUP_DIR}/memory" && return 0
 	memory_cgroup_self
-	if [ -n "${memory_self_v2}${memory_self_v1}" ] && [ "${MEMORY_CGROUP_PATH}" != "${memory_self_v2}" ] \
-		&& [ "${MEMORY_CGROUP_PATH}" != "${memory_self_v1}" ]
+	# The process's own folder, of the version the mount was taken as, when it exists under the
+	# mount and is another one: the mount is then the host's root. When it does not exist the
+	# mount is the container's own view (v1 Docker binds its cgroup there and /proc/self/cgroup
+	# still names the host's path).
+	case "${MEMORY_CGROUP}" in
+		v2) memory_self_other=${memory_self_v2} ;;
+		v1) memory_self_other=${memory_self_v1} ;;
+		*) memory_self_other= ;;
+	esac
+	if [ -n "${memory_self_other}" ] && [ "${memory_self_other}" != "${MEMORY_CGROUP_PATH}" ] && [ -d "${memory_self_other}" ]
 	then
 		MEMORY_CGROUP=none
 		MEMORY_CGROUP_PATH=
@@ -323,11 +331,11 @@ memory_cgroup_self() {
 	return 0
 }
 
-# The memory budget when the cgroup has no limit of its own, in MB, from the chain the tuner sizes
-# the server for (os_limits' available_memory, which psql_tune_cmd.sh sources by name from PATH):
-# MEMORY_LIMIT_VAR's variable (NOMAD_MEMORY_LIMIT) scaled by MEMORY_LIMIT_UNIT_PERC, else
-# HOST_MEM_PERC (20) % of MemTotal. Sets MEMORY_LIMIT_SOURCE (cgroup, nomad_var, host_share or
-# none) and MEMORY_LIMIT_FALLBACK_BYTES, which memory_read takes as the limit. Neither the kernel
+# The memory budget when the cgroup has no limit of its own, in MB: the one the tuner sizes the
+# server for. That is MAX_MEMORY (kB) when set, else os_limits' available_memory (which
+# psql_tune_cmd.sh sources by name from PATH): MEMORY_LIMIT_VAR's variable (NOMAD_MEMORY_LIMIT)
+# scaled by MEMORY_LIMIT_UNIT_PERC, else HOST_MEM_PERC (20) % of MemTotal. Sets
+# MEMORY_LIMIT_SOURCE (cgroup, max_memory, nomad_var, host_share or none) and MEMORY_LIMIT_FALLBACK_BYTES, which memory_read takes as the limit. Neither the kernel
 # nor the runtime knows this budget: only the guard enforces it.
 memory_limit_source() {
 	MEMORY_LIMIT_FALLBACK_BYTES=
@@ -346,6 +354,18 @@ memory_limit_source() {
 	case "${memory_limit_name}" in
 		''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) memory_limit_name=NOMAD_MEMORY_LIMIT ;;
 	esac
+	memory_limit_max=$(memory_env MAX_MEMORY)
+	if [ -n "${memory_limit_max}" ]
+	then
+		case "${memory_limit_max}" in
+			*[!0-9]*) return 0 ;;
+		esac
+		memory_limit_mb=$(memory_limit_check "$(awk -v k="${memory_limit_max}" 'BEGIN { if (length(k) <= 16) printf "%d\n", k / 1024 }')") || return 0
+		MEMORY_LIMIT_SOURCE=max_memory
+		memory_limit_name=MAX_MEMORY
+		MEMORY_LIMIT_FALLBACK_BYTES=$(( memory_limit_mb * 1048576 ))
+		return 0
+	fi
 	memory_limit_mb=$(memory_limit_os) || memory_limit_mb=$(memory_limit_chain) || return 0
 	if [ -n "$(memory_env "${memory_limit_name}")" ]
 	then

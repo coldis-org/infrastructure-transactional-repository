@@ -165,16 +165,18 @@ refusing connections meanwhile; every client then reconnects at once. Ending one
   - **Which cgroup, which limit.** The cgroup is the mount's own (`/sys/fs/cgroup`, a private
     cgroup namespace) when it has a limit, else the process's own one from `/proc/self/cgroup`
     (`0::<path>` on v2, the line listing `memory` on v1, under the mount: a container that sees
-    the host's tree). With no limit anywhere (`docker run` without `-m`, `memory.max=max`, or no
+    the host's tree). An unlimited mount is set aside only when that own folder exists under it
+    and is another one (the mount is then the host's root). With no limit anywhere (`docker run` without `-m`, `memory.max=max`, or no
     `memory.max` at the root of a namespace) the limit is the budget the tuner sized the server
-    for, from the same chain as `os_limits` `available_memory` (the guard runs that script, as
-    `psql_tune_cmd.sh` does, when the image ships it): `NOMAD_MEMORY_LIMIT` (`MEMORY_LIMIT_VAR`,
-    scaled by `MEMORY_LIMIT_UNIT_PERC`), else `HOST_MEM_PERC` (20) % of `MemTotal`. **That
+    for: `MAX_MEMORY` (kB) when set, else the chain of `os_limits` `available_memory` (the guard
+    runs that script, as `psql_tune_cmd.sh` does, when the image ships it): `NOMAD_MEMORY_LIMIT`
+    (`MEMORY_LIMIT_VAR`, scaled by `MEMORY_LIMIT_UNIT_PERC`), else `HOST_MEM_PERC` (20) % of
+    `MemTotal`. **That
     budget is guard-only: the kernel does not enforce it**; the guard keeps the server within it,
     and there is no kernel kill behind it. Use is always the cgroup's (`memory.current` or
     `usage_in_bytes` less page cache); with no cgroup use readable the guard stays off
     (`reason=no_cgroup`) rather than read the host's, which is every tenant's. `event=start`
-    and `event=oom_target` carry `limit_source=cgroup|nomad_var|host_share` and
+    and `event=oom_target` carry `limit_source=cgroup|max_memory|nomad_var|host_share` and
     `cgroup_path=<folder>`; a fallback budget adds one `WARN: event=limit_fallback`. Simulation
     S1U runs S1 with no `-m` and `NOMAD_MEMORY_LIMIT=1024`.
   - Superuser sessions are never ended; a database whose heavy sessions are superusers gets

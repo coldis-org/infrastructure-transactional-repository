@@ -591,6 +591,17 @@ check "the host share logs the limit_fallback WARN once" warned "${out}"
 out=$(sources HOST_MEM_PERC=50)
 check "HOST_MEM_PERC=50: 4000 MB" starts "${out}" "*limit_mb=4000 used_pct=12 * limit_source=host_share *"
 
+out=$(sources MAX_MEMORY=1572864 NOMAD_MEMORY_LIMIT=1024)
+check "MAX_MEMORY (kB), which the tuner takes first, is the budget when set: 1536 MB" \
+	starts "${out}" "*limit_mb=1536 used_pct=33 * limit_source=max_memory *"
+check "and the WARN names it" has "${out}" "*WARN: event=limit_fallback limit_source=max_memory limit_mb=1536 limit_var=MAX_MEMORY *"
+
+tree "4:memory:/docker/abc" "0::/docker/abc"
+fake_v1 "${WORK}/tree/cg/memory" 9223372036854771712 512
+out=$(sources NOMAD_MEMORY_LIMIT=1024)
+check "v1 Docker without a namespace: the bound mount is the container's own though /proc names the host path" \
+	starts "${out}" "*cgroup=v1 limit_mb=1024 used_pct=50 used_mb=512 * limit_source=nomad_var cgroup_path=${WORK}/tree/cg/memory"
+
 tree "0::/"
 fake_v2 "${WORK}/tree/cg" - 512
 out=$(sources NOMAD_MEMORY_LIMIT=2048)
@@ -615,6 +626,7 @@ check "an os_limits budget of v1's no-limit size is not taken: the chain's is" s
 
 tree "0::/system.slice/docker-abc.scope"
 fake_v2 "${WORK}/tree/cg" max 6000
+mkdir -p "${WORK}/tree/cg/system.slice/docker-abc.scope"
 out=$(sources NOMAD_MEMORY_LIMIT=1024)
 check "own cgroup unreadable: the host root's use is never taken, disabled with reason=no_cgroup" \
 	has "${out}" "*LOG: event=disabled reason=no_cgroup*"

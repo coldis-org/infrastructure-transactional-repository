@@ -411,7 +411,10 @@ memory_limit_os() {
 	)" 2> /dev/null
 }
 
-# The same chain as os_limits' available_memory past the cgroup, for an image without it.
+# The same chain as os_limits' available_memory past the cgroup, for an image without it. The
+# scaling is os_limits' own shell arithmetic, MEMORY_LIMIT / (MEMORY_LIMIT_UNIT_PERC / 100), whole
+# hundreds only (150 divides by 1), so that the guard's budget is the tuner's; below 100 os_limits
+# divides by zero, and here 100 is used.
 memory_limit_chain() {
 	memory_chain_value=$(memory_env "${memory_limit_name}")
 	if [ -n "${memory_chain_value}" ]

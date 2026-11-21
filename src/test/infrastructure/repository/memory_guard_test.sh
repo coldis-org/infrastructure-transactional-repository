@@ -591,6 +591,9 @@ out=$(sources MEMORY_LIMIT_VAR=JOB_MEMORY MEMORY_LIMIT_UNIT_PERC=200 JOB_MEMORY=
 check "MEMORY_LIMIT_VAR and MEMORY_LIMIT_UNIT_PERC are followed as os_limits does (2048 / 2)" \
 	starts "${out}" "*limit_mb=1024 used_pct=50 * limit_source=nomad_var *"
 
+out=$(sources MEMORY_LIMIT_UNIT_PERC=150 NOMAD_MEMORY_LIMIT=1024)
+check "MEMORY_LIMIT_UNIT_PERC=150 divides by 1, as os_limits' integer arithmetic does" \
+	starts "${out}" "*limit_mb=1024 used_pct=50 * limit_source=nomad_var *"
 out=$(sources)
 check "v2 with max and no variable: HOST_MEM_PERC (20) % of MemTotal, 1600 of 8000 MB" \
 	starts "${out}" "*cgroup=v2 limit_mb=1600 used_pct=32 used_mb=512 * limit_source=host_share cgroup_path=${WORK}/tree/cg"

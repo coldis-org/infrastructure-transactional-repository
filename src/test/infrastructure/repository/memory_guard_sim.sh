@@ -680,8 +680,10 @@ s2() {
 	[ -n "${before}" ] && [ "${before}" = "${after}" ] || fails+=("hog session did not survive (before=${before:-none} after=${after:-none})")
 	[ "${oom1}" = "${oom0}" ] || fails+=("oom_kill ${oom0}->${oom1}")
 	canary_ok || fails+=("canary lost its backend")
+	# The hog's statement holds the literals 'hog' and 10240: the logged prefix must hold neither.
+	printf '%s\n' "${cancels}" | grep -E " query=\"[^\"]*(hog|10240)" >/dev/null && fails+=("a literal of the hog's query reached the log")
 	local detail
-	detail="cancel lines=$(count_lines "${cancels}") terminate lines for hog=$(count_lines "${terms}") peak=$(sampled_peak "${SDIR}/memory.tsv")% oom_kill ${oom0}->${oom1}"
+	detail="cancel lines=$(count_lines "${cancels}") query=$(kv "$(printf '%s\n' "${cancels}" | head -n 1)" query | cut -c 1-60) terminate lines for hog=$(count_lines "${terms}") peak=$(sampled_peak "${SDIR}/memory.tsv")% oom_kill ${oom0}->${oom1}"
 	if [ ${#fails[@]} -eq 0 ]; then record S2 PASS "${detail}"; else record S2 FAIL "$(IFS=';'; echo "${fails[*]}") | ${detail}"; fi
 }
 

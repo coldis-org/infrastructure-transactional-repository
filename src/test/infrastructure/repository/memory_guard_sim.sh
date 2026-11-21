@@ -465,6 +465,17 @@ sampler_start() {
 }
 # Highest and lowest percentage sampled since epoch $2 (0: all).
 sampled_peak() { awk -v from="${2:-0}" '$1 >= from && $2 > p { p = $2 } END { print p + 0 }' "$1" 2>/dev/null || echo 0; }
+# Highest use the guard itself logged (used_pct of its stage, action and status lines) in a log file:
+# the 0.5 s sampler can miss a crossing the guard saw and acted on.
+guard_peak() { grep -E 'MEMORY_GUARD: [A-Z]+: event=(stage|action|status) ' "$1" 2>/dev/null | sed -nE 's/.* used_pct=([0-9]+).*/\1/p' | sort -n | tail -n 1; }
+# Peak of a scenario: the higher of the sampled and the guard-logged one.
+scenario_peak() { # memory.tsv db.log
+	local s g
+	s=$(sampled_peak "$1")
+	g=$(guard_peak "$2")
+	[ -n "${g}" ] && [ "${g}" -gt "${s}" ] && s=${g}
+	echo "${s}"
+}
 sampled_low() { awk -v from="${2:-0}" '$1 >= from && (l == "" || $2 < l) { l = $2 } END { print l + 0 }' "$1" 2>/dev/null || echo 0; }
 
 # --- Server and guard logs -----------------------------------------------------------------------
@@ -653,7 +664,7 @@ s1() {
 	actions=$(guard_events "${SDIR}/db.log" action)
 	n=$(count_lines "${actions}")
 	bad=$(printf '%s\n' "${actions}" | grep -v '^$' | grep -cvE ' action=terminate (.* )?stage=idle( |$)| stage=idle (.* )?action=terminate( |$)')
-	peak=$(sampled_peak "${SDIR}/memory.tsv")
+	peak=$(scenario_peak "${SDIR}/memory.tsv" "${SDIR}/db.log")
 	local fails=()
 	[ "${oom1}" = "${oom0}" ] || fails+=("oom_kill ${oom0}->${oom1}")
 	grep -qE "${SIG9_RE}" "${SDIR}/db.log" && fails+=("signal 9 line")
@@ -696,7 +707,7 @@ s1u() {
 	actions=$(guard_events "${SDIR}/db.log" action)
 	n=$(count_lines "${actions}")
 	bad=$(printf '%s\n' "${actions}" | grep -v '^$' | grep -cvE ' action=terminate (.* )?stage=idle( |$)| stage=idle (.* )?action=terminate( |$)')
-	peak=$(sampled_peak "${SDIR}/memory.tsv")
+	peak=$(scenario_peak "${SDIR}/memory.tsv" "${SDIR}/db.log")
 	SIM_BUDGET_MB=
 	local fails=()
 	[ "${cgmax}" = max ] || fails+=("container has a kernel limit (memory.max=${cgmax})")

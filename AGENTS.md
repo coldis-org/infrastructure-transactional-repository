@@ -165,11 +165,13 @@ refusing connections meanwhile; every client then reconnects at once. Ending one
   - **Which cgroup, which limit.** The cgroup is the mount's own (`/sys/fs/cgroup`, a private
     cgroup namespace) when it has a limit, else the process's own one from `/proc/self/cgroup`
     (`0::<path>` on v2, the line listing `memory` on v1, under the mount: a container that sees
-    the host's tree). An unlimited mount is set aside only when that own folder exists under it
-    and is another one (the mount is then the host's root). With no limit anywhere (`docker run` without `-m`, `memory.max=max`, or no
+    the host's tree). An unlimited mount is kept only when it is known to be the container's own
+    (that own folder is the mount, or is not under it, as with v1 Docker's bind mount); when the
+    own folder is another one under it, or unknown, the guard stays off. With no limit anywhere (`docker run` without `-m`, `memory.max=max`, or no
     `memory.max` at the root of a namespace) the limit is the budget the tuner sized the server
     for: `MAX_MEMORY` (kB) when set, else the chain of `os_limits` `available_memory` (the guard
-    runs that script, as `psql_tune_cmd.sh` does, when the image ships it): `NOMAD_MEMORY_LIMIT`
+    runs that script, found on `PATH` as `psql_tune_cmd.sh` finds it; the boot-time OOM targeting,
+    run as root, does not run it and only names the source): `NOMAD_MEMORY_LIMIT`
     (`MEMORY_LIMIT_VAR`, scaled by `MEMORY_LIMIT_UNIT_PERC`), else `HOST_MEM_PERC` (20) % of
     `MemTotal`. **That
     budget is guard-only: the kernel does not enforce it**; the guard keeps the server within it,

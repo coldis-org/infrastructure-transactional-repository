@@ -75,8 +75,8 @@
 # /var/run/postgresql), with PGPASSWORD only when POSTGRES_ADMIN_PASSWORD is set, never prompting.
 # The budget with no cgroup limit follows the tuner's: MAX_MEMORY (kB), else os_limits' settings
 # MEMORY_LIMIT_VAR (NOMAD_MEMORY_LIMIT), MEMORY_LIMIT_UNIT_PERC (100) and HOST_MEM_PERC (20).
-# Tests point MEMORY_CGROUP_DIR, MEMORY_PROC_DIR and MEMORY_UPTIME_FILE at fakes, and MEMORY_OS_LIMITS
-# at a fake os_limits (empty: none).
+# Tests point MEMORY_CGROUP_DIR, MEMORY_PROC_DIR and MEMORY_UPTIME_FILE at fakes, and put a fake
+# os_limits first on PATH.
 
 # Tab, the field separator of every list below.
 MEMORY_TAB=$(printf '\t')
@@ -248,9 +248,9 @@ memory_sleep() { # ms
 #   2. the process's own cgroup from /proc/self/cgroup under the mount, v2 then v1 (a container
 #      that sees the host's tree, cgroupns=host).
 # With no limit anywhere the guard still needs a cgroup whose use is the container's: its own
-# cgroup from /proc/self/cgroup when it is readable, else the mount, but never the mount when the
-# process's own folder exists under it and is another one (that mount is the host's root, and its
-# use is every tenant's). The limit then comes from memory_limit_source.
+# cgroup from /proc/self/cgroup when it is readable, else the mount, but only when the mount is
+# known to be the container's own (never the host's root, whose use is every tenant's). The limit
+# then comes from memory_limit_source.
 memory_cgroup() {
 	MEMORY_CGROUP_DIR=${MEMORY_CGROUP_DIR:-/sys/fs/cgroup}
 	MEMORY_CGROUP=none
@@ -260,16 +260,19 @@ memory_cgroup() {
 	memory_cgroup_probe v2 "${MEMORY_CGROUP_DIR}" && return 0
 	memory_cgroup_probe v1 "${MEMORY_CGROUP_DIR}/memory" && return 0
 	memory_cgroup_self
-	# The process's own folder, of the version the mount was taken as, when it exists under the
-	# mount and is another one: the mount is then the host's root. When it does not exist the
-	# mount is the container's own view (v1 Docker binds its cgroup there and /proc/self/cgroup
-	# still names the host's path).
+	# An unlimited mount is kept only when it is known to be the container's own: the process's
+	# own folder of that version is the mount itself, or is not there under it (v1 Docker binds
+	# its cgroup at the mount while /proc/self/cgroup still names the host's path). When that
+	# folder exists and is another one the mount is the host's root, and when it is not known
+	# (/proc/self/cgroup unreadable, or its path not taken) the mount may be: the guard then stays
+	# off rather than count every tenant's memory.
 	case "${MEMORY_CGROUP}" in
 		v2) memory_self_other=${memory_self_v2} ;;
 		v1) memory_self_other=${memory_self_v1} ;;
 		*) memory_self_other= ;;
 	esac
-	if [ -n "${memory_self_other}" ] && [ "${memory_self_other}" != "${MEMORY_CGROUP_PATH}" ] && [ -d "${memory_self_other}" ]
+	if [ -z "${memory_self_other}" ] \
+		|| { [ "${memory_self_other}" != "${MEMORY_CGROUP_PATH}" ] && [ -d "${memory_self_other}" ]; }
 	then
 		MEMORY_CGROUP=none
 		MEMORY_CGROUP_PATH=
@@ -335,9 +338,11 @@ memory_cgroup_self() {
 # server for. That is MAX_MEMORY (kB) when set, else os_limits' available_memory (which
 # psql_tune_cmd.sh sources by name from PATH): MEMORY_LIMIT_VAR's variable (NOMAD_MEMORY_LIMIT)
 # scaled by MEMORY_LIMIT_UNIT_PERC, else HOST_MEM_PERC (20) % of MemTotal. Sets
-# MEMORY_LIMIT_SOURCE (cgroup, max_memory, nomad_var, host_share or none) and MEMORY_LIMIT_FALLBACK_BYTES, which memory_read takes as the limit. Neither the kernel
-# nor the runtime knows this budget: only the guard enforces it.
-memory_limit_source() {
+# MEMORY_LIMIT_SOURCE (cgroup, max_memory, nomad_var, host_share or none) and
+# MEMORY_LIMIT_FALLBACK_BYTES, which memory_read takes as the limit. Neither the kernel nor the
+# runtime knows this budget: only the guard enforces it. With "log" (the OOM targeting, run as root
+# at boot, which only logs the source) os_limits is not run: the chain alone names it.
+memory_limit_source() { # [log]
 	MEMORY_LIMIT_FALLBACK_BYTES=
 	if [ "${MEMORY_CGROUP}" = none ]
 	then
@@ -366,7 +371,9 @@ memory_limit_source() {
 		MEMORY_LIMIT_FALLBACK_BYTES=$(( memory_limit_mb * 1048576 ))
 		return 0
 	fi
-	memory_limit_mb=$(memory_limit_os) || memory_limit_mb=$(memory_limit_chain) || return 0
+	memory_limit_mb=
+	[ "${1:-}" = log ] || memory_limit_mb=$(memory_limit_os) || memory_limit_mb=
+	[ -n "${memory_limit_mb}" ] || memory_limit_mb=$(memory_limit_chain) || return 0
 	if [ -n "$(memory_env "${memory_limit_name}")" ]
 	then
 		MEMORY_LIMIT_SOURCE=nomad_var
@@ -386,12 +393,15 @@ memory_limit_check() { # mb
 	printf '%s\n' "$1"
 }
 
-# The budget os_limits gives, when the image ships it: the same script the tuner sources, run in a
-# subshell (it sets errexit and resets the INT and TERM traps) with its output dropped.
-# MEMORY_OS_LIMITS names the script instead of the PATH lookup (tests; empty for none).
+# The budget os_limits gives, when the image ships it: the same script the tuner sources, found the
+# same way (by name on PATH), run in a subshell (it sets errexit and resets the INT and TERM traps)
+# with its output dropped.
 memory_limit_os() {
-	memory_os_limits=${MEMORY_OS_LIMITS-$(command -v os_limits 2> /dev/null || true)}
-	[ -n "${memory_os_limits}" ] && [ -r "${memory_os_limits}" ] || return 1
+	memory_os_limits=$(command -v os_limits 2> /dev/null || true)
+	case "${memory_os_limits}" in
+		/*) [ -r "${memory_os_limits}" ] || return 1 ;;
+		*) return 1 ;;
+	esac
 	memory_limit_check "$(
 		set --
 		# shellcheck source=/dev/null  # os_limits comes from the OS image
@@ -490,7 +500,7 @@ psql_oom_target() {
 	memory_bool OOM_TARGETING_ENABLED true
 	memory_setting OOM_CHILD_SCORE_ADJ 100 -1000 1000
 	memory_cgroup
-	memory_limit_source
+	memory_limit_source log
 	# This shell is the future postmaster (the init script execs into it); read is a builtin, so
 	# /proc/self is this shell.
 	memory_cgroup_value "${MEMORY_PROC_DIR:-/proc}/self/oom_score_adj"

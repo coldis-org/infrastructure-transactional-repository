@@ -383,16 +383,16 @@ guard 2 >/dev/null
 rm -f "${WORK}/between" "${WORK}/psql.slow"
 if [ "$(state mg_sleep_ms)" = 500 ] && [ "$(state mg_throttle_ms)" = 0 ] && [ "$(listed)" = 2 ]; then ok "a full pass back under the budget ends the throttling (500 ms, fresh listing)"; else bad "a full pass back under the budget ends the throttling (500 ms, fresh listing)"; fi
 
-# 17a. The query prefix is masked before it is cut to MEMORY_GUARD_QUERY_CHARS, in one left-to-right
-# regexp_replace so that quotes pair up: quoted regions (strings, E'' strings, quoted identifiers,
-# dollar quotes), comments and numbers become ?. A real server applies the pattern (simulation S2
-# checks that the hog's literals never reach the log).
+# 17a. The query prefix never holds a literal: the listing keeps the statement up to its first quote,
+# dollar sign or comment opener, masks the numbers before it, and only then cuts the text to
+# MEMORY_GUARD_QUERY_CHARS. (A real server applies the patterns; simulation S2 checks that the
+# hog's literals never reach the log.)
 cgroup 1000 870 0 0; standard_sessions
 guard 1 >/dev/null
-check "the listing masks in one pass before cutting the query prefix" \
-	grep -qE "regexp_replace\(left\(regexp_replace\(coalesce\(a.query, ''\),[[:space:]]+'\\\\\\$" "${WORK}/psql.log"
-check "the pass covers quoted identifiers, E'' and plain strings, comments and numbers" \
-	grep -qF "|\"(\"\"|[^\"])*(\"|\$)|[Ee]''(\\\\.|''''|[^''\\\\])*(''|\$)|''(''''|[^''])*(''|\$)|/\*([^*]|\*+[^*/])*(\*+/|\$)|--[^\n]*|\m(0[xX]" "${WORK}/psql.log"
+check "the prefix stops at the first quote, dollar sign or comment opener" \
+	grep -qF "substring(coalesce(a.query, '') FROM '^(?:[^''\"\$/-]|/(?!\*)|-(?!-))*')" "${WORK}/psql.log"
+check "numbers before it become ?, before the cut" \
+	grep -qF "'\m(0[xX][0-9A-Fa-f_]+|[0-9][0-9_]*(\.[0-9_]*)?([eE][-+]?[0-9]+)?)\M', '?', 'g'), 120)" "${WORK}/psql.log"
 
 # 17b. A slow pass spaces the next one by at least its own length (capped at the max interval),
 # not only by twice the fast interval.

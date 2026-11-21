@@ -103,7 +103,9 @@ case ${1:-} in
 
 	idle)
 		clients=$2 seconds=$3
-		printf 'SELECT 1;\n\\sleep %s s\n' "${seconds}" > "${LOG_DIR}/idle.sql"
+		# pgbench keeps \sleep in microseconds in a 32-bit int: above 2147 s it overflows and does
+		# not sleep at all, and every "idle" client then runs SELECT 1 in a busy loop.
+		printf 'SELECT 1;\n\\sleep %s s\n' "$(( seconds > 2000 ? 2000 : seconds ))" > "${LOG_DIR}/idle.sql"
 		{ PGPASSWORD=${SIM_APP_PW} pgbench -n -c "${clients}" -j 8 -T "${seconds}" -f "${LOG_DIR}/idle.sql" \
 			-h "${SIM_DB_HOST}" -U "${SIM_APP_USER:-simapp}" "${SIM_DB:-simapp}"; echo "EXIT $?"; } > "${LOG_DIR}/idle.log" 2>&1
 		;;

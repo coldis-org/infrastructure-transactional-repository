@@ -935,7 +935,8 @@ memory_guard_main() {
 	fi
 	memory_guard_priority
 	memory_log LOG start "mode=${MEMORY_GUARD_MODE}" "cgroup=${MEMORY_CGROUP}" "limit_mb=$3" "used_pct=$1" "used_mb=$2" \
-		"interval=${MEMORY_GUARD_INTERVAL}" "fast_interval=${MEMORY_GUARD_FAST_INTERVAL}" "idle_perc=${MEMORY_GUARD_IDLE_PERC}" \
+		"interval=${MEMORY_GUARD_INTERVAL}" "fast_interval=${MEMORY_GUARD_FAST_INTERVAL}" \
+		"max_interval=${MEMORY_GUARD_MAX_INTERVAL}" "tick_budget_ms=${MEMORY_GUARD_TICK_BUDGET_MS}" "idle_perc=${MEMORY_GUARD_IDLE_PERC}" \
 		"active_perc=${MEMORY_GUARD_ACTIVE_PERC}" "critical_perc=${MEMORY_GUARD_CRITICAL_PERC}" \
 		"min_private_mb=${MEMORY_GUARD_MIN_PRIVATE_MB}" "oom_kills=$4" "nice=${memory_guard_nice}" "ionice=${memory_guard_ionice}"
 	while :

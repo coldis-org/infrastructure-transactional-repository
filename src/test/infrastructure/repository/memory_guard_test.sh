@@ -397,7 +397,7 @@ cgroup 1000 500 0 0
 loop TERM >/dev/null
 start=$(grep 'event=start' "${WORK}/loop.log")
 check "start line with mode, thresholds and lowered priority" has "${start}" \
-	"*LOG: event=start mode=dry-run cgroup=v2 limit_mb=1000 used_pct=50 used_mb=500 interval=0.2 fast_interval=0.1 idle_perc=85 active_perc=92 critical_perc=96 min_private_mb=16 oom_kills=0 nice=* ionice=*"
+	"*LOG: event=start mode=dry-run cgroup=v2 limit_mb=1000 used_pct=50 used_mb=500 interval=0.2 fast_interval=0.1 max_interval=* tick_budget_ms=200 idle_perc=85 active_perc=92 critical_perc=96 min_private_mb=16 oom_kills=0 nice=* ionice=*"
 check "the guard lowered its own CPU priority (nice=10)" has "${start}" "* nice=10 *"
 out=$(loop TERM MEMORY_GUARD_ENABLED=false)
 if has "$(cat "${WORK}/loop.log")" "*LOG: event=disabled reason=off*" && [ "${out}" = "status 0" ]; then ok "MEMORY_GUARD_ENABLED=false exits 0 with event=disabled reason=off"; else bad "MEMORY_GUARD_ENABLED=false exits 0 with event=disabled reason=off"; fi

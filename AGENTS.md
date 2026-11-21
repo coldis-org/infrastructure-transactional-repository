@@ -165,9 +165,9 @@ refusing connections meanwhile; every client then reconnects at once. Ending one
   - Superuser sessions are never ended; a database whose heavy sessions are superusers gets
     `event=no_candidate` only.
   - It is a polling loop: in simulation S3 (1 GB, 2 CPUs, three sessions growing at once) it held
-    growth up to 12% of the limit per second (about 120 MB/s) and lost at 25%/s. Faster growth
-    reaches the kernel first. A full pass over 2,000 idle backends (simulation S7, 8 GB, 4 CPUs)
-    took about 100 ms of CPU, about 250 ms extrapolated to 5,000.
+    growth up to 12% of the limit per second (about 120 MB/s) and lost at 25%/s (one run lost at
+    12%/s). Faster growth reaches the kernel first. A full pass over 2,000 idle backends (simulation S7, 8 GB, 4 CPUs)
+    took 100 to 140 ms of CPU, 250 to 350 ms extrapolated to 5,000.
 - **OOM targeting** (`psql_oom_target`, `OOM_TARGETING_ENABLED`, `OOM_CHILD_SCORE_ADJ` 100):
   exports `PG_OOM_ADJUST_FILE` / `PG_OOM_ADJUST_VALUE`, so every child of the postmaster raises its
   own `oom_score_adj` and the kernel kills a child, never PID 1, and the container survives. It

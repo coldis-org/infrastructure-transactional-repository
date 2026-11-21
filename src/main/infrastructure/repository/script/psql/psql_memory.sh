@@ -430,6 +430,9 @@ memory_guard_settings() {
 		FROM pg_stat_activity a LEFT JOIN pg_roles r ON r.oid = a.usesysid
 		WHERE a.pid <> pg_backend_pid()
 			AND ((a.backend_type = 'client backend' AND r.rolsuper IS FALSE${memory_guard_exclude_sql}) OR a.backend_type = 'parallel worker')"
+	# The same for stage idle: idle client backends only (an idle session leads no parallel worker).
+	MEMORY_GUARD_LIST_IDLE_SQL="${MEMORY_GUARD_LIST_SQL%%WHERE *}WHERE a.pid <> pg_backend_pid() AND a.state = 'idle'
+			AND a.backend_type = 'client backend' AND r.rolsuper IS FALSE${memory_guard_exclude_sql}"
 	if [ -n "${POSTGRES_ADMIN_PASSWORD:-}" ]
 	then
 		PGPASSWORD=${POSTGRES_ADMIN_PASSWORD}
@@ -452,9 +455,11 @@ memory_guard_psql() { # sql
 # out the shared buffers it maps; a parallel worker's is added to its leader's. Only the status
 # files of the listed client backends and their parallel workers are read, never all of /proc;
 # status is a counter read, unlike smaps_rollup, which walks every mapping.
-memory_guard_scan() {
+memory_guard_scan() { # all|idle
 	memory_guard_dir=${MEMORY_GUARD_STATE_DIR}
-	if ! memory_guard_psql "${MEMORY_GUARD_LIST_SQL}" > "${memory_guard_dir}/rows" 2> "${memory_guard_dir}/psql.err"
+	memory_guard_list_sql=${MEMORY_GUARD_LIST_SQL}
+	[ "${1:-all}" = idle ] && memory_guard_list_sql=${MEMORY_GUARD_LIST_IDLE_SQL}
+	if ! memory_guard_psql "${memory_guard_list_sql}" > "${memory_guard_dir}/rows" 2> "${memory_guard_dir}/psql.err"
 	then
 		return 1
 	fi
@@ -661,7 +666,7 @@ memory_postmaster() {
 memory_guard_load() {
 	mg_sleep_ms='' mg_stage='' mg_oom='' mg_status_at='' mg_status_peak='' mg_status_t='' mg_status_c=''
 	mg_episode_at='' mg_episode_peak='' mg_episode_t='' mg_episode_c='' mg_psql_failed_at='' mg_rate_limited_at=''
-	mg_slow_at='' mg_no_candidate='' mg_throttle_ms='' mg_scan_at=''
+	mg_slow_at='' mg_no_candidate='' mg_throttle_ms='' mg_scan_at='' mg_scan_scope=''
 	if [ -r "${MEMORY_GUARD_STATE_DIR}/state" ]
 	then
 		# shellcheck disable=SC1091  # written by memory_guard_save
@@ -682,6 +687,7 @@ memory_guard_load() {
 	mg_slow_at=${mg_slow_at:--60000}
 	mg_throttle_ms=${mg_throttle_ms:-0}
 	mg_scan_at=${mg_scan_at:-0}
+	mg_scan_scope=${mg_scan_scope:-all}
 }
 
 memory_guard_save() {
@@ -692,16 +698,16 @@ memory_guard_save() {
 		mg_sleep_ms=${MEMORY_GUARD_FAST_INTERVAL_MS}
 	fi
 	[ "${mg_throttle_ms}" -gt "${mg_sleep_ms}" ] && mg_sleep_ms=${mg_throttle_ms}
-	printf 'mg_sleep_ms=%s\nmg_stage=%s\nmg_oom=%s\nmg_status_at=%s\nmg_status_peak=%s\nmg_status_t=%s\nmg_status_c=%s\nmg_episode_at=%s\nmg_episode_peak=%s\nmg_episode_t=%s\nmg_episode_c=%s\nmg_psql_failed_at=%s\nmg_rate_limited_at=%s\nmg_slow_at=%s\nmg_no_candidate=%s\nmg_throttle_ms=%s\nmg_scan_at=%s\n' \
+	printf 'mg_sleep_ms=%s\nmg_stage=%s\nmg_oom=%s\nmg_status_at=%s\nmg_status_peak=%s\nmg_status_t=%s\nmg_status_c=%s\nmg_episode_at=%s\nmg_episode_peak=%s\nmg_episode_t=%s\nmg_episode_c=%s\nmg_psql_failed_at=%s\nmg_rate_limited_at=%s\nmg_slow_at=%s\nmg_no_candidate=%s\nmg_throttle_ms=%s\nmg_scan_at=%s\nmg_scan_scope=%s\n' \
 		"${mg_sleep_ms}" "${mg_stage}" "${mg_oom}" "${mg_status_at}" "${mg_status_peak}" "${mg_status_t}" "${mg_status_c}" \
 		"${mg_episode_at}" "${mg_episode_peak}" "${mg_episode_t}" "${mg_episode_c}" "${mg_psql_failed_at}" \
-		"${mg_rate_limited_at}" "${mg_slow_at}" "${mg_no_candidate}" "${mg_throttle_ms}" "${mg_scan_at}" \
+		"${mg_rate_limited_at}" "${mg_slow_at}" "${mg_no_candidate}" "${mg_throttle_ms}" "${mg_scan_at}" "${mg_scan_scope}" \
 		> "${MEMORY_GUARD_STATE_DIR}/state.new" && mv -f "${MEMORY_GUARD_STATE_DIR}/state.new" "${MEMORY_GUARD_STATE_DIR}/state"
 }
 
 # One pass of the guard: read the cgroup, follow the stage, act under pressure, then measure the
 # pass. A full pass longer than MEMORY_GUARD_TICK_BUDGET_MS throttles the guard: the interval
-# doubles, up to MEMORY_GUARD_MAX_INTERVAL, and passes act from the last ranking (re-checked by the
+# doubles, and is at least as long as that pass took, up to MEMORY_GUARD_MAX_INTERVAL, and passes act from the last ranking (re-checked by the
 # action statement) with a full scan only every MEMORY_GUARD_MAX_INTERVAL, until a full pass is
 # back under the budget.
 memory_guard_tick() {
@@ -725,6 +731,8 @@ memory_guard_tick() {
 			fi
 			[ "${mg_throttle_ms}" -gt "${memory_guard_base_ms}" ] && memory_guard_base_ms=${mg_throttle_ms}
 			mg_throttle_ms=$(( memory_guard_base_ms * 2 ))
+			# At least as long as the slow pass took, so the guard spends at most half its time in passes.
+			[ "${memory_guard_tick_ms}" -gt "${mg_throttle_ms}" ] && mg_throttle_ms=${memory_guard_tick_ms}
 			[ "${mg_throttle_ms}" -gt "${MEMORY_GUARD_MAX_INTERVAL_MS}" ] && mg_throttle_ms=${MEMORY_GUARD_MAX_INTERVAL_MS}
 			if [ $(( memory_now_ms - mg_slow_at )) -ge 60000 ]
 			then
@@ -806,14 +814,19 @@ memory_guard_pass() {
 		return 0
 	fi
 
-	# Full scan, or the last ranking while throttled.
+	# Full scan, or the last ranking while throttled, when it covers this stage. Stage idle only
+	# ends idle sessions, so its listing (and the /proc reads after it) takes those alone.
+	memory_guard_scope=all
+	[ "${stage}" = idle ] && memory_guard_scope=idle
 	if [ "${mg_throttle_ms}" -gt 0 ] && [ "${mg_scan_at}" -gt 0 ] && [ -r "${MEMORY_GUARD_STATE_DIR}/ranking" ] \
-		&& [ $(( now - mg_scan_at )) -lt "${MEMORY_GUARD_MAX_INTERVAL_MS}" ]
+		&& [ $(( now - mg_scan_at )) -lt "${MEMORY_GUARD_MAX_INTERVAL_MS}" ] \
+		&& { [ "${mg_scan_scope}" = all ] || [ "${memory_guard_scope}" = idle ]; }
 	then
 		memory_guard_full=0
-	elif memory_guard_scan
+	elif memory_guard_scan "${memory_guard_scope}"
 	then
 		mg_scan_at=${now}
+		mg_scan_scope=${memory_guard_scope}
 		read -r memory_guard_listed < "${MEMORY_GUARD_STATE_DIR}/listed" || memory_guard_listed=0
 	else
 		# Throttled: while the server is down or starting, every pass would fail the same way.
@@ -867,7 +880,12 @@ memory_guard_pass() {
 memory_guard_init() { # oom-kills
 	if [ -z "${MEMORY_GUARD_STATE_DIR:-}" ]
 	then
-		MEMORY_GUARD_STATE_DIR=$(mktemp -d 2>/dev/null) || return 1
+		# In memory when /dev/shm is there (a few small files), so no pass waits on the disk.
+		if [ -d /dev/shm ] && [ -w /dev/shm ]
+		then
+			MEMORY_GUARD_STATE_DIR=$(mktemp -d /dev/shm/memory_guard.XXXXXX 2>/dev/null) || MEMORY_GUARD_STATE_DIR=
+		fi
+		[ -n "${MEMORY_GUARD_STATE_DIR:-}" ] || MEMORY_GUARD_STATE_DIR=$(mktemp -d 2>/dev/null) || return 1
 		[ -n "${MEMORY_GUARD_STATE_DIR}" ] || return 1
 	fi
 	memory_guard_load
@@ -886,9 +904,11 @@ memory_guard_priority() {
 	then
 		memory_guard_nice=10
 	fi
-	if command -v ionice > /dev/null 2>&1 && ionice -c 3 -p $$ > /dev/null 2>&1
+	# The best-effort class at its lowest level, not the idle class: a busy database does I/O all
+	# the time, and the idle class would then starve the guard's own reads and process starts.
+	if command -v ionice > /dev/null 2>&1 && ionice -c 2 -n 7 -p $$ > /dev/null 2>&1
 	then
-		memory_guard_ionice=idle
+		memory_guard_ionice=best-effort-7
 	fi
 }
 

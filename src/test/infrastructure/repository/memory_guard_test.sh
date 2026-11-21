@@ -42,7 +42,7 @@ count() { # text fixed-string
 # psql stub. The listing query gets ${WORK}/sessions; the action statement gets one "<pid> t" per
 # session in its VALUES list ("<pid> skipped" for pids in ${WORK}/gone). Every statement is one
 # line of ${WORK}/psql.log. ${WORK}/psql.fail makes it fail; ${WORK}/psql.slow makes every call
-# take 300 ms on the fake clock.
+# take 300 ms on the fake clock, or as many seconds as the file holds.
 mkdir -p "${WORK}/bin"
 cat > "${WORK}/bin/psql" <<'EOF'
 #!/bin/sh
@@ -51,7 +51,8 @@ printf '%s\n' "${last}" | tr '\n' ' ' >> "${STUB_DIR}/psql.log"; echo >> "${STUB
 if [ -f "${STUB_DIR}/psql.slow" ]
 then
 	read -r up _ < "${STUB_DIR}/uptime"
-	awk -v u="${up}" 'BEGIN { printf "%.2f\n", u + 0.30 }' > "${STUB_DIR}/uptime"
+	slow=; read -r slow < "${STUB_DIR}/psql.slow" || true
+	awk -v u="${up}" -v s="${slow:-0.30}" 'BEGIN { printf "%.2f\n", u + s }' > "${STUB_DIR}/uptime"
 fi
 [ -f "${STUB_DIR}/psql.fail" ] && { echo "psql: error: connection to server failed: \"no\" such socket" >&2; exit 2; }
 case "${last}" in
@@ -369,6 +370,33 @@ touch "${WORK}/psql.slow"
 guard 2 >/dev/null
 rm -f "${WORK}/between" "${WORK}/psql.slow"
 if [ "$(state mg_sleep_ms)" = 500 ] && [ "$(state mg_throttle_ms)" = 0 ] && [ "$(listed)" = 2 ]; then ok "a full pass back under the budget ends the throttling (500 ms, fresh listing)"; else bad "a full pass back under the budget ends the throttling (500 ms, fresh listing)"; fi
+
+# 17b. A slow pass spaces the next one by at least its own length (capped at the max interval),
+# not only by twice the fast interval.
+cgroup 1000 870 0 0; standard_sessions
+echo 1.5 > "${WORK}/psql.slow"
+guard 1 >/dev/null
+check "a 3 s pass sets the interval to 3 s, not 1 s" [ "$(state mg_sleep_ms)" = 3000 ]
+echo 9 > "${WORK}/psql.slow"
+guard 1 >/dev/null
+check "a pass longer than the max interval sets it to the max (5 s)" [ "$(state mg_sleep_ms)" = 5000 ]
+rm -f "${WORK}/psql.slow"
+
+# 17c. Stage idle lists idle client backends only; the other stages list every client backend and
+# the parallel workers. A ranking listed in stage idle is not reused in a later stage.
+cgroup 1000 870 0 0; standard_sessions
+guard 1 >/dev/null
+check "stage idle lists idle sessions only" grep -qE "a.state = 'idle'[[:space:]]+AND a.backend_type = 'client backend'" "${WORK}/psql.log"
+check "stage idle lists no parallel worker" sh -c "! grep -q \"backend_type = 'parallel worker'\" '${WORK}/psql.log'"
+cgroup 1000 930 0 0; standard_sessions
+guard 1 >/dev/null
+check "stage active lists every client backend and the parallel workers" grep -q "OR a.backend_type = 'parallel worker'" "${WORK}/psql.log"
+cgroup 1000 870 0 0; standard_sessions
+touch "${WORK}/psql.slow"
+echo "use 930" > "${WORK}/between"
+guard 2 >/dev/null
+rm -f "${WORK}/between" "${WORK}/psql.slow"
+check "a ranking listed in stage idle is not reused, throttled, in stage active" [ "$(listed)" = 2 ]
 
 # 18. The loop: survives garbage, exits 0 on TERM, INT and HUP, and when off or unlimited.
 loop() { # signal [VAR=value...]

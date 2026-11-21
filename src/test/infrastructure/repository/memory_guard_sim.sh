@@ -7,10 +7,10 @@
 #   src/test/infrastructure/repository/memory_guard_sim.sh --build .            # build Dockerfile7 here
 #   src/test/infrastructure/repository/memory_guard_sim.sh --image <tag> --scenarios S0
 #
-# Every database container gets --memory=1g --memory-swap=1g (no swap), --cpus=2, a tmpfs at
-# /var/lib/postgresql (the data directory lives in memory, charged to the same cgroup), and the
-# application role simapp through POSTGRES_DEFAULT_USER. Load comes from a second container on the
-# same network (sim/sim_client.sh), so the clients' memory is not charged to the database.
+# Every database container but S1U's gets --memory=1g --memory-swap=1g (no swap), --cpus=2, a
+# tmpfs at /var/lib/postgresql (the data directory lives in memory, charged to the same cgroup), and
+# the application role simapp through POSTGRES_DEFAULT_USER. Load comes from a second container on
+# the same network (sim/sim_client.sh), so the clients' memory is not charged to the database.
 #
 # Pressure is reproducible:
 #   idle bloat  sessions that set_config() 8 MB pads one after the other, at a set share of the
@@ -52,7 +52,7 @@ BUILD_PATH=
 BASELINE_IMAGE=coldis/infrastructure-transactional-repository:7.3.0
 REPLICA_IMAGE=
 declare -A MAJOR_IMAGE=()
-SCENARIOS=S0,S0B,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10
+SCENARIOS=S0,S0B,S1,S1U,S2,S3,S4,S5,S6,S7,S8,S9,S10
 OUT=
 KEEP_IMAGES=false
 MEMORY=1g
@@ -84,7 +84,7 @@ usage() {
 	  --baseline-image TAG    image for S0B (default ${BASELINE_IMAGE})
 	  --replica-image TAG     replica image for S6 (default: built from --build)
 	  --major-image N=TAG     image of PostgreSQL N (15, 16, 17) for S8 (default: built from --build)
-	  --scenarios LIST        comma list of S0,S0B,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10
+	  --scenarios LIST        comma list of S0,S0B,S1,S1U,S2,S3,S4,S5,S6,S7,S8,S9,S10
 	                          (default: all; S5 runs S5a,S5b,S5cd,S5e, which can be named alone)
 	  --out DIR               where logs go (default: a new temporary directory)
 	  --memory SIZE           database container limit (default ${MEMORY})
@@ -292,19 +292,27 @@ scn_end() {
 	return 0
 }
 
-# Starts a database container: db_run <name> <image> <memory> [NAME=value ...].
+# Starts a database container: db_run <name> <image> <memory> [NAME=value ...]. Memory "none"
+# runs it with no limit at all (no -m), its data tmpfs still at 1g.
 db_run() {
-	local name=$1 image=$2 mem=$3 e
+	local name=$1 image=$2 mem=$3 e tmpfs
 	shift 3
-	local env=()
+	local env=() limit=()
 	for e in "$@"
 	do
 		env+=(-e "${e}")
 	done
+	tmpfs=${mem}
+	if [ "${mem}" = none ]
+	then
+		tmpfs=1g
+	else
+		limit=(--memory="${mem}" --memory-swap="${mem}")
+	fi
 	docker run -d --name "${name}" --hostname "${name}" --network "${NET}" \
 		--label "mgsim.run=${RUN_ID}" --label "mgsim.scn=${NET}" \
-		--memory="${mem}" --memory-swap="${mem}" --cpus="${CPUS}" \
-		--tmpfs "/var/lib/postgresql:rw,size=${mem}" \
+		"${limit[@]}" --cpus="${CPUS}" \
+		--tmpfs "/var/lib/postgresql:rw,size=${tmpfs}" \
 		-e "POSTGRES_ADMIN_USER=${ADMIN_USER}" -e "POSTGRES_ADMIN_PASSWORD=${ADMIN_PW}" \
 		-e "POSTGRES_DEFAULT_USER=${APP_USER}" -e "POSTGRES_DEFAULT_PASSWORD=${APP_PW}" \
 		-e "POSTGRES_DEFAULT_DATABASE=${APP_DB}" \
@@ -425,12 +433,18 @@ kernel_victims() {
 }
 oom_fmt() { if [ "$1" = "${OOM_GONE}" ]; then echo "container-OOM-killed"; else echo "$1"; fi; }
 
-# "<pct> <used MB> <limit MB>": memory.current less page cache, as the guard reads it.
+# "<pct> <used MB> <limit MB>": memory.current less page cache, as the guard reads it. With no
+# limit (memory.max is max) the limit is SIM_BUDGET_MB, the budget the guard was given, if set.
+SIM_BUDGET_MB=
 mem_use() {
 	local cur max
 	cur=$(cg_cat "$1" memory.current) || return 1
 	max=$(cg_cat "$1" memory.max) || return 1
-	[ "${max}" != max ] || { echo "0 0 0"; return 0; }
+	if [ "${max}" = max ]
+	then
+		[ -n "${SIM_BUDGET_MB}" ] || { echo "0 0 0"; return 0; }
+		max=$(( SIM_BUDGET_MB * 1048576 ))
+	fi
 	cg_cat "$1" memory.stat | awk -v cur="${cur}" -v max="${max}" '
 		$1 == "active_file" || $1 == "inactive_file" { f += $2 }
 		END { u = cur - f; printf "%d %d %d\n", u * 100 / max, u / 1048576, max / 1048576 }'
@@ -651,6 +665,55 @@ s1() {
 	local detail
 	detail="actions=${n} peak=${peak}% final=${final}% oom_kill ${oom0}->${oom1}"
 	if [ ${#fails[@]} -eq 0 ]; then record S1 PASS "${detail}"; else record S1 FAIL "$(IFS=';'; echo "${fails[*]}") | ${detail}"; fi
+}
+
+# S1U: S1 on a container with no memory limit (no -m) and NOMAD_MEMORY_LIMIT=1024: the guard
+# takes the budget the tuner sized the server for (limit_source=nomad_var) and keeps the server
+# within it. The kernel enforces nothing here, so there is no OOM kill to wait for: the pass is the
+# guard's own actions, and the peak against the budget.
+S1U_BUDGET_MB=1024
+s1u() {
+	local saved_memory=${MEMORY} start warn cgmax oom0 oom1 actions bad n peak final
+	MEMORY=none
+	SIM_BUDGET_MB=${S1U_BUDGET_MB}
+	if ! sim_up "${IMAGE}" MEMORY_GUARD_ENABLED=true MEMORY_GUARD_MODE=enforce "NOMAD_MEMORY_LIMIT=${S1U_BUDGET_MB}"
+	then
+		MEMORY=${saved_memory}
+		SIM_BUDGET_MB=
+		return 0
+	fi
+	MEMORY=${saved_memory}
+	start=$(db_log "${DB}" | grep -E 'MEMORY_GUARD: [A-Z]+: event=start( |$)' | tail -n 1)
+	warn=$(db_log "${DB}" | grep -E 'MEMORY_GUARD: WARN: event=limit_fallback( |$)' | tail -n 1)
+	cgmax=$(cg_cat "${DB}" memory.max 2>/dev/null)
+	oom0=$(oom_kills "${DB}")
+	canary_start
+	ramp 3 130 none pad
+	wait_for 30 use_below "${GUARD_IDLE_PERC}" || true
+	read -r final _ <<< "$(mem_use "${DB}")"
+	oom1=$(oom_kills "${DB}")
+	db_log "${DB}" > "${SDIR}/db.log"
+	actions=$(guard_events "${SDIR}/db.log" action)
+	n=$(count_lines "${actions}")
+	bad=$(printf '%s\n' "${actions}" | grep -v '^$' | grep -cvE ' action=terminate (.* )?stage=idle( |$)| stage=idle (.* )?action=terminate( |$)')
+	peak=$(sampled_peak "${SDIR}/memory.tsv")
+	SIM_BUDGET_MB=
+	local fails=()
+	[ "${cgmax}" = max ] || fails+=("container has a kernel limit (memory.max=${cgmax})")
+	[ "$(kv "${start}" limit_source)" = nomad_var ] || fails+=("start line limit_source=$(kv "${start}" limit_source), not nomad_var")
+	[ "$(kv "${start}" limit_mb)" = "${S1U_BUDGET_MB}" ] || fails+=("start line limit_mb=$(kv "${start}" limit_mb)")
+	[ -n "${warn}" ] || fails+=("no WARN event=limit_fallback")
+	[ "${oom1}" = "${oom0}" ] || fails+=("oom_kill ${oom0}->${oom1}")
+	grep -qE "${SIG9_RE}" "${SDIR}/db.log" && fails+=("signal 9 line")
+	[ "${n}" -ge 1 ] || fails+=("no action line")
+	[ "${bad}" = 0 ] || fails+=("${bad} action line(s) other than terminate at stage idle")
+	canary_ok || fails+=("canary lost its backend ($(canary_state))")
+	[ "${final}" -lt "${GUARD_IDLE_PERC}" ] || fails+=("use still ${final}% of the budget")
+	[ "${peak}" -ge "${GUARD_IDLE_PERC}" ] || fails+=("pressure never reached ${GUARD_IDLE_PERC}% (peak ${peak}%)")
+	[ "${peak}" -lt 100 ] || fails+=("peak ${peak}% of the budget")
+	local detail
+	detail="memory.max=${cgmax} limit_source=$(kv "${start}" limit_source) limit_mb=$(kv "${start}" limit_mb) cgroup_path=$(kv "${start}" cgroup_path) actions=${n} peak=${peak}% final=${final}% of ${S1U_BUDGET_MB} MB; oom_kill ${oom0}->${oom1}"
+	if [ ${#fails[@]} -eq 0 ]; then record S1U PASS "${detail}"; else record S1U FAIL "$(IFS=';'; echo "${fails[*]}") | ${detail}"; fi
 }
 
 # S2: guard enforcing, one active hog as the application role at 3% of the limit per second.
@@ -1126,6 +1189,7 @@ do
 			docker image inspect "${BASELINE_IMAGE}" >/dev/null 2>&1 || docker pull -q "${BASELINE_IMAGE}" >/dev/null
 			run_one S0B s0 "${BASELINE_IMAGE}" ;;
 		S1) run_one S1 s1 ;;
+		S1U) run_one S1U s1u ;;
 		S2) run_one S2 s2 ;;
 		S3) s3 ;;
 		S4) run_one S4 s4 ;;

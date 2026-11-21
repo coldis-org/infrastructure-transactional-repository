@@ -608,8 +608,8 @@ memory_guard_record() { # result-when-not-enforcing stage pct used-MB limit-MB n
 			action = $1; expect = $2; kb = $3; pid = $4; start = $5
 			if (forced != "") res = forced
 			else if (!(pid in result)) res = "failed"
-			else if (result[pid] == "t") res = "ok"
-			else if (result[pid] == "f" || result[pid] == "skipped") res = "skipped"
+			else if (result[pid] == "true" || result[pid] == "t") res = "ok"
+			else if (result[pid] == "false" || result[pid] == "f" || result[pid] == "skipped") res = "skipped"
 			else res = "failed"
 			line = prefix " WARN: event=action action=" action " stage=" stage " pid=" pid " usename=" q($7) \
 				" datname=" q($8) " application_name=" q($9) " state=" q($6) " private_mb=" int(kb / 1024) \

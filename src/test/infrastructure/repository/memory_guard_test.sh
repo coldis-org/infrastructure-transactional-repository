@@ -58,7 +58,7 @@ case "${last}" in
 	*'FROM (VALUES'*)
 		printf '%s\n' "${last}" | grep -o "([0-9]*, [0-9]*, '[a-z]*'" | tr -d "(," | while read -r pid _
 		do
-			if grep -qx "${pid}" "${STUB_DIR}/gone" 2>/dev/null; then printf '%s\tskipped\n' "${pid}"; else printf '%s\tt\n' "${pid}"; fi
+			if grep -qx "${pid}" "${STUB_DIR}/gone" 2>/dev/null; then printf '%s\tskipped\n' "${pid}"; else printf '%s\ttrue\n' "${pid}"; fi
 		done
 		;;
 	*'LEFT JOIN pg_roles r ON r.oid = a.usesysid'*) cat "${STUB_DIR}/sessions" ;;

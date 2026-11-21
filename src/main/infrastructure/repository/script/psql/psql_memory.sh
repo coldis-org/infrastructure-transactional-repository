@@ -42,6 +42,13 @@
 # memory.events, or v1 memory.usage_in_bytes, memory.limit_in_bytes, memory.stat and
 # memory.oom_control. The file page cache (active_file and inactive_file) is left out of the use:
 # the kernel reclaims it before killing anything, and a database keeps it full.
+# The cgroup is the mount's own (a private cgroup namespace), else the process's own one found
+# through /proc/self/cgroup (a container that sees the host's tree); see memory_cgroup. When it has
+# no limit (docker run without -m, or the root of a namespace) the limit is the budget the tuner
+# sized the server for, from os_limits: NOMAD_MEMORY_LIMIT, else a share of the host's memory
+# (memory_limit_source). The kernel does not enforce that budget; the guard does. The use is
+# always the cgroup's: with no cgroup use to read the guard stays off, as the host's use is every
+# tenant's.
 #
 # Guard settings (environment, checked once at start; bad values fall back with a WARN):
 #   MEMORY_GUARD_ENABLED          true          false: one line, exit 0.
@@ -66,7 +73,10 @@
 # OOM targeting: OOM_TARGETING_ENABLED (true), OOM_CHILD_SCORE_ADJ (100, -1000 to 1000).
 # The guard connects as POSTGRES_ADMIN_USER over the local socket (MEMORY_GUARD_SOCKET_DIR,
 # /var/run/postgresql), with PGPASSWORD only when POSTGRES_ADMIN_PASSWORD is set, never prompting.
-# Tests point MEMORY_CGROUP_DIR, MEMORY_PROC_DIR and MEMORY_UPTIME_FILE at fakes.
+# The budget with no cgroup limit follows os_limits' settings: MEMORY_LIMIT_VAR (NOMAD_MEMORY_LIMIT),
+# MEMORY_LIMIT_UNIT_PERC (100) and HOST_MEM_PERC (20).
+# Tests point MEMORY_CGROUP_DIR, MEMORY_PROC_DIR and MEMORY_UPTIME_FILE at fakes, and MEMORY_OS_LIMITS
+# at a fake os_limits (empty: none).
 
 # Tab, the field separator of every list below.
 MEMORY_TAB=$(printf '\t')
@@ -230,45 +240,194 @@ memory_sleep() { # ms
 	sleep "$(( $1 / 1000 )).${memory_sleep_rest}" 2>/dev/null || sleep $(( $1 / 1000 + 1 )) || true
 }
 
-# Finds the container's memory cgroup: sets MEMORY_CGROUP to v2, v1 or none and MEMORY_CGROUP_PATH
-# to its folder. MEMORY_CGROUP_DIR is the cgroup mount (tests point it elsewhere).
+# Finds the container's memory cgroup: sets MEMORY_CGROUP to v2, v1 or none, MEMORY_CGROUP_PATH to
+# its folder, and MEMORY_CGROUP_LIMITED to true when the cgroup has a limit of its own.
+# MEMORY_CGROUP_DIR is the cgroup mount and MEMORY_PROC_DIR is /proc (tests point both elsewhere).
+# In order, the first cgroup with a readable use and a limit wins:
+#   1. the mount itself, v2 then v1 (a private cgroup namespace, where it is the container's own);
+#   2. the process's own cgroup from /proc/self/cgroup under the mount, v2 then v1 (a container
+#      that sees the host's tree, cgroupns=host).
+# With no limit anywhere the guard still needs a cgroup whose use is the container's: its own
+# cgroup from /proc/self/cgroup when it is readable, else the mount, but never the mount when
+# /proc/self/cgroup puts the process elsewhere (that mount is the host's root, and its use is
+# every tenant's). The limit then comes from memory_limit_source.
 memory_cgroup() {
 	MEMORY_CGROUP_DIR=${MEMORY_CGROUP_DIR:-/sys/fs/cgroup}
-	if [ -r "${MEMORY_CGROUP_DIR}/memory.current" ] && [ -r "${MEMORY_CGROUP_DIR}/memory.max" ]
+	MEMORY_CGROUP=none
+	MEMORY_CGROUP_PATH=
+	MEMORY_CGROUP_LIMITED=false
+	MEMORY_LIMIT_FALLBACK_BYTES=
+	memory_cgroup_probe v2 "${MEMORY_CGROUP_DIR}" && return 0
+	memory_cgroup_probe v1 "${MEMORY_CGROUP_DIR}/memory" && return 0
+	memory_cgroup_self
+	if [ -n "${memory_self_v2}${memory_self_v1}" ] && [ "${MEMORY_CGROUP_PATH}" != "${memory_self_v2}" ] \
+		&& [ "${MEMORY_CGROUP_PATH}" != "${memory_self_v1}" ]
 	then
-		MEMORY_CGROUP=v2
-		MEMORY_CGROUP_PATH=${MEMORY_CGROUP_DIR}
-	elif [ -r "${MEMORY_CGROUP_DIR}/memory/memory.usage_in_bytes" ] && [ -r "${MEMORY_CGROUP_DIR}/memory/memory.limit_in_bytes" ]
-	then
-		MEMORY_CGROUP=v1
-		MEMORY_CGROUP_PATH=${MEMORY_CGROUP_DIR}/memory
-	else
 		MEMORY_CGROUP=none
 		MEMORY_CGROUP_PATH=
 	fi
+	memory_cgroup_probe v2 "${memory_self_v2}" && return 0
+	memory_cgroup_probe v1 "${memory_self_v1}" && return 0
+	return 0
+}
+
+# Takes the cgroup in folder $2 (of version $1) when its use is readable, and returns 0 only when it
+# also has a limit: a positive number of bytes below 10^18 (v2 "max", v1's page-rounded 2^63 and a
+# missing memory.max, at the root of a namespace, are none).
+memory_cgroup_probe() { # v2|v1 folder
+	[ -n "$2" ] || return 1
+	if [ "$1" = v2 ]
+	then
+		set -- v2 "$2" memory.current memory.max
+	else
+		set -- v1 "$2" memory.usage_in_bytes memory.limit_in_bytes
+	fi
+	[ -r "$2/$3" ] || return 1
+	MEMORY_CGROUP=$1
+	MEMORY_CGROUP_PATH=$2
+	memory_probe_limit=
+	if [ -r "$2/$4" ]
+	then
+		read -r memory_probe_limit _ < "$2/$4" || true
+	fi
+	case "${memory_probe_limit}" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "${#memory_probe_limit}" -le 18 ] && [ "${memory_probe_limit}" -gt 0 ] || return 1
+	MEMORY_CGROUP_LIMITED=true
+	return 0
+}
+
+# Reads the process's own cgroup from /proc/self/cgroup (read is a builtin, so self is this shell,
+# which shares the server's cgroup): sets memory_self_v2 to its v2 folder (the "0::<path>" line)
+# and memory_self_v1 to its v1 memory folder (the line whose controllers include memory), both
+# under the mount, or empty. A path that climbs out of the namespace ("/..") is not followed.
+memory_cgroup_self() {
+	memory_self_v2=
+	memory_self_v1=
+	[ -r "${MEMORY_PROC_DIR:-/proc}/self/cgroup" ] || return 0
+	while IFS= read -r memory_self_line || [ -n "${memory_self_line}" ]
+	do
+		memory_self_rest=${memory_self_line#*:}
+		memory_self_controllers=${memory_self_rest%%:*}
+		memory_self_path=${memory_self_rest#*:}
+		case "${memory_self_path}" in
+			/*/..|/*/../*|/..|/../*|*[!A-Za-z0-9_.:@=+,/-]*|'') continue ;;
+			/) memory_self_path= ;;
+		esac
+		case "${memory_self_line%%:*}:${memory_self_controllers}" in
+			0:) memory_self_v2=${MEMORY_CGROUP_DIR}${memory_self_path} ;;
+			*:memory|*:memory,*|*,memory|*,memory,*) memory_self_v1=${MEMORY_CGROUP_DIR}/memory${memory_self_path} ;;
+		esac
+	done < "${MEMORY_PROC_DIR:-/proc}/self/cgroup"
+	return 0
+}
+
+# The memory budget when the cgroup has no limit of its own, in MB, from the chain the tuner sizes
+# the server for (os_limits' available_memory, which psql_tune_cmd.sh sources by name from PATH):
+# MEMORY_LIMIT_VAR's variable (NOMAD_MEMORY_LIMIT) scaled by MEMORY_LIMIT_UNIT_PERC, else
+# HOST_MEM_PERC (20) % of MemTotal. Sets MEMORY_LIMIT_SOURCE (cgroup, nomad_var, host_share or
+# none) and MEMORY_LIMIT_FALLBACK_BYTES, which memory_read takes as the limit. Neither the kernel
+# nor the runtime knows this budget: only the guard enforces it.
+memory_limit_source() {
+	MEMORY_LIMIT_FALLBACK_BYTES=
+	if [ "${MEMORY_CGROUP}" = none ]
+	then
+		MEMORY_LIMIT_SOURCE=none
+		return 0
+	fi
+	if [ "${MEMORY_CGROUP_LIMITED}" = true ]
+	then
+		MEMORY_LIMIT_SOURCE=cgroup
+		return 0
+	fi
+	MEMORY_LIMIT_SOURCE=none
+	memory_limit_name=$(memory_env MEMORY_LIMIT_VAR)
+	case "${memory_limit_name}" in
+		''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) memory_limit_name=NOMAD_MEMORY_LIMIT ;;
+	esac
+	memory_limit_mb=$(memory_limit_os) || memory_limit_mb=$(memory_limit_chain) || return 0
+	if [ -n "$(memory_env "${memory_limit_name}")" ]
+	then
+		MEMORY_LIMIT_SOURCE=nomad_var
+	else
+		MEMORY_LIMIT_SOURCE=host_share
+	fi
+	MEMORY_LIMIT_FALLBACK_BYTES=$(( memory_limit_mb * 1048576 ))
+}
+
+# Prints a budget in MB if it is a whole number from 1 to 2^40 - 1 (a larger one is v1's "no limit"
+# read as a number), else fails.
+memory_limit_check() { # mb
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "${#1}" -le 13 ] && [ "$1" -ge 1 ] && [ "$1" -lt 1099511627776 ] || return 1
+	printf '%s\n' "$1"
+}
+
+# The budget os_limits gives, when the image ships it: the same script the tuner sources, run in a
+# subshell (it sets errexit and resets the INT and TERM traps) with its output dropped.
+# MEMORY_OS_LIMITS names the script instead of the PATH lookup (tests; empty for none).
+memory_limit_os() {
+	memory_os_limits=${MEMORY_OS_LIMITS-$(command -v os_limits 2> /dev/null || true)}
+	[ -n "${memory_os_limits}" ] && [ -r "${memory_os_limits}" ] || return 1
+	memory_limit_check "$(
+		set --
+		# shellcheck source=/dev/null  # os_limits comes from the OS image
+		. "${memory_os_limits}" < /dev/null > /dev/null 2>&1
+		available_memory < /dev/null > /dev/null 2>&1
+		printf '%s' "${AVAILABLE_MEMORY:-}"
+	)" 2> /dev/null
+}
+
+# The same chain as os_limits' available_memory past the cgroup, for an image without it.
+memory_limit_chain() {
+	memory_chain_value=$(memory_env "${memory_limit_name}")
+	if [ -n "${memory_chain_value}" ]
+	then
+		memory_chain_unit=$(memory_env MEMORY_LIMIT_UNIT_PERC)
+		case "${memory_chain_unit:=100}" in
+			*[!0-9]*|?|??) memory_chain_unit=100 ;;
+		esac
+		memory_limit_check "$(awk -v v="${memory_chain_value}" -v u="${memory_chain_unit}" 'BEGIN {
+			if (v !~ /^[0-9]+$/ || length(v) > 13) exit 1
+			m = int(v / int(u / 100)); if (m < 1) m = 1; printf "%d\n", m }')"
+		return
+	fi
+	memory_chain_perc=$(memory_env HOST_MEM_PERC)
+	case "${memory_chain_perc:=20}" in
+		*[!0-9]*) memory_chain_perc=20 ;;
+	esac
+	memory_limit_check "$(awk -v p="${memory_chain_perc}" '/^MemTotal:/ { printf "%d\n", int(sprintf("%.0f", $2 / 1024) * p / 100); exit }' \
+		"${MEMORY_PROC_DIR:-/proc}/meminfo" 2> /dev/null)"
 }
 
 # Reads the cgroup once, with one awk. Prints
 #   <used %> <used MB> <limit MB> <oom kills> <used kB> <limit kB>
-# or "unlimited" when the cgroup has no limit (v2 "max", v1 a page-rounded 2^63), or nothing when
-# it cannot be read. The oom kill count is -1 when the kernel does not report it.
+# or "unlimited" when the cgroup has no limit (v2 "max" or no memory.max, v1 a page-rounded 2^63:
+# anything from 10^18 bytes up) and MEMORY_LIMIT_FALLBACK_BYTES is not set, or nothing when it
+# cannot be read. With no limit of the cgroup's own, MEMORY_LIMIT_FALLBACK_BYTES is the limit. The
+# oom kill count is -1 when the kernel does not report it.
 # v1 memory.stat carries both the cgroup's own counters and the hierarchical total_* ones; the use
 # (memory.usage_in_bytes) is hierarchical, so only total_* are subtracted when present. Adding both
 # would leave the page cache out twice and make the guard act late.
 memory_read() {
 	case "${MEMORY_CGROUP}" in
 		v2)
-			set -- "${MEMORY_CGROUP_PATH}/memory.max" "${MEMORY_CGROUP_PATH}/memory.current" "${MEMORY_CGROUP_PATH}/memory.stat"
+			set -- "${MEMORY_CGROUP_PATH}/memory.current" "${MEMORY_CGROUP_PATH}/memory.stat"
+			[ -r "${MEMORY_CGROUP_PATH}/memory.max" ] && set -- "$@" "${MEMORY_CGROUP_PATH}/memory.max"
 			[ -r "${MEMORY_CGROUP_PATH}/memory.events" ] && set -- "$@" "${MEMORY_CGROUP_PATH}/memory.events"
 			;;
 		v1)
-			set -- "${MEMORY_CGROUP_PATH}/memory.limit_in_bytes" "${MEMORY_CGROUP_PATH}/memory.usage_in_bytes" "${MEMORY_CGROUP_PATH}/memory.stat"
+			set -- "${MEMORY_CGROUP_PATH}/memory.usage_in_bytes" "${MEMORY_CGROUP_PATH}/memory.stat"
+			[ -r "${MEMORY_CGROUP_PATH}/memory.limit_in_bytes" ] && set -- "$@" "${MEMORY_CGROUP_PATH}/memory.limit_in_bytes"
 			[ -r "${MEMORY_CGROUP_PATH}/memory.oom_control" ] && set -- "$@" "${MEMORY_CGROUP_PATH}/memory.oom_control"
 			;;
 		*) return 1 ;;
 	esac
-	awk '
-		BEGIN { oom = -1 }
+	awk -v fallback="${MEMORY_LIMIT_FALLBACK_BYTES:-}" '
+		BEGIN { oom = -1; limit = "max" }
 		FILENAME ~ /(memory\.max|memory\.limit_in_bytes)$/ && FNR == 1 { limit = $1 }
 		FILENAME ~ /(memory\.current|memory\.usage_in_bytes)$/ && FNR == 1 { current = $1 }
 		FILENAME ~ /memory\.stat$/ {
@@ -277,7 +436,10 @@ memory_read() {
 		}
 		FILENAME ~ /(memory\.events|memory\.oom_control)$/ && $1 == "oom_kill" { oom = $2 }
 		END {
-			if (limit == "max" || (limit ~ /^[0-9]+$/ && limit + 0 >= 1152921504606846976)) { print "unlimited"; exit 0 }
+			if (limit == "max" || (limit ~ /^[0-9]+$/ && length(limit) > 18)) {
+				if (fallback !~ /^[0-9]+$/ || fallback + 0 <= 0) { print "unlimited"; exit 0 }
+				limit = fallback
+			}
 			if (limit !~ /^[0-9]+$/ || limit + 0 <= 0 || current !~ /^[0-9]+$/) exit 1
 			if (oom !~ /^-?[0-9]+$/) oom = -1
 			used = current - (hierarchical ? total : own)
@@ -308,6 +470,7 @@ psql_oom_target() {
 	memory_bool OOM_TARGETING_ENABLED true
 	memory_setting OOM_CHILD_SCORE_ADJ 100 -1000 1000
 	memory_cgroup
+	memory_limit_source
 	# This shell is the future postmaster (the init script execs into it); read is a builtin, so
 	# /proc/self is this shell.
 	memory_cgroup_value "${MEMORY_PROC_DIR:-/proc}/self/oom_score_adj"
@@ -346,6 +509,7 @@ psql_oom_target() {
 	memory_log LOG oom_target "state=${oom_target_state}" "postmaster_oom_score_adj=${oom_target_postmaster}" \
 		"child_oom_score_adj=${oom_target_child}" "cgroup=${MEMORY_CGROUP}" "memory_max=${oom_target_max}" \
 		"memory_high=${oom_target_high}" "swap_max=${oom_target_swap}" "oom_group=${oom_target_group}" \
+		"limit_source=${MEMORY_LIMIT_SOURCE}" "$(memory_field cgroup_path "${MEMORY_CGROUP_PATH}")" \
 		'note="only makes the victim deterministic; any kill is crash recovery"'
 	if [ "${oom_target_group}" = 1 ]
 	then
@@ -956,9 +1120,15 @@ memory_guard_main() {
 		memory_guard_tries=$(( memory_guard_tries + 1 ))
 		sleep 1 || true
 	done
+	# With no limit of the cgroup's own, the budget the server was tuned for is the limit.
+	memory_limit_source
+	if [ "${memory_guard_reading}" = unlimited ] && [ -n "${MEMORY_LIMIT_FALLBACK_BYTES}" ]
+	then
+		memory_guard_reading=$(memory_read) || memory_guard_reading=
+	fi
 	case "${memory_guard_reading}" in
 		unlimited)
-			memory_log LOG disabled reason=unlimited
+			memory_log LOG disabled reason=unlimited "$(memory_field cgroup_path "${MEMORY_CGROUP_PATH}")"
 			exit 0
 			;;
 		'')
@@ -978,7 +1148,13 @@ memory_guard_main() {
 		"interval=${MEMORY_GUARD_INTERVAL}" "fast_interval=${MEMORY_GUARD_FAST_INTERVAL}" \
 		"max_interval=${MEMORY_GUARD_MAX_INTERVAL}" "tick_budget_ms=${MEMORY_GUARD_TICK_BUDGET_MS}" "idle_perc=${MEMORY_GUARD_IDLE_PERC}" \
 		"active_perc=${MEMORY_GUARD_ACTIVE_PERC}" "critical_perc=${MEMORY_GUARD_CRITICAL_PERC}" \
-		"min_private_mb=${MEMORY_GUARD_MIN_PRIVATE_MB}" "oom_kills=$4" "nice=${memory_guard_nice}" "ionice=${memory_guard_ionice}"
+		"min_private_mb=${MEMORY_GUARD_MIN_PRIVATE_MB}" "oom_kills=$4" "nice=${memory_guard_nice}" "ionice=${memory_guard_ionice}" \
+		"limit_source=${MEMORY_LIMIT_SOURCE}" "$(memory_field cgroup_path "${MEMORY_CGROUP_PATH}")"
+	if [ "${MEMORY_LIMIT_SOURCE}" != cgroup ]
+	then
+		memory_log WARN limit_fallback "limit_source=${MEMORY_LIMIT_SOURCE}" "limit_mb=$3" "limit_var=${memory_limit_name}" \
+			'note="the kernel does not enforce this limit; the guard keeps the server within the budget it was tuned for"'
+	fi
 	while :
 	do
 		( memory_guard_tick ) || true

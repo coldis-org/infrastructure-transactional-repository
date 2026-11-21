@@ -132,7 +132,7 @@ standard_sessions() {
 		"203 20 client idle_in_transaction app update"
 }
 
-ENVS="PATH=${WORK}/bin:${PATH} STUB_DIR=${WORK} MEMORY_CGROUP_DIR=${WORK}/cg MEMORY_PROC_DIR=${WORK}/proc MEMORY_UPTIME_FILE=${WORK}/uptime PGDATA=${WORK}/pgdata MEMORY_GUARD_PAUSE_FILE=${WORK}/pause"
+ENVS="PATH=${WORK}/bin:${PATH} STUB_DIR=${WORK} MEMORY_CGROUP_DIR=${WORK}/cg MEMORY_PROC_DIR=${WORK}/proc MEMORY_UPTIME_FILE=${WORK}/uptime PGDATA=${WORK}/pgdata MEMORY_GUARD_PAUSE_FILE=${WORK}/pause MEMORY_OS_LIMITS="
 
 # Runs guard passes under sh, enforcing unless told otherwise; prints the guard's log (stderr)
 # and keeps the statements in ${WORK}/psql.log. State carries over between the passes of one
@@ -162,7 +162,7 @@ listed() { grep -c 'LEFT JOIN pg_roles r ON r.oid = a.usesysid' "${WORK}/psql.lo
 statements() { grep -c 'FROM (VALUES' "${WORK}/psql.log"; }
 state() { sed -n "s/^$1=//p" "${WORK}/state/state"; }
 memread() { # cgroup-dir
-	env MEMORY_CGROUP_DIR="$1" sh -c ". '${SCRIPTS}/psql_memory.sh'; memory_cgroup; memory_read"
+	env MEMORY_CGROUP_DIR="$1" MEMORY_PROC_DIR="${WORK}/noproc" sh -c ". '${SCRIPTS}/psql_memory.sh'; memory_cgroup; memory_read"
 }
 
 # 1. Reading the cgroup.
@@ -454,7 +454,7 @@ out=$(loop TERM MEMORY_GUARD_ENABLED=false)
 if has "$(cat "${WORK}/loop.log")" "*LOG: event=disabled reason=off*" && [ "${out}" = "status 0" ]; then ok "MEMORY_GUARD_ENABLED=false exits 0 with event=disabled reason=off"; else bad "MEMORY_GUARD_ENABLED=false exits 0 with event=disabled reason=off"; fi
 echo max > "${WORK}/cg/memory.max"
 out=$(loop TERM)
-if has "$(cat "${WORK}/loop.log")" "*LOG: event=disabled reason=unlimited*" && [ "${out}" = "status 0" ]; then ok "no memory limit: exits 0 with reason=unlimited"; else bad "no memory limit: exits 0 with reason=unlimited"; fi
+if has "$(cat "${WORK}/loop.log")" "*LOG: event=disabled reason=unlimited*" && [ "${out}" = "status 0" ]; then ok "no memory limit and no budget to fall back on: exits 0 with reason=unlimited"; else bad "no memory limit and no budget to fall back on: exits 0 with reason=unlimited"; fi
 rm -rf "${WORK}/cg"
 out=$(loop TERM)
 if has "$(cat "${WORK}/loop.log")" "*LOG: event=disabled reason=no_cgroup*" && [ "${out}" = "status 0" ]; then ok "no cgroup: exits 0 with reason=no_cgroup"; else bad "no cgroup: exits 0 with reason=no_cgroup"; fi
@@ -485,14 +485,14 @@ check "under pressure the guard checks every MEMORY_GUARD_FAST_INTERVAL ($(liste
 # 20. OOM targeting.
 mkdir -p "${WORK}/fakeproc/self"; echo 0 > "${WORK}/fakeproc/self/oom_score_adj"
 target() { # VAR=value...
-	env MEMORY_CGROUP_DIR="${WORK}/cg" MEMORY_PROC_DIR="${WORK}/fakeproc" "$@" sh -c \
+	env MEMORY_CGROUP_DIR="${WORK}/cg" MEMORY_PROC_DIR="${WORK}/fakeproc" MEMORY_OS_LIMITS= "$@" sh -c \
 		". '${SCRIPTS}/psql_memory.sh'; psql_oom_target; echo \"rc=\$? file=\${PG_OOM_ADJUST_FILE:-} value=\${PG_OOM_ADJUST_VALUE:-}\"" 2>&1 | tee -a "${WORK}/all.log"
 }
 cgroup 1000 500 0 0 1
 out=$(target)
 check "OOM targeting exports PG_OOM_ADJUST_FILE and PG_OOM_ADJUST_VALUE=100 by default" has "${out}" "*rc=0 file=/proc/self/oom_score_adj value=100"
 check "boot line with scores and the cgroup's limits" has "${out}" \
-	'*LOG: event=oom_target state=on postmaster_oom_score_adj=0 child_oom_score_adj=100 cgroup=v2 memory_max=1048576000 memory_high=max swap_max=0 oom_group=1 note="only makes the victim deterministic; any kill is crash recovery"*'
+	"*LOG: event=oom_target state=on postmaster_oom_score_adj=0 child_oom_score_adj=100 cgroup=v2 memory_max=1048576000 memory_high=max swap_max=0 oom_group=1 limit_source=cgroup cgroup_path=${WORK}/cg note=\"only makes the victim deterministic; any kill is crash recovery\"*"
 check "memory.oom.group=1 is warned about" has "${out}" "*WARN: event=oom_group oom_group=1*"
 cgroup 1000 500 0 0 0
 out=$(target)
@@ -511,7 +511,126 @@ out=$(env MEMORY_CGROUP_DIR="${WORK}/cg" MEMORY_PROC_DIR="${WORK}/none" OOM_CHIL
 	". '${SCRIPTS}/psql_memory.sh'; psql_oom_target; echo booted" 2>&1 | tee -a "${WORK}/all.log")
 check "under errexit, with no cgroup, no /proc and bad settings, the boot goes on" has "${out}" "*state=on postmaster_oom_score_adj=unknown child_oom_score_adj=100 cgroup=none memory_max=unknown*booted"
 
-# 21. Every line any test produced follows the format.
+# 21. Where the cgroup and the limit come from. Each case builds a fake mount (${WORK}/tree/cg) and
+# a fake /proc (${WORK}/tree/proc, with self/cgroup and meminfo), runs the guard for a second and
+# reads its start line.
+tree() { # /proc/self/cgroup lines...
+	rm -rf "${WORK}/tree"
+	mkdir -p "${WORK}/tree/cg" "${WORK}/tree/proc/self"
+	: > "${WORK}/tree/proc/self/cgroup"
+	for tree_line
+	do
+		printf '%s\n' "${tree_line}" >> "${WORK}/tree/proc/self/cgroup"
+	done
+	printf 'MemTotal:        8192000 kB\nMemFree:         1000 kB\n' > "${WORK}/tree/proc/meminfo"
+}
+fake_v2() { # folder memory.max (- for none) used-mb
+	mkdir -p "$1"
+	[ "$2" = - ] || echo "$2" > "$1/memory.max"
+	echo $(( ($3 + 100) * 1048576 )) > "$1/memory.current"
+	printf 'anon %d\nactive_file %d\ninactive_file %d\n' $(( $3 * 1048576 )) 52428800 52428800 > "$1/memory.stat"
+	printf 'oom 0\noom_kill 0\n' > "$1/memory.events"
+}
+fake_v1() { # folder memory.limit_in_bytes used-mb
+	mkdir -p "$1"
+	echo "$2" > "$1/memory.limit_in_bytes"
+	echo $(( ($3 + 100) * 1048576 )) > "$1/memory.usage_in_bytes"
+	printf 'total_active_file %d\ntotal_inactive_file %d\n' 52428800 52428800 > "$1/memory.stat"
+	printf 'oom_kill_disable 0\noom_kill 0\n' > "$1/memory.oom_control"
+}
+sources() { # VAR=value...: the guard's log over one second on the fake tree
+	# shellcheck disable=SC2086  # ENVS is a list of assignments
+	env ${ENVS} MEMORY_CGROUP_DIR="${WORK}/tree/cg" MEMORY_PROC_DIR="${WORK}/tree/proc" MEMORY_GUARD_CGROUP_RETRY=0 \
+		MEMORY_GUARD_INTERVAL=5 "$@" timeout -s TERM 1 sh "${SCRIPTS}/psql_memory_guard.sh" 2>&1 | tee -a "${WORK}/all.log"
+}
+starts() { # log pattern: the start line matches the shell pattern
+	has "$(printf '%s\n' "$1" | grep 'event=start ')" "$2"
+}
+warned() { # log: one WARN event=limit_fallback with the note
+	[ "$(count "$1" 'WARN: event=limit_fallback ')" = 1 ] \
+		&& has "$1" '*event=limit_fallback *note="the kernel does not enforce this limit; the guard keeps the server within the budget it was tuned for"*'
+}
+MB=1048576
+
+tree "0::/"
+fake_v2 "${WORK}/tree/cg" $(( 1000 * MB )) 500
+out=$(sources NOMAD_MEMORY_LIMIT=4096)
+check "v2, private namespace: the mount's own limit, NOMAD_MEMORY_LIMIT aside" \
+	starts "${out}" "*cgroup=v2 limit_mb=1000 used_pct=50 used_mb=500 * limit_source=cgroup cgroup_path=${WORK}/tree/cg"
+check "a cgroup limit logs no limit_fallback WARN" [ "$(count "${out}" event=limit_fallback)" = 0 ]
+
+tree "0::/system.slice/docker-abc.scope"
+printf 'anon 1\n' > "${WORK}/tree/cg/memory.stat"
+fake_v2 "${WORK}/tree/cg/system.slice/docker-abc.scope" $(( 800 * MB )) 400
+out=$(sources)
+check "v2, host namespace: the own cgroup through /proc/self/cgroup" \
+	starts "${out}" "*cgroup=v2 limit_mb=800 used_pct=50 used_mb=400 * limit_source=cgroup cgroup_path=${WORK}/tree/cg/system.slice/docker-abc.scope"
+
+tree "12:cpu,cpuacct:/docker/abc" "4:memory:/docker/abc" "1:name=systemd:/docker/abc" "0::/docker/abc"
+fake_v1 "${WORK}/tree/cg/memory" 9223372036854771712 6000
+fake_v1 "${WORK}/tree/cg/memory/docker/abc" $(( 600 * MB )) 300
+out=$(sources)
+check "v1, host namespace: the memory controller's line of /proc/self/cgroup, not the host's root" \
+	starts "${out}" "*cgroup=v1 limit_mb=600 used_pct=50 used_mb=300 * limit_source=cgroup cgroup_path=${WORK}/tree/cg/memory/docker/abc"
+
+tree "0::/"
+fake_v2 "${WORK}/tree/cg" max 512
+out=$(sources NOMAD_MEMORY_LIMIT=1024)
+check "v2 with max and NOMAD_MEMORY_LIMIT=1024: the variable's budget" \
+	starts "${out}" "*cgroup=v2 limit_mb=1024 used_pct=50 used_mb=512 * limit_source=nomad_var cgroup_path=${WORK}/tree/cg"
+check "a variable's budget logs the limit_fallback WARN once" warned "${out}"
+check "the WARN names the source and the limit" has "${out}" "*WARN: event=limit_fallback limit_source=nomad_var limit_mb=1024 limit_var=NOMAD_MEMORY_LIMIT *"
+out=$(sources MEMORY_LIMIT_VAR=JOB_MEMORY MEMORY_LIMIT_UNIT_PERC=200 JOB_MEMORY=2048 NOMAD_MEMORY_LIMIT=9999)
+check "MEMORY_LIMIT_VAR and MEMORY_LIMIT_UNIT_PERC are followed as os_limits does (2048 / 2)" \
+	starts "${out}" "*limit_mb=1024 used_pct=50 * limit_source=nomad_var *"
+
+out=$(sources)
+check "v2 with max and no variable: HOST_MEM_PERC (20) % of MemTotal, 1600 of 8000 MB" \
+	starts "${out}" "*cgroup=v2 limit_mb=1600 used_pct=32 used_mb=512 * limit_source=host_share cgroup_path=${WORK}/tree/cg"
+check "the host share logs the limit_fallback WARN once" warned "${out}"
+out=$(sources HOST_MEM_PERC=50)
+check "HOST_MEM_PERC=50: 4000 MB" starts "${out}" "*limit_mb=4000 used_pct=12 * limit_source=host_share *"
+
+tree "0::/"
+fake_v2 "${WORK}/tree/cg" - 512
+out=$(sources NOMAD_MEMORY_LIMIT=2048)
+check "v2 at the root of a private namespace, no memory.max: the budget applies" \
+	starts "${out}" "*cgroup=v2 limit_mb=2048 used_pct=25 used_mb=512 * limit_source=nomad_var cgroup_path=${WORK}/tree/cg"
+
+tree "0::/"
+fake_v2 "${WORK}/tree/cg" max 512
+printf '#!/bin/sh\nset -o errexit\ntrap - INT TERM\navailable_memory() { echo chatter; AVAILABLE_MEMORY=777; export AVAILABLE_MEMORY; }\n' > "${WORK}/os_limits"
+# shellcheck disable=SC2086  # ENVS is a list of assignments
+env ${ENVS} MEMORY_CGROUP_DIR="${WORK}/tree/cg" MEMORY_PROC_DIR="${WORK}/tree/proc" MEMORY_GUARD_CGROUP_RETRY=0 MEMORY_GUARD_INTERVAL=5 \
+	MEMORY_OS_LIMITS="${WORK}/os_limits" NOMAD_MEMORY_LIMIT=1024 timeout --preserve-status -s TERM 1 sh "${SCRIPTS}/psql_memory_guard.sh" > "${WORK}/os.log" 2>&1
+status=$?
+out=$(cat "${WORK}/os.log"); printf '%s\n' "${out}" >> "${WORK}/all.log"
+check "os_limits, when shipped, gives the budget (the tuner's own number)" \
+	starts "${out}" "*limit_mb=777 used_pct=65 * limit_source=nomad_var *"
+check "os_limits' output is dropped" [ "$(count "${out}" chatter)" = 0 ]
+check "sourcing os_limits (errexit, trap - TERM) leaves the guard's TERM trap: exits 0 (${status})" [ "${status}" = 0 ]
+printf 'available_memory() { AVAILABLE_MEMORY=8796093022208; }\n' > "${WORK}/os_limits"
+out=$(sources MEMORY_OS_LIMITS="${WORK}/os_limits" NOMAD_MEMORY_LIMIT=1024)
+check "an os_limits budget of v1's no-limit size is not taken: the chain's is" starts "${out}" "*limit_mb=1024 *limit_source=nomad_var *"
+
+tree "0::/system.slice/docker-abc.scope"
+fake_v2 "${WORK}/tree/cg" max 6000
+out=$(sources NOMAD_MEMORY_LIMIT=1024)
+check "own cgroup unreadable: the host root's use is never taken, disabled with reason=no_cgroup" \
+	has "${out}" "*LOG: event=disabled reason=no_cgroup*"
+check "and nothing starts" [ "$(count "${out}" 'event=start ')" = 0 ]
+tree
+out=$(sources NOMAD_MEMORY_LIMIT=1024)
+check "nothing readable: disabled with reason=no_cgroup, whatever the budget" has "${out}" "*LOG: event=disabled reason=no_cgroup*"
+
+tree "0::/"
+fake_v2 "${WORK}/tree/cg" max 512
+out=$(env MEMORY_CGROUP_DIR="${WORK}/tree/cg" MEMORY_PROC_DIR="${WORK}/tree/proc" MEMORY_OS_LIMITS= NOMAD_MEMORY_LIMIT=1024 sh -e -c \
+	". '${SCRIPTS}/psql_memory.sh'; psql_oom_target; echo booted" 2>&1 | tee -a "${WORK}/all.log")
+check "OOM targeting logs the same source and cgroup path" has "${out}" \
+	"*event=oom_target *cgroup=v2 memory_max=max *limit_source=nomad_var cgroup_path=${WORK}/tree/cg note=*booted"
+
+# 22. Every line any test produced follows the format.
 lines=$(grep -c 'MEMORY_GUARD:' "${WORK}/all.log")
 badlines=$(grep 'MEMORY_GUARD:' "${WORK}/all.log" | grep -v -E \
 	'^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [A-Za-z0-9+-]+ \[[0-9]+\] MEMORY_GUARD: (LOG|WARN|ERROR): event=[a-z_]+( [a-z_]+=("[^"]*"|[^ "]*))*$')

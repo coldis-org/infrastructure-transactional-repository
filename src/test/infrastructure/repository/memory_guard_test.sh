@@ -276,10 +276,10 @@ listing=$(grep 'LEFT JOIN pg_roles' "${WORK}/psql.log" | head -n 1)
 check "the listing: non-superuser client backends, parallel workers, not the guard's own, backend_start, query_id" \
 	has "${listing}" "*a.query_id*a.pid <> pg_backend_pid()*a.backend_type = 'client backend' AND r.rolsuper IS FALSE) OR a.backend_type = 'parallel worker'*"
 check "the listing carries backend_start in microseconds" has "${listing}" "*extract(epoch FROM a.backend_start) * 1000000)::bigint*"
-check "the query prefix is capped at MEMORY_GUARD_QUERY_CHARS (120)" has "${listing}" "*left(coalesce(a.query, ''), 120)*"
+check "the query prefix is capped at MEMORY_GUARD_QUERY_CHARS (120)" has "${listing}" "*'?', 'g'), 120)*"
 cgroup 1000 870 0 0; standard_sessions
 guard 1 MEMORY_GUARD_QUERY_CHARS=0 >/dev/null
-check "MEMORY_GUARD_QUERY_CHARS=0 asks for no query text" has "$(grep 'LEFT JOIN pg_roles' "${WORK}/psql.log")" "*left(coalesce(a.query, ''), 0)*"
+check "MEMORY_GUARD_QUERY_CHARS=0 asks for no query text" has "$(grep 'LEFT JOIN pg_roles' "${WORK}/psql.log")" "*'?', 'g'), 0)*"
 
 # 10. Nothing the guard may end: one WARN line, not one per pass.
 cgroup 1000 930 0 0
@@ -384,6 +384,15 @@ touch "${WORK}/psql.slow"
 guard 2 >/dev/null
 rm -f "${WORK}/between" "${WORK}/psql.slow"
 if [ "$(state mg_sleep_ms)" = 500 ] && [ "$(state mg_throttle_ms)" = 0 ] && [ "$(listed)" = 2 ]; then ok "a full pass back under the budget ends the throttling (500 ms, fresh listing)"; else bad "a full pass back under the budget ends the throttling (500 ms, fresh listing)"; fi
+
+# 17a. The query prefix carries no values: the listing masks string and numeric literals and dollar
+# quotes in SQL, and only then cuts the text to MEMORY_GUARD_QUERY_CHARS.
+cgroup 1000 870 0 0; standard_sessions
+guard 1 >/dev/null
+check "the listing masks literals before cutting the query prefix" \
+	grep -qF "regexp_replace(left(regexp_replace(regexp_replace(regexp_replace(coalesce(a.query, '')" "${WORK}/psql.log"
+check "string literals become ?" grep -qF "'''(''''|[^''])*(''|\$)', '?', 'g'" "${WORK}/psql.log"
+check "numeric literals become ?" grep -qF "'\m[0-9]+(\.[0-9]+)?\M', '?', 'g'" "${WORK}/psql.log"
 
 # 17b. A slow pass spaces the next one by at least its own length (capped at the max interval),
 # not only by twice the fast interval.

@@ -430,14 +430,20 @@ memory_guard_settings() {
 	# Client backends that are not superusers (WAL senders and background processes have other
 	# backend types), not excluded, not the guard's own session; plus parallel workers, only to
 	# add their memory to the session leading them. backend_start in microseconds identifies the
-	# session against pid reuse. Text is stripped of whitespace and control characters here.
+	# session against pid reuse. Text is stripped of whitespace and control characters here. The
+	# query prefix carries no values: string and numeric literals become ?, and anything from a
+	# dollar quote on becomes $?$, before it is cut to MEMORY_GUARD_QUERY_CHARS (query_id names the
+	# statement).
 	MEMORY_GUARD_LIST_SQL="SELECT a.pid, coalesce(a.leader_pid, a.pid), a.backend_type, coalesce(a.state, ''),
 		coalesce((extract(epoch FROM a.backend_start) * 1000000)::bigint, 0),
 		regexp_replace(coalesce(a.usename::text, ''), '[[:space:][:cntrl:]]+', ' ', 'g'),
 		regexp_replace(coalesce(a.datname::text, ''), '[[:space:][:cntrl:]]+', ' ', 'g'),
 		regexp_replace(coalesce(a.application_name, ''), '[[:space:][:cntrl:]]+', ' ', 'g'),
 		coalesce(a.query_id::text, ''),
-		regexp_replace(left(coalesce(a.query, ''), ${MEMORY_GUARD_QUERY_CHARS}), '[[:space:][:cntrl:]]+', ' ', 'g')
+		regexp_replace(left(regexp_replace(regexp_replace(regexp_replace(coalesce(a.query, ''),
+			'\\\$([A-Za-z_][A-Za-z0-9_]*)?\\\$.*', '\$?\$'),
+			'''(''''|[^''])*(''|\$)', '?', 'g'),
+			'\\m[0-9]+(\\.[0-9]+)?\\M', '?', 'g'), ${MEMORY_GUARD_QUERY_CHARS}), '[[:space:][:cntrl:]]+', ' ', 'g')
 		FROM pg_stat_activity a LEFT JOIN pg_roles r ON r.oid = a.usesysid
 		WHERE a.pid <> pg_backend_pid()
 			AND ((a.backend_type = 'client backend' AND r.rolsuper IS FALSE${memory_guard_exclude_sql}) OR a.backend_type = 'parallel worker')"

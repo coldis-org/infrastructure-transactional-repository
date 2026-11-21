@@ -143,7 +143,8 @@ refusing connections meanwhile; every client then reconnects at once. Ending one
   (up to `MEMORY_GUARD_MAX_INTERVAL`), acting from the last ranking in between. Every line starts with `MEMORY_GUARD:`
   (`grep MEMORY_GUARD:`), in English, as `event=<name> key=value`; action lines carry `usename`,
   `application_name`, `private_mb`, the `query_id` and a query prefix of `MEMORY_GUARD_QUERY_CHARS`
-  (120; 0 for none: literal values in a statement's first characters reach the container log). The tuner sets `compute_query_id=on`, so the id is always there; where
+  (120; 0 for none), with string and numeric literals and dollar-quoted text masked as `?` in SQL
+  before the cut, so no values reach the container log. The tuner sets `compute_query_id=on`, so the id is always there; where
   `pg_stat_statements` is preloaded, `SELECT query FROM pg_stat_statements WHERE queryid = <id>`
   gives the full normalised text.
   - **Ships in dry-run** (`MEMORY_GUARD_MODE=dry-run`): it logs every action with

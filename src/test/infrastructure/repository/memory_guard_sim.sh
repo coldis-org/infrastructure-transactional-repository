@@ -911,7 +911,9 @@ s7() {
 	conns=$(( S7_BACKENDS + 60 ))
 	local saved_cpus=${CPUS}
 	CPUS=${S7_CPUS}
-	db_run "${DB}" "${IMAGE}" "${S7_MEMORY}" MEMORY_GUARD_ENABLED=true MEMORY_GUARD_MODE=enforce MEMORY_GUARD_IDLE_PERC=1 \
+	# MIN_PRIVATE_MB above any backend: every pass lists and reads them all, and nothing is eligible,
+	# so the backend count stays put and no termination churns the connections being measured.
+	db_run "${DB}" "${IMAGE}" "${S7_MEMORY}" MEMORY_GUARD_ENABLED=true MEMORY_GUARD_MODE=enforce MEMORY_GUARD_IDLE_PERC=1 MEMORY_GUARD_MIN_PRIVATE_MB=1048576 \
 		"MAX_CONNECTIONS=${conns}" "MAX_CONNECTIONS_MIN=${conns}" CONNECTION_MEMORY=2048 || { CPUS=${saved_cpus}; record S7 FAIL "docker run failed"; return 0; }
 	CPUS=${saved_cpus}
 	client_run

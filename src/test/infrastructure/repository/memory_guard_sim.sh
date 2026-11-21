@@ -638,7 +638,7 @@ s1() {
 	db_log "${DB}" > "${SDIR}/db.log"
 	actions=$(guard_events "${SDIR}/db.log" action)
 	n=$(count_lines "${actions}")
-	bad=$(printf '%s\n' "${actions}" | grep -v '^$' | grep -cvE ' action=terminate( |$).* stage=idle( |$)| stage=idle( |$).* action=terminate( |$)')
+	bad=$(printf '%s\n' "${actions}" | grep -v '^$' | grep -cvE ' action=terminate (.* )?stage=idle( |$)| stage=idle (.* )?action=terminate( |$)')
 	peak=$(sampled_peak "${SDIR}/memory.tsv")
 	local fails=()
 	[ "${oom1}" = "${oom0}" ] || fails+=("oom_kill ${oom0}->${oom1}")

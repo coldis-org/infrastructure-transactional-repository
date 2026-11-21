@@ -37,6 +37,11 @@ WORKDIR /opt/psql-script
 RUN chown -R postgres:postgres /opt/psql-script && \
 	chmod -R +x /opt/psql-script
 	
+# The memory guard and OOM targeting (MEMORY_GUARD_ENABLED, OOM_TARGETING_ENABLED) are off on this
+# major: they are simulated and enabled on PostgreSQL 18 (Dockerfile7) only. They can be turned on
+# here, untested. The tuner settings below apply to every major, WORK_MEM_ACTIVE_PERC=65 included:
+# work_mem is sized for 65% of the connections at once, an over-commit that no guard covers here
+# (100 sizes it for all of them, as before 7.4.0).
 ENV POSTGRES_ADMIN_USER=postgres\
     POSTGRES_ADMIN_PASSWORD=postgres\
 	MAX_CONNECTIONS=300\
@@ -78,6 +83,30 @@ ENV POSTGRES_ADMIN_USER=postgres\
 	CONNECTION_SHARED_BUFFERS_MAPPED_PERC=35\
 	WORK_MEM_OPERATIONS=2\
 	HUGE_PAGES=try\
+	WORK_MEM_ACTIVE_PERC=65\
+	WORK_MEM_MAX=\
+	MAX_PARALLEL_WORKERS_PER_GATHER_MAX=2\
+	SERVER_PROCESSES_MEMORY_MAX_PERC=10\
+	IDLE_IN_TRANSACTION_SESSION_TIMEOUT=30min\
+	OOM_TARGETING_ENABLED=false\
+	OOM_CHILD_SCORE_ADJ=100\
+	MEMORY_GUARD_ENABLED=false\
+	MEMORY_GUARD_MODE=dry-run\
+	MEMORY_GUARD_INTERVAL=2\
+	MEMORY_GUARD_FAST_INTERVAL=0.5\
+	MEMORY_GUARD_MAX_INTERVAL=5\
+	MEMORY_GUARD_TICK_BUDGET_MS=200\
+	MEMORY_GUARD_IDLE_PERC=85\
+	MEMORY_GUARD_ACTIVE_PERC=92\
+	MEMORY_GUARD_CRITICAL_PERC=96\
+	MEMORY_GUARD_IDLE_BATCH=5\
+	MEMORY_GUARD_IDLE_MAX_PER_MIN=120\
+	MEMORY_GUARD_CRITICAL_BATCH=10\
+	MEMORY_GUARD_CANCEL_GRACE=1\
+	MEMORY_GUARD_EXCLUDE_USERS=\
+	MEMORY_GUARD_QUERY_CHARS=120\
+	MEMORY_GUARD_STATUS_INTERVAL=300\
+	MEMORY_GUARD_PAUSE_FILE=/tmp/memory_guard.pause\
 	OVERWRITE_TUNED_ARGS=true
 	
 # Command.

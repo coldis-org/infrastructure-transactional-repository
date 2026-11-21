@@ -39,7 +39,9 @@ RUN chown -R postgres:postgres /opt/psql-script && \
 	
 # The memory guard and OOM targeting (MEMORY_GUARD_ENABLED, OOM_TARGETING_ENABLED) are off on this
 # major: they are simulated and enabled on PostgreSQL 18 (Dockerfile7) only. They can be turned on
-# here, untested. The tuner settings below apply to every major.
+# here, untested. The tuner settings below apply to every major, WORK_MEM_ACTIVE_PERC=65 included:
+# work_mem is sized for 65% of the connections at once, an over-commit that no guard covers here
+# (100 sizes it for all of them, as before 7.4.0).
 ENV POSTGRES_ADMIN_USER=postgres\
     POSTGRES_ADMIN_PASSWORD=postgres\
 	MAX_CONNECTIONS=300\

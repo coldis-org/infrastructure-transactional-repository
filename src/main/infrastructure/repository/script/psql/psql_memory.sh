@@ -106,11 +106,16 @@ memory_setting_warn() { # name value used reason
 	memory_log WARN setting "name=$1" "value=$(memory_quote "$2")" "$(memory_field used "$3")" "reason=$(memory_quote "$4")"
 }
 
+# Settings come from the environment (the image's ENV block, or docker run -e): read by name with
+# printenv and written back with export, so no setting's value is ever evaluated as code.
+memory_env() { # variable
+	printenv "$1" 2>/dev/null || true
+}
+
 # Checks the integer setting named $1 in place: $2 when empty or not an integer, clamped to $3..$4.
 # Keeps every later arithmetic expansion valid whatever the environment holds.
 memory_setting() { # variable default min max
-	memory_setting_given=
-	eval "memory_setting_given=\${$1:-}"
+	memory_setting_given=$(memory_env "$1")
 	memory_setting_value=${memory_setting_given:-$2}
 	memory_setting_sign=
 	case "${memory_setting_value}" in -*) memory_setting_sign=- ;; esac
@@ -140,14 +145,13 @@ memory_setting() { # variable default min max
 			fi
 			;;
 	esac
-	eval "$1=\${memory_setting_value}"
+	export "$1=${memory_setting_value}"
 }
 
 # Checks the duration in seconds named $1 in place (a positive number with at most one decimal
 # point, $2 otherwise) and sets <name>_MS to it in milliseconds.
 memory_seconds() { # variable default
-	memory_seconds_given=
-	eval "memory_seconds_given=\${$1:-}"
+	memory_seconds_given=$(memory_env "$1")
 	memory_seconds_value=${memory_seconds_given:-$2}
 	case "${memory_seconds_value}" in
 		*[!0-9.]*|*.*.*|.|'')
@@ -170,24 +174,22 @@ memory_seconds() { # variable default
 	if [ "${memory_seconds_ms}" -le 0 ]
 	then
 		memory_setting_warn "$1" "${memory_seconds_given}" "$2" "not a positive number of seconds"
-		eval "$1=\$2"
+		export "$1=$2"
 		memory_seconds "$1" "$2"
 		return 0
 	fi
-	eval "$1=\${memory_seconds_value}"
-	eval "$1_MS=\${memory_seconds_ms}"
+	export "$1=${memory_seconds_value}" "$1_MS=${memory_seconds_ms}"
 }
 
 # Checks the boolean setting named $1 in place: true or false, $2 otherwise.
 memory_bool() { # variable default
-	memory_bool_given=
-	eval "memory_bool_given=\${$1:-}"
+	memory_bool_given=$(memory_env "$1")
 	case "${memory_bool_given}" in
 		true|false) ;;
-		'') eval "$1=\$2" ;;
+		'') export "$1=$2" ;;
 		*)
 			memory_setting_warn "$1" "${memory_bool_given}" "$2" "not true or false"
-			eval "$1=\$2"
+			export "$1=$2"
 			;;
 	esac
 }

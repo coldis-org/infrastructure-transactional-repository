@@ -1144,7 +1144,7 @@ do
 			if [ -n "${BUILD_PATH}" ]
 			then
 				# PostgreSQL 14 does not boot on master (a known bug candidate): build only.
-				if major_image 14; then record S8-pg14 PASS "build only"; else record S8-pg14 FAIL "build failed"; fi
+				if major_image 14; then record S8-pg14 SKIP "build only: does not boot, guard not exercised"; else record S8-pg14 FAIL "build failed"; fi
 			fi ;;
 		S9) record S9 SKIP "needs host root to write memory.high; run by hand (see the header)" ;;
 		S10) s10 ;;

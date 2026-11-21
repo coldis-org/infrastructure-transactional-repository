@@ -113,7 +113,9 @@ REPLICA_LOCKS=$(setting "$REPLICA" max_locks_per_transaction)
 REPLICA_SENDERS=$(setting "$REPLICA" max_wal_senders)
 if [ "$NEW_BASE" = true ]; then
 	if ! docker logs "$REPLICA" 2>&1 | grep -q "Raising max_worker_processes\|Raising max_wal_senders"; then ok "the tuner budgets the primary's workers and WAL senders itself (nothing raised after tuning)"; else bad "the tuner budgets the primary's workers and WAL senders itself (nothing raised after tuning)"; fi
-	if docker logs "$REPLICA" 2>&1 | grep -q "MEMORY_GUARD: LOG: event=start "; then ok "the memory guard starts on the replica"; else bad "the memory guard starts on the replica"; fi
+	# The replicas here have no container memory limit (MAX_MEMORY only), so the guard finds an
+	# unlimited cgroup and says so; either line shows it ran.
+	if docker logs "$REPLICA" 2>&1 | grep -qE "MEMORY_GUARD: LOG: event=(start |disabled reason=unlimited)"; then ok "the memory guard starts on the replica"; else bad "the memory guard starts on the replica"; fi
 else
 	if docker logs "$REPLICA" 2>&1 | grep -q "Reserving [0-9]* MB more for the lock rows"; then ok "the extra workers' lock rows are budgeted before tuning"; else bad "the extra workers' lock rows are budgeted before tuning"; fi
 	if ! docker logs "$REPLICA" 2>&1 | grep -q "MEMORY_GUARD:"; then ok "an older base starts without the memory guard"; else bad "an older base starts without the memory guard"; fi
@@ -174,20 +176,20 @@ if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" =
 CHECK=$(replica_check "$REPLICA")
 if [ "${CHECK%%|*}" = 0 ] && [[ $CHECK == *"not a standby"* ]]; then ok "check: a promoted replica passes"; else bad "check: a promoted replica passes (got $CHECK)"; fi
 
-# 7 and 8. A replica too small for the primary's lock table and other floors. Older bases stop and
-# say why. From 7.4.0 it starts as a standby with the primary's values, everything else at
-# Postgres' minimums, and a WARN that says the reserve is not kept (the memory guard is then the
-# remaining protection).
+# 7 and 8. Replicas too small for the primary's lock table and other floors on older bases, which
+# stop and say why. From 7.4.0 both start as standbys with the primary's values: at 512 MB the
+# tuner still keeps the reserve; at 256 MB it cannot, starts with everything else at Postgres'
+# minimums, and says so in a WARN (the memory guard is then the remaining protection).
 for case in "524288 replica_tight" "262144 replica_tiny"; do
 	set -- $case
 	start_replica "$IMAGE" "$1" "$2"
 	if [ "$NEW_BASE" = true ]; then
 		if wait_ready "$REPLICA" && [ "$(sql "$REPLICA" "SELECT pg_is_in_recovery()")" = t ] \
 			&& [ "$(setting "$REPLICA" max_locks_per_transaction)" -ge "$PRIMARY_LOCKS" ] && [ "$(setting "$REPLICA" max_connections)" -ge "$PRIMARY_CONNECTIONS" ] \
-			&& docker logs "$REPLICA" 2>&1 | grep -q "WARN: NOT ENOUGH MEMORY: starting without the reserve"; then
-			ok "a replica of $(( $1 / 1024 )) MB, too small for the primary's floors, starts as a standby with them and a WARN"
+			&& { [ "$1" -gt 262144 ] || docker logs "$REPLICA" 2>&1 | grep -q "WARN: NOT ENOUGH MEMORY: starting without the reserve"; }; then
+			ok "a replica of $(( $1 / 1024 )) MB starts as a standby with the primary's floors$([ "$1" -gt 262144 ] || echo ', and a WARN that the reserve is not kept')"
 		else
-			bad "a replica of $(( $1 / 1024 )) MB, too small for the primary's floors, starts as a standby with them and a WARN"; docker logs "$REPLICA" 2>&1 | grep -E "WARN|FATAL|Not enough" | tail -3 | sed 's/^/    log: /'
+			bad "a replica of $(( $1 / 1024 )) MB starts as a standby with the primary's floors"; docker logs "$REPLICA" 2>&1 | grep -E "WARN|FATAL|Not enough" | tail -3 | sed 's/^/    log: /'
 		fi
 	else
 		wait_stopped "$REPLICA"

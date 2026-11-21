@@ -326,8 +326,22 @@ touch "${WORK}/pause"
 log=$(guard 1)
 rm -f "${WORK}/pause"
 if [ "$(statements)" = 0 ] && [ "$(count "${log}" 'result=paused')" = 5 ]; then ok "pause file: nothing sent even in enforce, lines say result=paused"; else bad "pause file: nothing sent even in enforce, lines say result=paused"; fi
+# A pause file of another account (/tmp is writable by anyone) is ignored; stat is stubbed to say so.
+cat > "${WORK}/bin/stat" <<'EOS'
+#!/bin/sh
+echo 4242
+EOS
+chmod +x "${WORK}/bin/stat"
+touch "${WORK}/pause"
+log=$(guard 1)
+rm -f "${WORK}/pause" "${WORK}/bin/stat"
+if [ "$(statements)" = 1 ] && [ "$(count "${log}" 'result=paused')" = 0 ]; then ok "a pause file owned by another account is ignored"; else bad "a pause file owned by another account is ignored"; fi
 
 # 15. Settings.
+# Backslashes in a logged value reach the log unchanged (dash's echo would read \c as "stop here").
+log=$(guard 1 'MEMORY_GUARD_IDLE_BATCH=a\cb\n')
+check "a backslash in a logged value is written as is" has "${log}" '*event=setting name=MEMORY_GUARD_IDLE_BATCH value="a\\cb\\n" used=5 reason="not an integer"*'
+
 cgroup 1000 870 0 0; standard_sessions
 log=$(guard 1 MEMORY_GUARD_EXCLUDE_USERS="backup,bad name,etl.job")
 check "MEMORY_GUARD_EXCLUDE_USERS goes into the listing" has "$(grep 'LEFT JOIN pg_roles' "${WORK}/psql.log")" "*AND a.usename::text NOT IN ('backup', 'etl.job')*"

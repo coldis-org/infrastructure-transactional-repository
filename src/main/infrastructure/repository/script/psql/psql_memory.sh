@@ -61,7 +61,8 @@
 #   MEMORY_GUARD_EXCLUDE_USERS    (empty)       comma list of roles never ended.
 #   MEMORY_GUARD_QUERY_CHARS      120           query prefix in action lines; 0 logs none.
 #   MEMORY_GUARD_STATUS_INTERVAL  300           seconds between status lines; 0 is off.
-#   MEMORY_GUARD_PAUSE_FILE       /tmp/memory_guard.pause  while it exists nothing is signalled.
+#   MEMORY_GUARD_PAUSE_FILE       /tmp/memory_guard.pause  while it exists (owned by postgres or
+#                                               root) nothing is signalled.
 # OOM targeting: OOM_TARGETING_ENABLED (true), OOM_CHILD_SCORE_ADJ (100, -1000 to 1000).
 # The guard connects as POSTGRES_ADMIN_USER over the local socket (MEMORY_GUARD_SOCKET_DIR,
 # /var/run/postgresql), with PGPASSWORD only when POSTGRES_ADMIN_PASSWORD is set, never prompting.
@@ -77,9 +78,9 @@ memory_log() { # level event fields
 	shift 2
 	if [ $# -gt 0 ]
 	then
-		echo "$(memory_log_prefix) ${memory_log_level}: event=${memory_log_event} $*" >&2
+		printf '%s\n' "$(memory_log_prefix) ${memory_log_level}: event=${memory_log_event} $*" >&2
 	else
-		echo "$(memory_log_prefix) ${memory_log_level}: event=${memory_log_event}" >&2
+		printf '%s\n' "$(memory_log_prefix) ${memory_log_level}: event=${memory_log_event}" >&2
 	fi
 }
 
@@ -96,8 +97,8 @@ memory_quote() { # value
 # Prints key=value, quoting the value unless it is a plain token.
 memory_field() { # key value
 	case "$2" in
-		''|*[!A-Za-z0-9_.:/+-]*) echo "$1=$(memory_quote "$2")" ;;
-		*) echo "$1=$2" ;;
+		''|*[!A-Za-z0-9_.:/+-]*) printf '%s\n' "$1=$(memory_quote "$2")" ;;
+		*) printf '%s\n' "$1=$2" ;;
 	esac
 }
 
@@ -192,6 +193,14 @@ memory_bool() { # variable default
 			export "$1=$2"
 			;;
 	esac
+}
+
+# Tells whether the pause file is there and owned by the guard's own user or by root: /tmp is
+# writable by anyone, and another account's file must not stop the guard.
+memory_guard_paused() {
+	[ -e "${MEMORY_GUARD_PAUSE_FILE}" ] || return 1
+	memory_guard_pause_owner=$(stat -c %u "${MEMORY_GUARD_PAUSE_FILE}" 2>/dev/null) || return 1
+	[ "${memory_guard_pause_owner}" = 0 ] || [ "${memory_guard_pause_owner}" = "$(id -u)" ]
 }
 
 # Milliseconds since boot, in memory_now_ms, from /proc/uptime with no process started.
@@ -859,7 +868,7 @@ memory_guard_pass() {
 		return 0
 	fi
 	mg_no_candidate=
-	if [ -e "${MEMORY_GUARD_PAUSE_FILE}" ]
+	if memory_guard_paused
 	then
 		memory_guard_forced=paused
 	elif [ "${MEMORY_GUARD_MODE}" = dry-run ]

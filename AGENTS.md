@@ -46,7 +46,7 @@ Docker tests (manual; they create and remove their own containers):
 
 ```bash
 bash src/test/infrastructure/repository-replica/replica_test.sh <replica-image> [replica-image-before]
-# Memory guard simulation, scenarios S0 to S10 (see the script header); --build builds Dockerfile7
+# Memory guard simulation, scenarios S0 to S10 and S1U (see the script header); --build builds Dockerfile7
 # (and Dockerfile4..6 for S8, the replica for S6) from a worktree, --image takes a built one:
 bash src/test/infrastructure/repository/memory_guard_sim.sh --build . --scenarios S0,S1,S2 --out <dir>
 ```
@@ -126,8 +126,8 @@ refusing connections meanwhile; every client then reconnects at once. Ending one
   `OOM_TARGETING_ENABLED=false`; they can be turned on there, untested. The tuner changes apply to
   all five.
 - **Memory guard** (`psql_memory_guard.sh`, started in the background by both init scripts just
-  before the `exec`, as `postgres`, a child of the postmaster). It reads the cgroup (v2, or v1)
-  every `MEMORY_GUARD_INTERVAL` (2 s; `FAST_INTERVAL` 0.5 s under pressure), counting use without
+  before the `exec`, as `postgres`, a child of the postmaster). It reads the cgroup (v2, or v1;
+  which one and which limit below) every `MEMORY_GUARD_INTERVAL` (2 s; `FAST_INTERVAL` 0.5 s under pressure), counting use without
   the file page cache. Stages, by share of the limit: **idle** (`MEMORY_GUARD_IDLE_PERC`, 85)
   terminates idle sessions holding the most private memory (`RssAnon` + `VmPTE`), up to
   `IDLE_BATCH` a pass and `IDLE_MAX_PER_MIN`; **active** (92) also cancels the largest busy query,
@@ -162,6 +162,21 @@ refusing connections meanwhile; every client then reconnects at once. Ending one
     wrong: raise the threshold or lower connections, do not live with it.
   - With `HUGE_PAGES=on`, shared buffers are normally not charged to the memory cgroup, so use
     reads lower against the same limit.
+  - **Which cgroup, which limit.** The cgroup is the mount's own (`/sys/fs/cgroup`, a private
+    cgroup namespace) when it has a limit, else the process's own one from `/proc/self/cgroup`
+    (`0::<path>` on v2, the line listing `memory` on v1, under the mount: a container that sees
+    the host's tree). With no limit anywhere (`docker run` without `-m`, `memory.max=max`, or no
+    `memory.max` at the root of a namespace) the limit is the budget the tuner sized the server
+    for, from the same chain as `os_limits` `available_memory` (the guard runs that script, as
+    `psql_tune_cmd.sh` does, when the image ships it): `NOMAD_MEMORY_LIMIT` (`MEMORY_LIMIT_VAR`,
+    scaled by `MEMORY_LIMIT_UNIT_PERC`), else `HOST_MEM_PERC` (20) % of `MemTotal`. **That
+    budget is guard-only: the kernel does not enforce it**; the guard keeps the server within it,
+    and there is no kernel kill behind it. Use is always the cgroup's (`memory.current` or
+    `usage_in_bytes` less page cache); with no cgroup use readable the guard stays off
+    (`reason=no_cgroup`) rather than read the host's, which is every tenant's. `event=start`
+    and `event=oom_target` carry `limit_source=cgroup|nomad_var|host_share` and
+    `cgroup_path=<folder>`; a fallback budget adds one `WARN: event=limit_fallback`. Simulation
+    S1U runs S1 with no `-m` and `NOMAD_MEMORY_LIMIT=1024`.
   - Superuser sessions are never ended; a database whose heavy sessions are superusers gets
     `event=no_candidate` only.
   - It is a polling loop: in simulation S3 (1 GB, 2 CPUs, three sessions growing at once) it held

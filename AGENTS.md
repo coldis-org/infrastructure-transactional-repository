@@ -104,9 +104,32 @@ refusing connections meanwhile; every client then reconnects at once. Ending one
   over-commit, stated at boot in a WARN with the worst case (`WORK_MEM_MAX` caps it;
   `ALTER ROLE ... SET work_mem` is the safer way to give one role more). No guard covers it by
   default (off below 18, dry-run on 18): a deployment close to its limit pins 100.
-  `MAX_PARALLEL_WORKERS_PER_GATHER_MAX` (2) caps workers per query, since each takes its own
-  `work_mem` per node. `IDLE_IN_TRANSACTION_SESSION_TIMEOUT` (30min) ends sessions left idle in a
-  transaction. `superuser_reserved_connections` is 5, so administration and the guard get in when
+  `MAX_PARALLEL_WORKERS_PER_GATHER_MAX` caps workers per query, since each takes its own
+  `work_mem` per node: unset (the default), 2 below 64 GiB of limit, 4 below 256 GiB, 8 from
+  there; a value given is used as is (0 turns parallel query off). The `work_mem` divisor already
+  counts every parallel worker that can run (`max_parallel_workers`), so the tier does not change
+  the budget. `IDLE_IN_TRANSACTION_SESSION_TIMEOUT` (30min) ends sessions left idle in a
+  transaction.
+- **Not everything comes from the shrunk budget.** On a large container with many connections the
+  budget loop leaves the settings a fraction of the limit (connections' memory and their page
+  tables take most of it), so what does not allocate, or is over-divided, is sized apart (7.4.1):
+  - `effective_cache_size` is a planner hint, not an allocation: `MAX_MEMORY` ×
+    `EFFECTIVE_CACHE_SIZE_PERC` (60) / 100, never below `shared_buffers` (the limit less the
+    15% reserve and what the connections' own memory takes in the normal case is roughly what
+    shared buffers and the page cache hold). It is outside the budget and moves no other setting.
+    `-c effective_cache_size=...` in the command still overrides it (`OVERWRITE_TUNED_ARGS`).
+  - `maintenance_work_mem` is `TOTAL_MAINTENANCE_WORK_MEM_PERC` (20) of the budget split over the
+    processes that can hold it at once: `autovacuum_max_workers` plus
+    `MAINTENANCE_WORK_MEM_SESSIONS` (2, manual `VACUUM`, `CREATE INDEX`, a migration), capped at
+    `MAINTENANCE_WORK_MEM_MAX` (2 GB), at least 1 MB. Parallel maintenance workers share their
+    leader's and are not counted (7.4.0 divided by them too).
+    `autovacuum_work_mem` stays -1, so autovacuum takes the same. It stays inside the budget,
+    since autovacuum runs at any time, deploy storms included, but only what those processes can
+    take (share × processes) is budgeted, so a cap reached gives memory back to the rest.
+  - `autovacuum_max_workers` (20% of `MAX_CPU` × `CPU_WORK_PERC`) is capped on PostgreSQL 18 at
+    `autovacuum_worker_slots`, left at its 16: above it PostgreSQL starts 16 anyway and warns, and
+    more workers would only split the same `autovacuum_vacuum_cost_limit`. The lock slots and the
+    server-process term count those 16. The major comes from the image's `PG_MAJOR`. `superuser_reserved_connections` is 5, so administration and the guard get in when
   `max_connections` is exhausted.
 - **Too little memory starts anyway** (7.3.0 refused to start). The settings shrink until the
   reserve (`MIN_RESERVED_MEMORY_PERC`, `MIN_RESERVED_MEMORY`) is kept; when that would leave them

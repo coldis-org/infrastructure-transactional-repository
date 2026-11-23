@@ -104,11 +104,13 @@ refusing connections meanwhile; every client then reconnects at once. Ending one
   over-commit, stated at boot in a WARN with the worst case (`WORK_MEM_MAX` caps it;
   `ALTER ROLE ... SET work_mem` is the safer way to give one role more). No guard covers it by
   default (off below 18, dry-run on 18): a deployment close to its limit pins 100.
-  `MAX_PARALLEL_WORKERS_PER_GATHER_MAX` caps workers per query, since each takes its own
-  `work_mem` per node: unset (the default), 2 below 64 GiB of limit, 4 below 256 GiB, 8 from
-  there; a value given is used as is (0 turns parallel query off). The `work_mem` divisor already
-  counts every parallel worker that can run (`max_parallel_workers`), so the tier does not change
-  the budget. `IDLE_IN_TRANSACTION_SESSION_TIMEOUT` (30min) ends sessions left idle in a
+  `MAX_PARALLEL_WORKERS_PER_GATHER_MAX` (2, whatever the memory) caps workers per query, since
+  each takes its own `work_mem` per node; a value given is used as is (0 turns parallel query
+  off). More per query trades CPU for one query's latency, which a busy transactional database
+  with many connections cannot spare: the driver is CPUs per concurrent heavy query, not memory.
+  A heavy query gets more in its own session (`SET max_parallel_workers_per_gather`, for instance
+  through the persistence library's `@QuerySettings`), not database-wide. The `work_mem` divisor
+  counts every parallel worker that can run (`max_parallel_workers`), whatever the cap. `IDLE_IN_TRANSACTION_SESSION_TIMEOUT` (30min) ends sessions left idle in a
   transaction.
 - **Not everything comes from the shrunk budget.** On a large container with many connections the
   budget loop leaves the settings a fraction of the limit (connections' memory and their page
@@ -240,19 +242,19 @@ Infra notes, outside the image:
 
 ## Workspace
 
-This repository expects `supersim-infrastructure-code-reviewer` checked out next to it
-(`../supersim-infrastructure-code-reviewer`; clone it there from the internal Git host if it's
-missing). The review-gate summary and the local review both live in it.
+This repository expects the internal code-reviewer repository checked out next to it (called
+`<code-reviewer>` below; clone it there from the internal Git host if it's missing). The
+review-gate summary and the local review both live in it.
 
 ## Review
 
 The gates are those of `src/agents/review/review.toml`, read from master, so a branch can't weaken
 its own review: `security`, `platform-image`, `platform-runtime`, `platform-config` and the
 `shellcheck` rule (severity `warning`, HIGH on failure). What each gate stops:
-`../supersim-infrastructure-code-reviewer/local-review/GATES.md`. The PR description must name
+`<code-reviewer>/local-review/GATES.md`. The PR description must name
 every base image or tag, PostgreSQL version, default, port, cron schedule, mount and data path
 changed, and whether a deployment needs a migration window.
 
 Before pushing, run the local review: follow
-`../supersim-infrastructure-code-reviewer/local-review/REVIEW.md`. It ends with
+`<code-reviewer>/local-review/REVIEW.md`. It ends with
 `local-check attest`. Push only when the developer asks.

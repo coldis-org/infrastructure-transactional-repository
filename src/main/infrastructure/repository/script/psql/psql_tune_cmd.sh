@@ -239,20 +239,13 @@ psql_tune_cmd() {
 		# with its own work_mem for every sort or hash it runs, so a query with N workers can take
 		# N+1 times the memory of a serial one: a percentage of the CPUs alone gives a large host
 		# tens of workers per query, which suits a warehouse and not a transactional database.
-		# Unset, the cap follows the memory: 2 below 64 GiB, 4 below 256 GiB, 8 from there. The
-		# work_mem budget does not move with it: every parallel worker running is counted already,
-		# up to max_parallel_workers, whatever the number per gather. A value given is used as is;
+		# More per query trades CPU for one query's latency, which a busy transactional database with
+		# many connections cannot spare, so the cap does not grow with the host: the driver is CPUs
+		# per concurrent heavy query, not memory, and a query that needs more asks for it in its own
+		# session (SET max_parallel_workers_per_gather). The work_mem budget counts every parallel
+		# worker that can run (max_parallel_workers), whatever the number per gather.
 		# 0 turns parallel query off.
-		if [ ${MAX_MEMORY} -ge 268435456 ]
-		then
-			PARALLEL_WORKERS_PER_GATHER_TIER=8
-		elif [ ${MAX_MEMORY} -ge 67108864 ]
-		then
-			PARALLEL_WORKERS_PER_GATHER_TIER=4
-		else
-			PARALLEL_WORKERS_PER_GATHER_TIER=2
-		fi
-		MAX_PARALLEL_WORKERS_PER_GATHER_MAX=$(psql_tune_integer MAX_PARALLEL_WORKERS_PER_GATHER_MAX "${MAX_PARALLEL_WORKERS_PER_GATHER_MAX:-${PARALLEL_WORKERS_PER_GATHER_TIER}}" "${PARALLEL_WORKERS_PER_GATHER_TIER}")
+		MAX_PARALLEL_WORKERS_PER_GATHER_MAX=$(psql_tune_integer MAX_PARALLEL_WORKERS_PER_GATHER_MAX "${MAX_PARALLEL_WORKERS_PER_GATHER_MAX:-2}" 2)
 		# Planner's estimate of the cache a query can count on, shared buffers plus the kernel's page
 		# cache, as a share of the limit (default 60: the limit less the reserve and what the
 		# connections' own memory takes in the normal case). It allocates nothing, so it is not

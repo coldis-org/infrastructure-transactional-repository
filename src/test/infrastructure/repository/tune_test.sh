@@ -248,33 +248,28 @@ wm_many=$(tunevars 262144 2500 WORK_MEM MAX_PARALLEL_WORKERS_PERC=100 MAX_WORKER
 [ "${wm_many:-0}" -lt "${wm_few:-0}" ] && ok "parallel workers take work_mem of their own (${wm_few} -> ${wm_many} kB)" \
 	|| bad "parallel workers did not lower work_mem (${wm_few} -> ${wm_many} kB)"
 
-# 10. Parallel workers per query are capped (MAX_PARALLEL_WORKERS_PER_GATHER_MAX; unset, 2 below
-# 64 GiB, 4 below 256 GiB, 8 from there): a percentage of 64 CPUs alone gives 38. A value given wins
-# over the tiers, in both directions.
+# 10. Parallel workers per query are capped (MAX_PARALLEL_WORKERS_PER_GATHER_MAX, 2 by default,
+# whatever the memory): a percentage of 64 CPUs alone gives 38. A value given wins, above 2 too.
 gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=4)
 [ "${gather}" = 4 ] && ok "64 CPUs get 4 parallel workers per gather with a cap of 4" || bad "64 CPUs get ${gather} parallel workers per gather with a cap of 4"
-for case in "65535 2" "65536 4" "262143 4" "262144 8" "360448 8"; do
-	# shellcheck disable=SC2086
-	set -- ${case}
-	gather=$(tunevars "$1" 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=)
-	[ "${gather}" = "$2" ] && ok "unset MAX_PARALLEL_WORKERS_PER_GATHER_MAX gives $1 MB with 64 CPUs $2 per gather" \
-		|| bad "unset MAX_PARALLEL_WORKERS_PER_GATHER_MAX gives $1 MB ${gather} per gather (expected $2)"
+for memory in 4096 65536 262144 360448; do
+	gather=$(tunevars "${memory}" 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=)
+	[ "${gather}" = 2 ] && ok "unset MAX_PARALLEL_WORKERS_PER_GATHER_MAX gives ${memory} MB with 64 CPUs 2 per gather" \
+		|| bad "unset MAX_PARALLEL_WORKERS_PER_GATHER_MAX gives ${memory} MB ${gather} per gather (expected 2)"
 done
-gather=$(tunevars 360448 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=2)
-[ "${gather}" = 2 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=2 wins over the 352 GiB tier" || bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=2 at 352 GiB gave ${gather}"
-gather=$(tunevars 4096 300 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=6)
-[ "${gather}" = 6 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=6 wins over the 4 GB tier" || bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=6 at 4 GB gave ${gather}"
+gather=$(tunevars 360448 5500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=62 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=8)
+[ "${gather}" = 8 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=8 is honoured at 352 GiB / 62 CPUs" || bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=8 at 352 GiB gave ${gather}"
 gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0)
 [ "${gather}" = 0 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0 turns parallel query off" || bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0 gave ${gather}"
 gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x)
-[ "${gather}" = 8 ] && warned MAX_PARALLEL_WORKERS_PER_GATHER_MAX && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x falls back to the tier (8 at 256 GiB) with a warning" \
+[ "${gather}" = 2 ] && warned MAX_PARALLEL_WORKERS_PER_GATHER_MAX && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x falls back to 2 with a warning" \
 	|| bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x gave ${gather}"
 # The work_mem budget counts every parallel worker that can run (max_parallel_workers) whatever the
-# number per gather, so raising the cap leaves work_mem as it was.
+# number per gather, so a higher cap leaves work_mem as it was.
 wm_cap2=$(tunevars 360448 5500 WORK_MEM TEST_CPUS=62 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=2)
-wm_tier=$(tunevars 360448 5500 WORK_MEM TEST_CPUS=62 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=)
-is_number "${wm_tier}" && [ "${wm_tier}" = "${wm_cap2}" ] && ok "the parallel tier leaves the work_mem budget as it was (${wm_tier} kB)" \
-	|| bad "the parallel tier moved work_mem (${wm_cap2} -> ${wm_tier} kB)"
+wm_cap8=$(tunevars 360448 5500 WORK_MEM TEST_CPUS=62 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=8)
+is_number "${wm_cap8}" && [ "${wm_cap8}" = "${wm_cap2}" ] && ok "the per-gather cap leaves the work_mem budget as it was (${wm_cap8} kB)" \
+	|| bad "the per-gather cap moved work_mem (${wm_cap2} -> ${wm_cap8} kB)"
 gather=$(tunevars 1024 300 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=2)
 [ "${gather}" = 1 ] && ok "2 CPUs keep 1 parallel worker per gather" || bad "2 CPUs get ${gather} parallel workers per gather"
 
@@ -381,13 +376,13 @@ esac
 # a share of the whole limit (EFFECTIVE_CACHE_SIZE_PERC), between shared buffers and the limit;
 # maintenance_work_mem is split over the autovacuum workers and MAINTENANCE_WORK_MEM_SESSIONS only,
 # within [1 MB, MAINTENANCE_WORK_MEM_MAX], and budgeted for what they can take; autovacuum_max_workers
-# stays within the 16 autovacuum_worker_slots; the parallel cap follows the memory tiers; the
-# reserve is kept. The last column is 7.4.0's maintenance_work_mem (kB) at the same size, measured
+# stays within the 16 autovacuum_worker_slots; parallel workers per gather stay at the fixed cap of
+# 2; the reserve is kept. The last column is 7.4.0's maintenance_work_mem (kB) at the same size, measured
 # with this harness on its script ("-" where it is not compared).
-for case in "1024 2 300 2 -" "4096 4 300 2 -" "16384 8 300 2 -" "65536 16 2500 4 191739" \
-	"262144 32 2500 8 433264" "360448 62 5500 8 186211" "360448 62 8000 8 146309"; do
+for case in "1024 2 300 2 -" "4096 4 300 2 -" "16384 8 300 2 -" "65536 16 2500 2 191739" \
+	"262144 32 2500 2 433264" "360448 62 5500 2 186211" "360448 62 8000 2 146309"; do
 	# shellcheck disable=SC2086
-	set -- ${case}; memory=$1; cpus=$2; connections=$3; tier=$4; before=$5
+	set -- ${case}; memory=$1; cpus=$2; connections=$3; cap=$4; before=$5
 	# shellcheck disable=SC2046
 	set -- $(tunevars "${memory}" "${connections}" "MAX_MEMORY SHARED_BUFFERS EFFECTIVE_CACHE_SIZE MAINTENANCE_WORK_MEM MAINTENANCE_WORK_MEM_MAX AUTOVACUUM_MAX_WORKERS MAX_PARALLEL_WORKERS_PER_GATHER_MAX MAX_PARALLEL_WORKERS_PER_GATHER ACTUAL_RESERVED_MEMORY_PERC TOTAL_MAINTENANCE_WORK_MEM MAINTENANCE_PROCESSES" \
 		TEST_CPUS="${cpus}" PG_MAJOR=18)
@@ -406,8 +401,8 @@ for case in "1024 2 300 2 -" "4096 4 300 2 -" "16384 8 300 2 -" "65536 16 2500 4
 	fi
 	is_number "$6" && [ "$6" -le 16 ] && ok "${label}: autovacuum_max_workers $6 within the 16 slots" \
 		|| bad "${label}: autovacuum_max_workers '$6' above the 16 slots"
-	[ "$7" = "${tier}" ] && is_number "$8" && [ "$8" -le "${tier}" ] && ok "${label}: parallel cap ${tier}, $8 per gather" \
-		|| bad "${label}: parallel cap '$7' (expected ${tier}), '$8' per gather"
+	[ "$7" = "${cap}" ] && is_number "$8" && [ "$8" -le "${cap}" ] && ok "${label}: parallel cap ${cap}, $8 per gather" \
+		|| bad "${label}: parallel cap '$7' (expected ${cap}), '$8' per gather"
 	is_number "$9" && [ "$9" -ge 15 ] && ok "${label}: the reserve is kept ($9%)" || bad "${label}: reserve '$9'% below 15%"
 	if [ "${memory}" = 360448 ]
 	then

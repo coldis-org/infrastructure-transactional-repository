@@ -15,7 +15,7 @@ Follow-ups from the review of the LDAP permissions reconcile (2026-11-04), accep
 - `reconcile_permissions.sql` is installed with `CREATE OR REPLACE`; a future change to its parameter names or `RETURNS TABLE` will fail the install (and every scheduled repair) until the old function is dropped. Install in one transaction with `DROP FUNCTION IF EXISTS` first.
 - The 90% statement-timeout ceiling leaves one `lock_timeout` (30s) of headroom and is not checked inside a single drop or the database/schema grants.
 - The boot install in `psql_configure.sh` runs outside the reconcile flock and can race a cron repair install during boot.
-- The on-demand "update database users" pipeline (supersim-infrastructure-continuous-integration) calls `psql_users_add.sh`, which now exits 3 on ERROR/DEFERRED and 75 on a lock-wait timeout; check how the pipeline treats those.
+- The on-demand "update database users" pipeline (in the internal CI repository) calls `psql_users_add.sh`, which now exits 3 on ERROR/DEFERRED and 75 on a lock-wait timeout; check how the pipeline treats those.
 - LDAP binds over plaintext `ldap://` when `LDAP_HOST` has no scheme (as the old scripts did); no `-ZZ`.
 - The reconcile and install scripts fall back to the admin password `postgres` when `POSTGRES_ADMIN_PASSWORD` is unset.
 - Write access grants `TRIGGER` (and `MAINTAIN` on 17+) with schema `CREATE`: a writer can run code as whoever modifies an application table (as the old `GRANT ALL` did).
@@ -31,6 +31,3 @@ Follow-ups from the review of the replica health check (2026-11-18), accepted:
 Found while building and simulating the memory guard of 7.4.0 (2026-11-20):
 - On first boot `pg_hba.conf` from `conf/` is not installed: the server keeps the one `initdb` wrote, which has no `host replication` rule for other hosts, so a replica's base backup over the network is refused until the primary restarts (`replica_test.sh` and the simulation add the rule by hand).
 - The images have no `kill`, `ps`, `pgrep` or `pkill` binaries (procps is not installed); operators must use the shell's built-in `kill` and walk `/proc` to find a pid.
-- On PostgreSQL 18, `autovacuum_max_workers` above `autovacuum_worker_slots` (16 by default) only starts 16 workers, with a startup WARNING ("should be less than or equal to"). The tuner gives 20% of `MAX_CPU * CPU_WORK_PERC`, which passes 16 from 29 CPUs (38 at 64); it should cap there or pass `autovacuum_worker_slots` too (verified on the 7.4.0 Dockerfile7 build).
-- `repository-replica/Dockerfile7` builds `FROM ...:7.2.0`, so released replicas run the 7.2 tuner and none of 7.3.0 or 7.4.0; raising it to 7.4.0 is the follow-up of this release.
-- The 7.3.0 tuner gives a 300 MB container with 16 CPUs `maintenance_work_mem=175kB`, below PostgreSQL's 1024 kB minimum, so it would not start (fixed in 7.4.0, which keeps every sized setting at or above its minimum).

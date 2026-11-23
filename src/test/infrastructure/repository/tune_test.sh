@@ -248,17 +248,28 @@ wm_many=$(tunevars 262144 2500 WORK_MEM MAX_PARALLEL_WORKERS_PERC=100 MAX_WORKER
 [ "${wm_many:-0}" -lt "${wm_few:-0}" ] && ok "parallel workers take work_mem of their own (${wm_few} -> ${wm_many} kB)" \
 	|| bad "parallel workers did not lower work_mem (${wm_few} -> ${wm_many} kB)"
 
-# 10. Parallel workers per query are capped (MAX_PARALLEL_WORKERS_PER_GATHER_MAX, 2 by default):
-# a percentage of 64 CPUs alone gives 38.
+# 10. Parallel workers per query are capped (MAX_PARALLEL_WORKERS_PER_GATHER_MAX, 2 by default,
+# whatever the memory): a percentage of 64 CPUs alone gives 38. A value given wins, above 2 too.
 gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=4)
 [ "${gather}" = 4 ] && ok "64 CPUs get 4 parallel workers per gather with a cap of 4" || bad "64 CPUs get ${gather} parallel workers per gather with a cap of 4"
-gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=)
-[ "${gather}" = 2 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX is 2 when unset" || bad "unset MAX_PARALLEL_WORKERS_PER_GATHER_MAX gave ${gather}"
+for memory in 4096 65536 262144 360448; do
+	gather=$(tunevars "${memory}" 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=)
+	[ "${gather}" = 2 ] && ok "unset MAX_PARALLEL_WORKERS_PER_GATHER_MAX gives ${memory} MB with 64 CPUs 2 per gather" \
+		|| bad "unset MAX_PARALLEL_WORKERS_PER_GATHER_MAX gives ${memory} MB ${gather} per gather (expected 2)"
+done
+gather=$(tunevars 360448 5500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=62 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=8)
+[ "${gather}" = 8 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=8 is honoured at 352 GiB / 62 CPUs" || bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=8 at 352 GiB gave ${gather}"
 gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0)
 [ "${gather}" = 0 ] && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0 turns parallel query off" || bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=0 gave ${gather}"
 gather=$(tunevars 262144 2500 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=64 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x)
 [ "${gather}" = 2 ] && warned MAX_PARALLEL_WORKERS_PER_GATHER_MAX && ok "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x falls back to 2 with a warning" \
 	|| bad "MAX_PARALLEL_WORKERS_PER_GATHER_MAX=x gave ${gather}"
+# The work_mem budget counts every parallel worker that can run (max_parallel_workers) whatever the
+# number per gather, so a higher cap leaves work_mem as it was.
+wm_cap2=$(tunevars 360448 5500 WORK_MEM TEST_CPUS=62 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=2)
+wm_cap8=$(tunevars 360448 5500 WORK_MEM TEST_CPUS=62 MAX_PARALLEL_WORKERS_PER_GATHER_MAX=8)
+is_number "${wm_cap8}" && [ "${wm_cap8}" = "${wm_cap2}" ] && ok "the per-gather cap leaves the work_mem budget as it was (${wm_cap8} kB)" \
+	|| bad "the per-gather cap moved work_mem (${wm_cap2} -> ${wm_cap8} kB)"
 gather=$(tunevars 1024 300 MAX_PARALLEL_WORKERS_PER_GATHER TEST_CPUS=2)
 [ "${gather}" = 1 ] && ok "2 CPUs keep 1 parallel worker per gather" || bad "2 CPUs get ${gather} parallel workers per gather"
 
@@ -359,6 +370,111 @@ cmd=$(tunevars 4096 4 POSTGRES_TUNED_CMD)
 case "${cmd}" in
 	*"-c max_connections=4 "*"-c superuser_reserved_connections=3 "*) ok "4 connections keep 3 for superusers" ;;
 	*) bad "4 connections: superuser_reserved_connections not lowered to 3" ;;
+esac
+
+# 15. Sizes from 1 GiB to a 352 GiB / 62-CPU container, on PostgreSQL 18. effective_cache_size is
+# a share of the whole limit (EFFECTIVE_CACHE_SIZE_PERC), between shared buffers and the limit;
+# maintenance_work_mem is split over the autovacuum workers and MAINTENANCE_WORK_MEM_SESSIONS only,
+# within [1 MB, MAINTENANCE_WORK_MEM_MAX], and budgeted for what they can take; autovacuum_max_workers
+# stays within the 16 autovacuum_worker_slots; parallel workers per gather stay at the fixed cap of
+# 2; the reserve is kept. The last column is 7.4.0's maintenance_work_mem (kB) at the same size, measured
+# with this harness on its script ("-" where it is not compared).
+for case in "1024 2 300 2 -" "4096 4 300 2 -" "16384 8 300 2 -" "65536 16 2500 2 191739" \
+	"262144 32 2500 2 433264" "360448 62 5500 2 186211" "360448 62 8000 2 146309"; do
+	# shellcheck disable=SC2086
+	set -- ${case}; memory=$1; cpus=$2; connections=$3; cap=$4; before=$5
+	# shellcheck disable=SC2046
+	set -- $(tunevars "${memory}" "${connections}" "MAX_MEMORY SHARED_BUFFERS EFFECTIVE_CACHE_SIZE MAINTENANCE_WORK_MEM MAINTENANCE_WORK_MEM_MAX AUTOVACUUM_MAX_WORKERS MAX_PARALLEL_WORKERS_PER_GATHER_MAX MAX_PARALLEL_WORKERS_PER_GATHER ACTUAL_RESERVED_MEMORY_PERC TOTAL_MAINTENANCE_WORK_MEM MAINTENANCE_PROCESSES" \
+		TEST_CPUS="${cpus}" PG_MAJOR=18)
+	label="${memory} MB / ${cpus} CPUs / ${connections} connections"
+	if [ "$#" -eq 11 ] && is_number "$3" && [ "$3" -ge "$2" ] && [ "$3" -le "$1" ]
+	then ok "${label}: effective_cache_size $3 kB within [shared_buffers $2, limit $1]"
+	else bad "${label}: effective_cache_size '$3', shared_buffers '$2', limit '$1'"
+	fi
+	is_number "$4" && [ "$4" -ge 1024 ] && [ "$4" -le "$5" ] && [ "${10}" = $(( $4 * ${11} )) ] \
+		&& ok "${label}: maintenance_work_mem $4 kB within [1024, $5], budgeted for ${11} processes" \
+		|| bad "${label}: maintenance_work_mem '$4' (cap '$5'), budgeted '${10}' for '${11}' processes"
+	if [ "${before}" != - ]
+	then
+		[ "$4" -gt "${before}" ] && ok "${label}: maintenance_work_mem $4 kB above 7.4.0's ${before} kB" \
+			|| bad "${label}: maintenance_work_mem '$4' not above 7.4.0's ${before} kB"
+	fi
+	is_number "$6" && [ "$6" -le 16 ] && ok "${label}: autovacuum_max_workers $6 within the 16 slots" \
+		|| bad "${label}: autovacuum_max_workers '$6' above the 16 slots"
+	[ "$7" = "${cap}" ] && is_number "$8" && [ "$8" -le "${cap}" ] && ok "${label}: parallel cap ${cap}, $8 per gather" \
+		|| bad "${label}: parallel cap '$7' (expected ${cap}), '$8' per gather"
+	is_number "$9" && [ "$9" -ge 15 ] && ok "${label}: the reserve is kept ($9%)" || bad "${label}: reserve '$9'% below 15%"
+	if [ "${memory}" = 360448 ]
+	then
+		[ "$3" -ge 157286400 ] && ok "${label}: effective_cache_size $(( $3 / 1048576 )) GiB, at least 150 GiB" \
+			|| bad "${label}: effective_cache_size '$3' kB below 150 GiB"
+	fi
+done
+
+# 15b. effective_cache_size: EFFECTIVE_CACHE_SIZE_PERC is a share of the limit, clamped to 100 and
+# never below shared buffers; anything but a number falls back to 60 with a warning. It allocates
+# nothing, so it moves no other setting.
+# shellcheck disable=SC2046
+set -- $(tunevars 360448 5500 "MAX_MEMORY EFFECTIVE_CACHE_SIZE SHARED_BUFFERS WORK_MEM" TEST_CPUS=62 PG_MAJOR=18 EFFECTIVE_CACHE_SIZE_PERC=40)
+ecs_limit=$1; sb_40=$3; wm_40=$4
+[ "$2" = $(( $1 * 40 / 100 )) ] && ok "EFFECTIVE_CACHE_SIZE_PERC=40 gives 40% of the limit ($2 kB)" || bad "EFFECTIVE_CACHE_SIZE_PERC=40 gave '$2' kB of '$1'"
+# shellcheck disable=SC2046
+set -- $(tunevars 360448 5500 "EFFECTIVE_CACHE_SIZE SHARED_BUFFERS WORK_MEM" TEST_CPUS=62 PG_MAJOR=18 EFFECTIVE_CACHE_SIZE_PERC=150)
+[ "$1" = "${ecs_limit}" ] && [ "$2" = "${sb_40}" ] && [ "$3" = "${wm_40}" ] \
+	&& ok "EFFECTIVE_CACHE_SIZE_PERC=150 is clamped to the limit, and moves neither shared_buffers nor work_mem" \
+	|| bad "EFFECTIVE_CACHE_SIZE_PERC=150: '$1' kB (limit ${ecs_limit}), shared_buffers '$2' (${sb_40}), work_mem '$3' (${wm_40})"
+# shellcheck disable=SC2046
+set -- $(tunevars 4096 300 "EFFECTIVE_CACHE_SIZE SHARED_BUFFERS" EFFECTIVE_CACHE_SIZE_PERC=1)
+is_number "$1" && [ "$1" = "$2" ] && ok "EFFECTIVE_CACHE_SIZE_PERC=1 is floored at shared_buffers ($2 kB)" || bad "EFFECTIVE_CACHE_SIZE_PERC=1 gave '$1' kB, shared_buffers '$2'"
+# shellcheck disable=SC2046
+set -- $(tunevars 4096 300 "MAX_MEMORY EFFECTIVE_CACHE_SIZE" EFFECTIVE_CACHE_SIZE_PERC=abc)
+[ "$2" = $(( $1 * 60 / 100 )) ] && warned EFFECTIVE_CACHE_SIZE_PERC && ok "EFFECTIVE_CACHE_SIZE_PERC=abc falls back to 60 with a warning" \
+	|| bad "EFFECTIVE_CACHE_SIZE_PERC=abc gave '$2' kB of '$1'"
+ecs=$(tunevars 4096 300 EFFECTIVE_CACHE_SIZE)
+cmd=$(tunevars 4096 300 POSTGRES_TUNED_CMD)
+case "${cmd}" in
+	*"-c effective_cache_size=${ecs}kB "*) ok "effective_cache_size=${ecs}kB is passed to the server" ;;
+	*) bad "effective_cache_size=${ecs}kB missing from the tuned command" ;;
+esac
+
+# 15c. maintenance_work_mem: MAINTENANCE_WORK_MEM_MAX caps it, and what the cap leaves over goes
+# back to the other settings or the reserve; below 1024 kB the cap is raised with a warning.
+# Parallel maintenance workers do not divide it; MAINTENANCE_WORK_MEM_SESSIONS does.
+# shellcheck disable=SC2046
+set -- $(tunevars 360448 5500 "TOTAL_MAINTENANCE_WORK_MEM SHARED_BUFFERS ACTUAL_RESERVED_MEMORY" TEST_CPUS=62 PG_MAJOR=18)
+total_default=$1; sb_default=$2; reserve_default=$3
+# shellcheck disable=SC2046
+set -- $(tunevars 360448 5500 "MAINTENANCE_WORK_MEM TOTAL_MAINTENANCE_WORK_MEM SHARED_BUFFERS ACTUAL_RESERVED_MEMORY" TEST_CPUS=62 PG_MAJOR=18 MAINTENANCE_WORK_MEM_MAX=65536)
+if [ "$1" = 65536 ] && is_number "${total_default}" && [ "$2" -lt "${total_default}" ] \
+	&& { [ "$3" -gt "${sb_default}" ] || [ "$4" -gt "${reserve_default}" ]; }
+then ok "MAINTENANCE_WORK_MEM_MAX=65536 caps it and gives the rest back (budgeted ${total_default} -> $2 kB, shared_buffers ${sb_default} -> $3 kB)"
+else bad "MAINTENANCE_WORK_MEM_MAX=65536: maintenance_work_mem '$1', budgeted '$2' (was ${total_default}), shared_buffers '$3', reserve '$4'"
+fi
+mwm=$(tunevars 4096 300 MAINTENANCE_WORK_MEM MAINTENANCE_WORK_MEM_MAX=100)
+[ "${mwm}" = 1024 ] && warned MAINTENANCE_WORK_MEM_MAX && ok "MAINTENANCE_WORK_MEM_MAX=100 is raised to 1024 with a warning" \
+	|| bad "MAINTENANCE_WORK_MEM_MAX=100 gave maintenance_work_mem '${mwm}'"
+mwm_few=$(tunevars 16384 300 MAINTENANCE_WORK_MEM TEST_CPUS=8 PG_MAJOR=18 MAX_PARALLEL_MAINTENANCE_WORKERS_PERC=1)
+mwm_many=$(tunevars 16384 300 MAINTENANCE_WORK_MEM TEST_CPUS=8 PG_MAJOR=18 MAX_PARALLEL_MAINTENANCE_WORKERS_PERC=100)
+is_number "${mwm_few}" && [ "${mwm_few}" = "${mwm_many}" ] && ok "parallel maintenance workers do not divide maintenance_work_mem (${mwm_few} kB)" \
+	|| bad "parallel maintenance workers changed maintenance_work_mem (${mwm_few} -> ${mwm_many} kB)"
+mwm_sessions=$(tunevars 16384 300 MAINTENANCE_WORK_MEM TEST_CPUS=8 PG_MAJOR=18 MAINTENANCE_WORK_MEM_SESSIONS=10)
+is_number "${mwm_sessions}" && [ "${mwm_sessions}" -lt "${mwm_few}" ] && ok "more MAINTENANCE_WORK_MEM_SESSIONS leave each a smaller share (${mwm_few} -> ${mwm_sessions} kB)" \
+	|| bad "MAINTENANCE_WORK_MEM_SESSIONS=10 gave '${mwm_sessions}' kB (2 give ${mwm_few})"
+
+# 15d. autovacuum_max_workers is capped at the 16 autovacuum_worker_slots on PostgreSQL 18 only
+# (62 CPUs give 37 otherwise), and the server processes are budgeted for the workers that run.
+# shellcheck disable=SC2046
+set -- $(tunevars 360448 5500 "AUTOVACUUM_MAX_WORKERS SERVER_PROCESSES" TEST_CPUS=62 PG_MAJOR=17); avw17=$1; procs17=$2
+# shellcheck disable=SC2046
+set -- $(tunevars 360448 5500 "AUTOVACUUM_MAX_WORKERS SERVER_PROCESSES SERVER_LOCK_SLOTS MAX_WORKER_PROCESSES MAX_WAL_SENDERS" TEST_CPUS=62 PG_MAJOR=18)
+if [ "${avw17}" = 37 ] && [ "$1" = 16 ] && [ "$2" = $(( procs17 - 37 + 16 + 3 )) ] && [ "$3" = $(( $4 + 16 + 1 + $5 )) ]
+then ok "62 CPUs: autovacuum_max_workers 37 on PostgreSQL 17, 16 on 18 (server processes ${procs17} -> $2, lock slots $3)"
+else bad "62 CPUs: autovacuum_max_workers '${avw17}' on 17, '$1' on 18; server processes ${procs17} -> '$2', lock slots '$3'"
+fi
+cmd=$(tunevars 360448 5500 POSTGRES_TUNED_CMD TEST_CPUS=62 PG_MAJOR=18)
+case "${cmd}" in
+	*"-c autovacuum_max_workers=16 "*) ok "autovacuum_max_workers=16 is passed on PostgreSQL 18" ;;
+	*) bad "autovacuum_max_workers=16 missing from the PostgreSQL 18 command" ;;
 esac
 
 echo "${pass} passed, ${fail} failed"

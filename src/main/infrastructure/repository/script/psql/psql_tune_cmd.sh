@@ -33,7 +33,6 @@ psql_tune_memory() {
 	
 	# Overall memory.
 	SHARED_BUFFERS=$(( NON_RESERVED_MAX_MEMORY * SHARED_BUFFERS_PERC / 100 ))
-	EFFECTIVE_CACHE_SIZE=$(( NON_RESERVED_MAX_MEMORY * EFFECTIVE_CACHE_SIZE_PERC / 100 ))
 	TOTAL_WORK_MEM=$(( NON_RESERVED_MAX_MEMORY * TOTAL_WORK_MEM_PERC / 100 ))
 	MIN_DYNAMIC_SHARED_MEMORY=$(( NON_RESERVED_MAX_MEMORY * MIN_DYNAMIC_SHARED_MEMORY_PERC / 100 ))
 	# A query takes work_mem once per sort or hash node it runs (hashes take twice,
@@ -48,8 +47,17 @@ psql_tune_memory() {
 	then
 		WORK_MEM=${WORK_MEM_MAX}
 	fi
+	# Maintenance memory is split over the processes that can hold it at once: every autovacuum
+	# worker (autovacuum_work_mem is left at -1, so they take maintenance_work_mem) plus
+	# MAINTENANCE_WORK_MEM_SESSIONS manual ones (VACUUM, CREATE INDEX, a migration). Parallel
+	# maintenance workers are not counted: a parallel index build or vacuum shares its leader's
+	# maintenance_work_mem rather than taking its own. Each share is capped at
+	# MAINTENANCE_WORK_MEM_MAX, and only what the processes can then take is budgeted, so a cap
+	# reached gives the rest back to the other settings. It stays in the budget: autovacuum runs at
+	# any time, connection storms included.
 	TOTAL_MAINTENANCE_WORK_MEM=$(( NON_RESERVED_MAX_MEMORY * TOTAL_MAINTENANCE_WORK_MEM_PERC / 100 ))
-	MAINTENANCE_WORK_MEM=$(( TOTAL_MAINTENANCE_WORK_MEM / (MAX_PARALLEL_MAINTENANCE_WORKERS + AUTOVACUUM_MAX_WORKERS )))
+	MAINTENANCE_WORK_MEM=$(( TOTAL_MAINTENANCE_WORK_MEM / MAINTENANCE_PROCESSES ))
+	MAINTENANCE_WORK_MEM=$(( MAINTENANCE_WORK_MEM > MAINTENANCE_WORK_MEM_MAX ? MAINTENANCE_WORK_MEM_MAX : MAINTENANCE_WORK_MEM ))
 	
 	# Lock tables. The shared memory they take is reserved at startup whether it is used
 	# or not, and it grows with max_locks_per_transaction times the connection limit: a
@@ -72,8 +80,8 @@ psql_tune_memory() {
 	WAL_DECODE_BUFFER_SIZE=$(( WAL_DECODE_BUFFER_SIZE < 64 ? 64 : WAL_DECODE_BUFFER_SIZE ))
 	LOGICAL_DECODING_WORK_MEM=$(( LOGICAL_DECODING_WORK_MEM < 64 ? 64 : LOGICAL_DECODING_WORK_MEM ))
 	SHARED_BUFFERS=$(( SHARED_BUFFERS < 128 ? 128 : SHARED_BUFFERS ))
-	EFFECTIVE_CACHE_SIZE=$(( EFFECTIVE_CACHE_SIZE < 8 ? 8 : EFFECTIVE_CACHE_SIZE ))
 	MAINTENANCE_WORK_MEM=$(( MAINTENANCE_WORK_MEM < 1024 ? 1024 : MAINTENANCE_WORK_MEM ))
+	TOTAL_MAINTENANCE_WORK_MEM=$(( MAINTENANCE_WORK_MEM * MAINTENANCE_PROCESSES ))
 	MAX_LOCKS_PER_TRANSACTION=$(( MAX_LOCKS_PER_TRANSACTION < 10 ? 10 : MAX_LOCKS_PER_TRANSACTION ))
 	TOTAL_LOCKS_MEMORY=$(( MAX_LOCKS_PER_TRANSACTION * (MAX_CONNECTIONS + SERVER_LOCK_SLOTS) * 3 / 4 ))
 
@@ -144,7 +152,7 @@ psql_tune_cmd() {
 #	TOTAL_LOGICAL_DECODING_WORK_MEM_PERC=2
 #	TOTAL_LOGICAL_DECODING_WORK_MEM_MAX=262144
 #	SHARED_BUFFERS_PERC=25
-#	EFFECTIVE_CACHE_SIZE_PERC=50
+#	EFFECTIVE_CACHE_SIZE_PERC=60
 #	TOTAL_WORK_MEM_PERC=13
 #	TOTAL_MAINTENANCE_WORK_MEM_PERC=5
 
@@ -231,8 +239,28 @@ psql_tune_cmd() {
 		# with its own work_mem for every sort or hash it runs, so a query with N workers can take
 		# N+1 times the memory of a serial one: a percentage of the CPUs alone gives a large host
 		# tens of workers per query, which suits a warehouse and not a transactional database.
+		# More per query trades CPU for one query's latency, which a busy transactional database with
+		# many connections cannot spare, so the cap does not grow with the host: the driver is CPUs
+		# per concurrent heavy query, not memory, and a query that needs more asks for it in its own
+		# session (SET max_parallel_workers_per_gather). The work_mem budget counts every parallel
+		# worker that can run (max_parallel_workers), whatever the number per gather.
 		# 0 turns parallel query off.
 		MAX_PARALLEL_WORKERS_PER_GATHER_MAX=$(psql_tune_integer MAX_PARALLEL_WORKERS_PER_GATHER_MAX "${MAX_PARALLEL_WORKERS_PER_GATHER_MAX:-2}" 2)
+		# Planner's estimate of the cache a query can count on, shared buffers plus the kernel's page
+		# cache, as a share of the limit (default 60: the limit less the reserve and what the
+		# connections' own memory takes in the normal case). It allocates nothing, so it is not
+		# sized from the budget below, which shrinks with the connections.
+		EFFECTIVE_CACHE_SIZE_PERC=$(psql_tune_integer EFFECTIVE_CACHE_SIZE_PERC "${EFFECTIVE_CACHE_SIZE_PERC:-60}" 60)
+		EFFECTIVE_CACHE_SIZE_PERC=$(( EFFECTIVE_CACHE_SIZE_PERC > 100 ? 100 : EFFECTIVE_CACHE_SIZE_PERC ))
+		# Largest maintenance_work_mem (and autovacuum share) in kB, 2 GB by default; and the manual
+		# maintenance sessions it is sized for besides the autovacuum workers (see psql_tune_memory).
+		MAINTENANCE_WORK_MEM_MAX=$(psql_tune_integer MAINTENANCE_WORK_MEM_MAX "${MAINTENANCE_WORK_MEM_MAX:-2097152}" 2097152)
+		if [ "${MAINTENANCE_WORK_MEM_MAX}" -lt 1024 ]
+		then
+			echo "WARN: MAINTENANCE_WORK_MEM_MAX=${MAINTENANCE_WORK_MEM_MAX} is below the 1024kB minimum of maintenance_work_mem; using 1024." >&2
+			MAINTENANCE_WORK_MEM_MAX=1024
+		fi
+		MAINTENANCE_WORK_MEM_SESSIONS=$(psql_tune_integer MAINTENANCE_WORK_MEM_SESSIONS "${MAINTENANCE_WORK_MEM_SESSIONS:-2}" 2)
 		# Sessions left idle inside a transaction hold their locks, snapshot and memory until
 		# they are ended. 0 disables. A value the server does not take would stop it from starting,
 		# so anything but a number with an optional unit falls back to the default.
@@ -301,6 +329,17 @@ psql_tune_cmd() {
 		AUTOVACUUM_MAX_WORKERS=$(( MAX_CPU_WORK * AUTOVACUUM_MAX_WORKERS_PERC / 100 ))
 		AUTOVACUUM_MAX_WORKERS=$(( AUTOVACUUM_MAX_WORKERS < 1 ? 1 : AUTOVACUUM_MAX_WORKERS ))
 		AUTOVACUUM_MAX_WORKERS=$(( AUTOVACUUM_MAX_WORKERS > MAX_WORKER_PROCESSES ? MAX_WORKER_PROCESSES : AUTOVACUUM_MAX_WORKERS ))
+		# PostgreSQL 18 starts no more autovacuum workers than autovacuum_worker_slots (16 by
+		# default, left as is), and warns at startup when autovacuum_max_workers is above it. More
+		# would not vacuum faster anyway: they share autovacuum_vacuum_cost_limit between them.
+		PG_MAJOR_VERSION=$(psql_tune_integer PG_MAJOR "${PG_MAJOR:-0}" 0)
+		AUTOVACUUM_WORKER_SLOTS=16
+		if [ "${PG_MAJOR_VERSION}" -ge 18 ]
+		then
+			AUTOVACUUM_MAX_WORKERS=$(( AUTOVACUUM_MAX_WORKERS > AUTOVACUUM_WORKER_SLOTS ? AUTOVACUUM_WORKER_SLOTS : AUTOVACUUM_MAX_WORKERS ))
+		fi
+		MAINTENANCE_PROCESSES=$(( AUTOVACUUM_MAX_WORKERS + MAINTENANCE_WORK_MEM_SESSIONS ))
+		MAINTENANCE_PROCESSES=$(( MAINTENANCE_PROCESSES < 1 ? 1 : MAINTENANCE_PROCESSES ))
 		MAX_PARALLEL_WORKERS_PER_GATHER=$(( MAX_CPU_WORK * MAX_PARALLEL_WORKERS_PER_GATHER_PERC / 100 ))
 		MAX_PARALLEL_WORKERS_PER_GATHER=$(( MAX_PARALLEL_WORKERS_PER_GATHER < 1 ? 1 : MAX_PARALLEL_WORKERS_PER_GATHER ))
 		MAX_PARALLEL_WORKERS_PER_GATHER=$(( MAX_PARALLEL_WORKERS_PER_GATHER > MAX_PARALLEL_WORKERS_PER_GATHER_MAX ? MAX_PARALLEL_WORKERS_PER_GATHER_MAX : MAX_PARALLEL_WORKERS_PER_GATHER ))
@@ -320,14 +359,13 @@ psql_tune_cmd() {
 		# Lock table rows exist for each of them but the auxiliary ones, as PostgreSQL sizes it
 		# over max_connections + autovacuum_max_workers + 1 + max_worker_processes +
 		# max_wal_senders. PostgreSQL 18 uses autovacuum_worker_slots (16 by default) there in
-		# place of autovacuum_max_workers, so the larger of the two is counted.
-		PG_MAJOR_VERSION=$(psql_tune_integer PG_MAJOR "${PG_MAJOR:-0}" 0)
+		# place of autovacuum_max_workers, which is capped at it above.
 		AUXILIARY_PROCESSES=6
 		AUTOVACUUM_LOCK_SLOTS=${AUTOVACUUM_MAX_WORKERS}
 		if [ "${PG_MAJOR_VERSION}" -ge 18 ]
 		then
 			AUXILIARY_PROCESSES=9
-			AUTOVACUUM_LOCK_SLOTS=$(( AUTOVACUUM_MAX_WORKERS < 16 ? 16 : AUTOVACUUM_MAX_WORKERS ))
+			AUTOVACUUM_LOCK_SLOTS=${AUTOVACUUM_WORKER_SLOTS}
 		fi
 		SERVER_PROCESSES=$(( MAX_WORKER_PROCESSES + AUTOVACUUM_MAX_WORKERS + MAX_WAL_SENDERS + AUXILIARY_PROCESSES ))
 		SERVER_LOCK_SLOTS=$(( MAX_WORKER_PROCESSES + AUTOVACUUM_LOCK_SLOTS + 1 + MAX_WAL_SENDERS ))
@@ -423,6 +461,11 @@ psql_tune_cmd() {
 		then
 			echo "WARN: lowered max_connections to ${MAX_CONNECTIONS} to keep the reserve (requested ${REQUESTED_MAX_CONNECTIONS})." >&2
 		fi
+
+		# Planner hint, from the whole limit (see EFFECTIVE_CACHE_SIZE_PERC above), never below
+		# shared buffers, which it includes.
+		EFFECTIVE_CACHE_SIZE=$(( MAX_MEMORY * EFFECTIVE_CACHE_SIZE_PERC / 100 ))
+		EFFECTIVE_CACHE_SIZE=$(( EFFECTIVE_CACHE_SIZE < SHARED_BUFFERS ? SHARED_BUFFERS : EFFECTIVE_CACHE_SIZE ))
 
 		# work_mem sized for fewer than all connections at once is an over-commit: say how far
 		# work memory can go when every connection and parallel worker sorts at the same time.

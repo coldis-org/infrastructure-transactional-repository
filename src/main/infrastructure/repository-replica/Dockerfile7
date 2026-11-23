@@ -13,7 +13,11 @@
 # to 7.4.0 primary. It brings the memory budget (a replica too small for its primary's floors
 # starts with a WARN instead of stopping), OOM targeting of child processes and the memory guard
 # (dry-run by default).
-FROM coldis/infrastructure-transactional-repository:7.4.0
+#
+# 7.4.1 is the same PostgreSQL 18.7 and Debian; its tuner sizes effective_cache_size and
+# maintenance memory apart from the connection budget and caps autovacuum workers at the
+# server's worker slots.
+FROM coldis/infrastructure-transactional-repository:7.4.1
 
 # Copies the init script and the health check. The trailing slash keeps more than one source
 # valid on every builder.
